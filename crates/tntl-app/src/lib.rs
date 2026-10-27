@@ -47,6 +47,12 @@ pub use memory::{MemoryAdvice, advice, advice_from_total, clamp_mb, system_memor
 
 /// Whether `pid` is a live process.
 fn process_alive(pid: u32) -> bool {
+    // No game can run as pid 0, and on Windows the system reports the idle
+    // process for it, which would let a broken marker block an instance for
+    // ever.
+    if pid == 0 {
+        return false;
+    }
     #[cfg(target_os = "linux")]
     {
         std::path::Path::new(&format!("/proc/{pid}")).exists()

@@ -422,8 +422,17 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // The server reports the connection instead of the test sleeping for a
+        // fixed time: building the client can take longer than any sleep the
+        // test picks, and a cancel that arrives before the connection exists
+        // makes the download return without ever reaching `accept`, which used
+        // to leave `server.join()` waiting for ever.
+        let (connected, connection) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let _ = connected.send(());
             let mut buf = [0u8; 1024];
             let _ = socket.read(&mut buf);
             let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n");
@@ -437,7 +446,9 @@ mod tests {
         let request = DownloadRequest::new(format!("http://{addr}/slow"), dir.join("slow.bin"));
         let _third = crate::cancel::begin();
         let worker = std::thread::spawn(move || Http::new().unwrap().download(&request, &mut |_| {}).map(|_| ()));
-        std::thread::sleep(Duration::from_millis(200));
+        connection
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the download never connected");
         crate::cancel::request();
         let result = worker.join().unwrap();
         assert!(matches!(result, Err(SourceError::Cancelled)), "{result:?}");
