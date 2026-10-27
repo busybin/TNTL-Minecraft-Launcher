@@ -373,11 +373,13 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(
             source.join("instance.json"),
-            format!(
-                r#"{{"name":"Imported","version_id":"1.20.1","root":"{}","game_dir":"{}"}}"#,
-                game.display(),
-                game.display()
-            ),
+            serde_json::json!({
+                "name": "Imported",
+                "version_id": "1.20.1",
+                "root": game.display().to_string(),
+                "game_dir": game.display().to_string(),
+            })
+            .to_string(),
         )
         .unwrap();
 
