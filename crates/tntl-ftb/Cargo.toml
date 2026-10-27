@@ -1,0 +1,14 @@
+[package]
+name = "tntl-ftb"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+tntl-modpack = { path = "../tntl-modpack" }
+tntl-source = { path = "../tntl-source" }
+tntl-store = { path = "../tntl-store" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

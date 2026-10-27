@@ -1,0 +1,15 @@
+[package]
+name = "tntl-forge"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+tntl-model = { path = "../tntl-model" }
+tntl-source = { path = "../tntl-source" }
+tntl-store = { path = "../tntl-store" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zip.workspace = true

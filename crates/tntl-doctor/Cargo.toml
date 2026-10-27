@@ -1,0 +1,11 @@
+[package]
+name = "tntl-doctor"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+tntl-instance = { path = "../tntl-instance" }
+serde.workspace = true
+serde_json.workspace = true

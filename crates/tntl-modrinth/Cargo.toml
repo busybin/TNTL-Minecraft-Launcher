@@ -1,0 +1,12 @@
+[package]
+name = "tntl-modrinth"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+tntl-source = { path = "../tntl-source" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

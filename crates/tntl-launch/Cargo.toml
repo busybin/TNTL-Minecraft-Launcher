@@ -1,0 +1,11 @@
+[package]
+name = "tntl-launch"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+tntl-resolve = { path = "../tntl-resolve" }
+tntl-store = { path = "../tntl-store" }
+thiserror.workspace = true

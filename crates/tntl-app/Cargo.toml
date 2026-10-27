@@ -1,0 +1,33 @@
+[package]
+name = "tntl-app"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+tntl-auth = { path = "../tntl-auth" }
+tntl-doctor = { path = "../tntl-doctor" }
+tntl-curseforge = { path = "../tntl-curseforge" }
+tntl-forge = { path = "../tntl-forge" }
+tntl-ftb = { path = "../tntl-ftb" }
+tntl-instance = { path = "../tntl-instance" }
+tntl-java = { path = "../tntl-java" }
+tntl-launch = { path = "../tntl-launch" }
+tntl-model = { path = "../tntl-model" }
+tntl-modpack = { path = "../tntl-modpack" }
+tntl-modrinth = { path = "../tntl-modrinth" }
+tntl-resolve = { path = "../tntl-resolve" }
+tntl-runtime = { path = "../tntl-runtime" }
+tntl-source = { path = "../tntl-source" }
+tntl-status = { path = "../tntl-status" }
+tntl-store = { path = "../tntl-store" }
+
+anyhow.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { version = "0.35", default-features = false, features = ["system"] }

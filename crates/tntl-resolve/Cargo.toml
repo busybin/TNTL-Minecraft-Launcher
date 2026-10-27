@@ -1,0 +1,14 @@
+[package]
+name = "tntl-resolve"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+tntl-auth = { path = "../tntl-auth" }
+tntl-model = { path = "../tntl-model" }
+tntl-store = { path = "../tntl-store" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

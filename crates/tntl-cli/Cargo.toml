@@ -1,0 +1,29 @@
+[package]
+name = "tntl-cli"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[[bin]]
+name = "tntl"
+path = "src/main.rs"
+
+[dependencies]
+tntl-app = { path = "../tntl-app" }
+tntl-doctor = { path = "../tntl-doctor" }
+tntl-auth = { path = "../tntl-auth" }
+tntl-instance = { path = "../tntl-instance" }
+tntl-java = { path = "../tntl-java" }
+tntl-launch = { path = "../tntl-launch" }
+tntl-model = { path = "../tntl-model" }
+tntl-modrinth = { path = "../tntl-modrinth" }
+tntl-resolve = { path = "../tntl-resolve" }
+tntl-source = { path = "../tntl-source" }
+tntl-status = { path = "../tntl-status" }
+tntl-store = { path = "../tntl-store" }
+
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+serde_json.workspace = true

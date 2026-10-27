@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TNTL",
+  "version": "4.0.0",
+  "identifier": "io.github.busybin.tntl",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "TNTL (TNT Launcher)",
+        "width": 1120,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 600,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "category": "Game",
+    "publisher": "busybin",
+    "copyright": "TNTL contributors. GPL-3.0-or-later.",
+    "licenseFile": "../../../LICENSE",
+    "resources": {
+      "../../../LICENSE": "LICENSE",
+      "../../../TRADEMARK.md": "TRADEMARK.md",
+      "../src/assets/fonts/OFL.txt": "OFL.txt"
+    },
+    "shortDescription": "TNTL (TNT Launcher) — Minecraft launcher for Windows and Linux",
+    "longDescription": "TNTL (TNT Launcher) is a Minecraft launcher for Windows and Linux with a Rust core, a headless CLI and a Tauri desktop shell. It installs vanilla, Fabric, Quilt, Legacy Fabric, Forge and NeoForge from official upstreams, and manages mods, modpacks, worlds, servers and accounts.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
+  }
+}
