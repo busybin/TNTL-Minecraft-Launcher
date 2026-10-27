@@ -56,7 +56,7 @@ pnpm install
 pnpm tauri dev
 ```
 
-Or use the CLI (built from source; the release page ships the desktop app):
+Or use the CLI (the release page ships a Linux x86_64 binary; elsewhere build it from source):
 
 ```sh
 cargo run -p tntl-cli -- install 1.20.1     # download from Mojang and create an instance
