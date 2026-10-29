@@ -8,12 +8,15 @@ use std::sync::{OnceLock, RwLock};
 use crate::http::SourceError;
 
 /// How outgoing requests pick a proxy.
+///
+/// There is no "follow the system" mode: the Windows environment carries no
+/// proxy variables, and the desktop shell has no terminal, so that mode would
+/// silently behave like a direct connection. Users pick a direct connection,
+/// HTTP or SOCKS5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProxyMode {
-    /// Follow `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` from the environment.
-    #[default]
-    System,
     /// Never use a proxy, even when the environment asks for one.
+    #[default]
     None,
     /// Explicit HTTP proxy, e.g. `http://127.0.0.1:7890`.
     Http,
@@ -24,17 +27,17 @@ pub enum ProxyMode {
 impl ProxyMode {
     pub fn key(self) -> &'static str {
         match self {
-            Self::System => "system",
             Self::None => "none",
             Self::Http => "http",
             Self::Socks5 => "socks5",
         }
     }
 
+    /// `system` and `env` are old settings files; they fall back to a direct
+    /// connection because the launcher no longer reads proxy variables.
     pub fn from_key(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "system" | "env" => Some(Self::System),
-            "none" | "off" | "direct" => Some(Self::None),
+            "system" | "env" | "none" | "off" | "direct" => Some(Self::None),
             "http" | "https" => Some(Self::Http),
             "socks5" | "socks" => Some(Self::Socks5),
             _ => None,
@@ -104,7 +107,6 @@ pub fn apply_proxy(builder: reqwest::blocking::ClientBuilder) -> Result<reqwest:
     let config = network_config();
     match config.mode {
         ProxyMode::None => Ok(builder.no_proxy()),
-        ProxyMode::System => Ok(builder),
         ProxyMode::Http | ProxyMode::Socks5 => {
             let Some(url) = config.url.as_deref() else {
                 return Ok(builder);
@@ -132,6 +134,14 @@ mod tests {
         assert_eq!(ProxyMode::from_key("SOCKS5"), Some(ProxyMode::Socks5));
         assert_eq!(ProxyMode::from_key("off"), Some(ProxyMode::None));
         assert_eq!(ProxyMode::from_key("bogus"), None);
+    }
+
+    #[test]
+    fn old_system_settings_become_a_direct_connection() {
+        assert_eq!(ProxyMode::from_key("system"), Some(ProxyMode::None));
+        assert_eq!(ProxyMode::from_key("env"), Some(ProxyMode::None));
+        assert_eq!(ProxyMode::default(), ProxyMode::None);
+        assert_eq!(ProxyMode::default().key(), "none");
     }
 
     #[test]

@@ -89,7 +89,7 @@ const settings = ref<LauncherSettings>({
   quit_on_launch: false,
   theme: "dark",
   background: null,
-  proxy_mode: "system",
+  proxy_mode: "none",
   proxy_url: null,
   proxy_username: null,
   proxy_password: null,
@@ -541,6 +541,15 @@ onMounted(async () => {
         // Open the new instance only when the user is watching the install;
         // yanking them out of Settings or a half-typed account loses work.
         if (done.instance && page.value === "install") openDetail(done.instance);
+      }),
+    () =>
+      // The game's stdout is a pipe this process reads; closing the window ends
+      // it. The game keeps running, but its console log stops here, so ask
+      // first instead of dropping it silently.
+      getCurrentWindow().onCloseRequested((event) => {
+        if (running.value && !window.confirm(t("app.closeWhileRunning"))) {
+          event.preventDefault();
+        }
       }),
     () =>
       getCurrentWindow().onDragDropEvent((event) => {

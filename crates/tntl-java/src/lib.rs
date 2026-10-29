@@ -25,7 +25,7 @@ impl JavaInstall {
 
 /// Run a JVM and parse `-XshowSettings:properties -version`.
 pub fn probe(path: &Path) -> Option<JavaInstall> {
-    let mut command = Command::new(path);
+    let mut command = Command::new(probe_binary(path));
     command.args(["-XshowSettings:properties", "-version"]);
     // The desktop shell is a GUI process, so a console child would flash a
     // black window on every probe (and discovery probes every JVM it finds).
@@ -62,6 +62,24 @@ pub fn probe(path: &Path) -> Option<JavaInstall> {
         vendor: properties.get("java.vendor").cloned(),
         arch: properties.get("os.arch").cloned(),
     })
+}
+
+/// The executable to interrogate. A user may point an instance at `javaw.exe`,
+/// which has no stdout to read; the sibling `java.exe` is the same JVM.
+fn probe_binary(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("javaw.exe"))
+        {
+            let java = path.with_file_name("java.exe");
+            if java.is_file() {
+                return java;
+            }
+        }
+    }
+    path.to_path_buf()
 }
 
 fn parse_major(value: &str) -> Option<u32> {

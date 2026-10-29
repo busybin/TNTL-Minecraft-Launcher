@@ -2273,10 +2273,25 @@ fn main() {
 
     let root = initial_root();
     let started = tauri::Builder::default()
-        .setup(|_| {
+        .setup(|app| {
             // The window and the webview exist at this point. A log that stops
             // at "window" means the frontend never became interactive.
             append_log("window", "the main window was created");
+            // 1120x720 is in logical pixels. On a 1366x768 display at 150% the
+            // work area is about 910x475, so the configured minimum (900x600)
+            // would put the bottom of the window off screen with no way to
+            // reach it. Shrink to this monitor and lower the minimum for the
+            // session; a large screen keeps the default size.
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(Some(monitor)) = window.current_monitor() {
+                    let screen = monitor.size().to_logical::<f64>(monitor.scale_factor());
+                    let width = (screen.width - 40.0).clamp(640.0, 1120.0);
+                    let height = (screen.height - 80.0).clamp(400.0, 720.0);
+                    let _ = window.set_min_size(Some(tauri::LogicalSize::new(width.min(900.0), height.min(600.0))));
+                    let _ = window.set_size(tauri::LogicalSize::new(width, height));
+                    let _ = window.center();
+                }
+            }
             Ok(())
         })
         .manage(AppState {

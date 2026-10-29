@@ -446,9 +446,20 @@ mod tests {
         let request = DownloadRequest::new(format!("http://{addr}/slow"), dir.join("slow.bin"));
         let _third = crate::cancel::begin();
         let worker = std::thread::spawn(move || Http::new().unwrap().download(&request, &mut |_| {}).map(|_| ()));
-        connection
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the download never connected");
+        // 30 s instead of a fixed 10 s, and an early exit of the worker is
+        // reported instead of looking like "never connected": this ran into the
+        // timeout when the whole workspace test suite ran in parallel.
+        let wait = std::time::Instant::now();
+        loop {
+            match connection.recv_timeout(Duration::from_millis(200)) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(!worker.is_finished(), "the download ended before connecting");
+                    assert!(wait.elapsed() < Duration::from_secs(30), "the download never connected");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the test server stopped"),
+            }
+        }
         crate::cancel::request();
         let result = worker.join().unwrap();
         assert!(matches!(result, Err(SourceError::Cancelled)), "{result:?}");

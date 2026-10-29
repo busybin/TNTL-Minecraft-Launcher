@@ -488,7 +488,6 @@ async function copyRoot() {
           <small>{{ t("settings.proxyHint") }}</small>
         </div>
         <select v-model="local.proxy_mode">
-          <option value="system">{{ t("settings.proxySystem") }}</option>
           <option value="none">{{ t("settings.proxyNone") }}</option>
           <option value="http">{{ t("settings.proxyHttp") }}</option>
           <option value="socks5">{{ t("settings.proxySocks5") }}</option>

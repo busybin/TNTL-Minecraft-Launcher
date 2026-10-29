@@ -104,10 +104,11 @@ main debugging and testing surface.
 - Nothing is fetched at startup. The version manifest is fetched when the
   install page opens; every other source (Modrinth, CurseForge, FTB, Adoptium,
   a skin lookup or the skin library) only when the user uses it.
-- The proxy is launcher-wide: direct, environment variables, HTTP or
-  SOCKS5, chosen in the settings page and applied to every client. HTTP and
-  SOCKS5 proxies may take a user name and password; the password is stored in
-  `launcher.json` next to the proxy address and never put into the URL.
+- The proxy is launcher-wide: a direct connection, HTTP or SOCKS5, chosen in
+  the settings page and applied to every client. There is no environment or
+  system-proxy mode. HTTP and SOCKS5 proxies may take a user name and password;
+  the password is stored in `launcher.json` next to the proxy address and never
+  put into the URL.
 
 ## Security
 

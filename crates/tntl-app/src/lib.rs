@@ -10,6 +10,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -89,6 +91,30 @@ fn process_start_time(pid: u32) -> Option<u64> {
         system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
         system.process(pid).map(|process| process.start_time())
     }
+}
+
+/// Probing a JVM spawns it (and used to flash a console window on Windows), so
+/// the discovered list is kept for a minute. `java/` is part of the key because
+/// the user can switch the launcher directory.
+const JAVA_SCAN_TTL: Duration = Duration::from_secs(60);
+
+type JavaScan = Option<(PathBuf, Instant, Vec<JavaInstall>)>;
+
+fn java_scan_cache() -> &'static Mutex<JavaScan> {
+    static CACHE: OnceLock<Mutex<JavaScan>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn invalidate_java_scan() {
+    if let Ok(mut cache) = java_scan_cache().lock() {
+        *cache = None;
+    }
+}
+
+fn cached_java_installs(managed: &Path) -> Option<Vec<JavaInstall>> {
+    let cache = java_scan_cache().lock().ok()?;
+    let (cached_path, at, installs) = cache.as_ref()?;
+    (cached_path == managed && at.elapsed() < JAVA_SCAN_TTL).then(|| installs.clone())
 }
 
 /// A launcher data directory: `instances/`, `versions/`, `libraries/`, `assets/`.
@@ -196,7 +222,7 @@ impl Default for LauncherSettings {
             quit_on_launch: false,
             theme: "dark".to_string(),
             background: None,
-            proxy_mode: "system".to_string(),
+            proxy_mode: "none".to_string(),
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -2525,9 +2551,18 @@ impl Launcher {
     }
 
     /// Managed runtimes first, then whatever the machine already has.
+    /// Probing a JVM spawns it, so the list is cached briefly: the shell asks
+    /// for it on every refresh and the resolver asks again on every launch.
     pub fn java_installs(&self) -> Vec<JavaInstall> {
-        let mut installs = tntl_java::discover_in(&self.java_dir());
+        let managed = self.java_dir();
+        if let Some(cached) = cached_java_installs(&managed) {
+            return cached;
+        }
+        let mut installs = tntl_java::discover_in(&managed);
         installs.extend(tntl_java::discover());
+        if let Ok(mut cache) = java_scan_cache().lock() {
+            *cache = Some((managed, Instant::now(), installs.clone()));
+        }
         installs
     }
 
@@ -3474,6 +3509,8 @@ impl Launcher {
         component: &str,
         progress: &(dyn Fn(RuntimeEvent) + Send + Sync),
     ) -> Result<InstalledRuntime> {
+        // A runtime landing in `java/` has to show up in the next plan.
+        invalidate_java_scan();
         let http = Http::new()?;
         let home = self.java_dir().join(sanitize_name(component));
         if let Some(major) = tntl_runtime::adoptium::major_of(component) {
@@ -6265,10 +6302,34 @@ fn validate_version_id(id: &str) -> Result<()> {
         || id.contains('/')
         || id.contains('\\')
         || id.chars().any(char::is_control)
+        || !portable_file_name(id)
     {
         bail!("invalid version id: {id}");
     }
     Ok(())
+}
+
+/// Whether `name` can be a directory entry on Windows too, so a data directory
+/// copied between platforms keeps working (device names, trailing dots/spaces,
+/// characters Windows reserves). Existing folders are not checked against this:
+/// they only have to be one component.
+fn portable_file_name(name: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
+        "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split('.').next().unwrap_or(name).trim().to_ascii_uppercase();
+    if name.ends_with('.') || name.ends_with(' ') || RESERVED.contains(&stem.as_str()) {
+        return false;
+    }
+    #[cfg(windows)]
+    if name
+        .chars()
+        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    true
 }
 
 /// Reject names that cannot be one directory entry. Every path built from an
@@ -6291,19 +6352,8 @@ pub fn validate_name(name: &str) -> Result<()> {
     // Windows folds `foo.` and `foo ` onto `foo`, so two instances could share
     // one folder, and `CON`/`NUL` name devices. Rejecting them everywhere keeps
     // a data directory portable.
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
-        "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
     valid_component(name)?;
-    let stem = name.split('.').next().unwrap_or(name).trim().to_ascii_uppercase();
-    #[cfg(windows)]
-    let bad_character = name
-        .chars()
-        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'));
-    #[cfg(not(windows))]
-    let bad_character = false;
-    if name.ends_with('.') || name.ends_with(' ') || RESERVED.contains(&stem.as_str()) || bad_character {
+    if !portable_file_name(name) {
         bail!("invalid instance name: {name}");
     }
     Ok(())
@@ -6443,11 +6493,14 @@ impl LauncherSettings {
         if self.background.as_deref().is_some_and(str::is_empty) {
             self.background = None;
         }
-        if tntl_source::ProxyMode::from_key(&self.proxy_mode).is_none() {
-            self.proxy_mode = "system".to_string();
-        } else {
-            self.proxy_mode = self.proxy_mode.trim().to_ascii_lowercase();
+        // There is no follow-the-system mode any more; old files that still say
+        // `system` (or anything unknown) become a direct connection.
+        self.proxy_mode = match self.proxy_mode.trim().to_ascii_lowercase().as_str() {
+            "http" | "https" => "http",
+            "socks5" | "socks" => "socks5",
+            _ => "none",
         }
+        .to_string();
         self.proxy_url = self
             .proxy_url
             .as_deref()
@@ -6518,6 +6571,23 @@ mod tests {
             let name = sanitize_name(title);
             assert!(validate_name(&name).is_ok(), "{title} -> {name}");
         }
+    }
+
+    #[test]
+    fn version_ids_are_portable_directory_names() {
+        for id in [
+            "1.20.1",
+            "1.20.1-Neoforge",
+            "fabric-loader-0.16.0-1.20.1",
+            "1.20.1 (copy)",
+        ] {
+            assert!(validate_version_id(id).is_ok(), "{id}");
+        }
+        for id in ["", ".", "..", "a/b", "a\\b", "a\tb", "CON", "NUL.txt", "1.20.1."] {
+            assert!(validate_version_id(id).is_err(), "{id}");
+        }
+        assert!(!portable_file_name("CON"));
+        assert!(portable_file_name("1.20.1-Neoforge"));
     }
 
     #[test]
@@ -6976,8 +7046,17 @@ mod tests {
             ..LauncherSettings::default()
         }
         .normalized();
-        assert_eq!(settings.proxy_mode, "system");
+        assert_eq!(settings.proxy_mode, "none");
         assert!(settings.proxy_url.is_none());
+
+        // Settings written before the system mode was removed fall back to a
+        // direct connection instead of keeping an unsupported value.
+        let settings = LauncherSettings {
+            proxy_mode: "system".to_string(),
+            ..LauncherSettings::default()
+        }
+        .normalized();
+        assert_eq!(settings.proxy_mode, "none");
 
         let settings = LauncherSettings {
             proxy_mode: "http".to_string(),
