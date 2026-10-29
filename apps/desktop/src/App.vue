@@ -34,6 +34,8 @@ const page = ref<Page>("instances");
 const bootstrap = ref<Bootstrap | null>(null);
 const instances = ref<InstanceView[]>([]);
 const running = ref<string | null>(null);
+/** Second close request while a game runs always closes; see onCloseRequested. */
+let closeArmed = false;
 const busy = ref<string | null>(null);
 const error = ref<string | null>(null);
 const toast = ref<string | null>(null);
@@ -545,11 +547,17 @@ onMounted(async () => {
     () =>
       // The game's stdout is a pipe this process reads; closing the window ends
       // it. The game keeps running, but its console log stops here, so ask
-      // first instead of dropping it silently.
+      // first instead of dropping it silently. A second close within five
+      // seconds proceeds: a webview that refuses to show dialogs (or a wedged
+      // one) must not make the window impossible to close.
       getCurrentWindow().onCloseRequested((event) => {
-        if (running.value && !window.confirm(t("app.closeWhileRunning"))) {
-          event.preventDefault();
-        }
+        if (!running.value || closeArmed) return;
+        if (window.confirm(t("app.closeWhileRunning"))) return;
+        event.preventDefault();
+        closeArmed = true;
+        window.setTimeout(() => {
+          closeArmed = false;
+        }, 5000);
       }),
     () =>
       getCurrentWindow().onDragDropEvent((event) => {

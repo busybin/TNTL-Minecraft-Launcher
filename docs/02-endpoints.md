@@ -9,8 +9,8 @@ host means adding a row here and a suffix in `scripts/check-endpoints.sh`.
 - Official sources only. There is no mirror list, no source picker and no
   region detection.
 - The launcher must work from a normal internet connection. Proxy settings are
-  user-selectable (direct, environment, HTTP or SOCKS5) and apply to every
-  request the launcher makes.
+  user-selectable (direct, HTTP or SOCKS5) and apply to every request the
+  launcher makes; there is no environment or system-proxy mode.
 - Every artifact is verified against the hash published by its source.
 - No request is made before the user asks for it.
 

@@ -38,6 +38,12 @@ function openGuide(url: string) {
 }
 const savingSettings = ref(false);
 const settingsStatus = ref<string | null>(null);
+const appVersion = ref("");
+
+onMounted(async () => {
+  // The About card must not hard-code the version; the backend owns it.
+  appVersion.value = await api.appVersion().catch(() => "");
+});
 let settingsRequest = 0;
 const storageInstance = ref<string | null>(props.instances[0]?.name ?? null);
 const usage = ref<DiskUsage | null>(null);
@@ -651,7 +657,7 @@ async function copyRoot() {
         <span class="chip"><Icon name="info" :size="16" /></span>
         <div>
           <h2>{{ t("settings.about") }}</h2>
-          <p>{{ t("settings.aboutText") }}</p>
+          <p>{{ t("settings.aboutText", { version: appVersion || "?" }) }}</p>
         </div>
       </header>
       <div class="facts">

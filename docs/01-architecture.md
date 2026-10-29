@@ -7,7 +7,7 @@
    desktop.
 3. A launch is described by data (`LaunchPlan`) before anything is executed.
 4. Network access is explicit, typed and auditable.
-5. No global mutable state; no UI toolkit inside the core.
+5. No global mutable state in the core crates; no UI toolkit inside the core.
 
 ## Crate graph
 
@@ -60,7 +60,7 @@ nothing under `crates/` may depend on Tauri, Vue or any GUI crate.
    secret (the CurseForge key, proxy credentials, account tokens) is written with
    owner-only permissions (`0600`) and never logged.
 8. **Instance writes are atomic.** Metadata goes through a temp file and a
-   rename, so a crash leaves the previous `instance.toml` intact rather than a
+   rename, so a crash leaves the previous `instance.json` intact rather than a
    half-written one. Multi-step directory moves are not journalled.
 9. **Source and docs are English.** User-visible strings live in
    `apps/desktop/src/locales` (eight languages, English as the fallback).

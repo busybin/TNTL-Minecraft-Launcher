@@ -449,6 +449,8 @@ export interface ImportCandidate {
 export interface ImportScan {
   root: string;
   versions: ImportCandidate[];
+  /** Version directory the chosen path pointed at, if any. */
+  picked: string | null;
   skipped: string[];
 }
 
@@ -752,6 +754,7 @@ export const api = {
   exportInstance: (name: string, path: string, packName: string | null, packVersion: string) =>
     invoke<{ files: number; bytes: number }>("export_instance", { name, path, packName, packVersion }),
   launcherSettings: () => invoke<LauncherSettings>("launcher_settings"),
+  appVersion: () => invoke<string>("app_version"),
   frontendReady: () => invoke<void>("frontend_ready"),
   saveLauncherSettings: (settings: LauncherSettings) =>
     invoke<LauncherSettings>("save_launcher_settings", { settings }),

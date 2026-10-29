@@ -104,12 +104,23 @@ pub fn network_config() -> NetworkConfig {
 
 /// Apply the global proxy to a client builder.
 pub fn apply_proxy(builder: reqwest::blocking::ClientBuilder) -> Result<reqwest::blocking::ClientBuilder, SourceError> {
-    let config = network_config();
+    apply_proxy_with(builder, &network_config())
+}
+
+/// Same, for one explicit configuration. Tests use this so they do not have to
+/// mutate the process-wide setting while other tests build clients.
+fn apply_proxy_with(
+    builder: reqwest::blocking::ClientBuilder,
+    config: &NetworkConfig,
+) -> Result<reqwest::blocking::ClientBuilder, SourceError> {
     match config.mode {
         ProxyMode::None => Ok(builder.no_proxy()),
         ProxyMode::Http | ProxyMode::Socks5 => {
+            // A proxy mode without an address must not fall back to reqwest's
+            // environment detection: this launcher has no "follow the system"
+            // mode, so no address means a direct connection.
             let Some(url) = config.url.as_deref() else {
-                return Ok(builder);
+                return Ok(builder.no_proxy());
             };
             let mut proxy = reqwest::Proxy::all(url).map_err(|error| SourceError::Proxy {
                 url: url.to_string(),
@@ -169,14 +180,17 @@ mod tests {
 
     #[test]
     fn builds_a_client_with_proxy_credentials() {
-        set_network_config(NetworkConfig::from_parts_auth(
-            "http",
-            Some("127.0.0.1:7890"),
-            Some("user"),
-            Some("pa:ss@word"),
-        ));
-        let client = crate::Http::new();
-        set_network_config(NetworkConfig::default());
-        assert!(client.is_ok(), "{:?}", client.err());
+        // No global setting here: mutating it raced with other tests that build
+        // clients against a local server.
+        let config = NetworkConfig::from_parts_auth("http", Some("127.0.0.1:7890"), Some("user"), Some("pa:ss@word"));
+        let builder = apply_proxy_with(reqwest::blocking::Client::builder(), &config).expect("proxy setup");
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn a_proxy_mode_without_an_address_stays_direct() {
+        let config = NetworkConfig::from_parts("http", Some("  "));
+        assert!(config.url.is_none());
+        assert!(apply_proxy_with(reqwest::blocking::Client::builder(), &config).is_ok());
     }
 }

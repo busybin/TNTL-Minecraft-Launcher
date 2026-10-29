@@ -165,9 +165,9 @@ Mojang Studios or Microsoft.
 
 ## Known limitations
 
-- Windows builds are produced by cross-compiling and have not been run on a
-  real Windows machine yet; Windows shows an unknown-publisher prompt when the
-  installer starts.
+- Windows builds are unsigned, so Windows shows an unknown-publisher prompt
+  when the installer starts. The portable executable and the installer have
+  been tested on Windows; the launcher is cross-compiled from Linux.
 - Microsoft sign-in needs a client id from your own Entra app registration.
 - Self-update from GitHub Releases is not implemented.
 - Technic and ATLauncher packs are not supported.

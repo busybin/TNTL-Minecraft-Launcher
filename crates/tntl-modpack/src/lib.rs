@@ -312,6 +312,8 @@ const EXPORT_SKIP: &[&str] = &[
     "backups",
     "natives",
     "screenshots",
+    "servers.dat",
+    "usercache.json",
     "versions",
     "libraries",
     "assets",
@@ -354,7 +356,7 @@ pub fn export(game_dir: &Path, output: &Path, options: &ExportOptions<'_>) -> Re
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if dir == game_dir && EXPORT_SKIP.contains(&name.as_str()) {
+            if dir == game_dir && EXPORT_SKIP.contains(&name.to_ascii_lowercase().as_str()) {
                 continue;
             }
             let meta = fs::symlink_metadata(&path).map_err(|error| io_error(&path, error))?;

@@ -18,10 +18,12 @@ const scan = ref<ImportScan | null>(null);
 const picked = ref<string>("");
 const scanning = ref(false);
 let scanTimer: number | undefined;
+let scanToken = 0;
 
 // Launchers disagree about the id inside a version json, so the dialog lists
 // what is actually on disk instead of making the user type it.
 async function refreshScan(target: string) {
+  const token = ++scanToken;
   picked.value = "";
   scan.value = null;
   if (!target.trim()) {
@@ -30,12 +32,15 @@ async function refreshScan(target: string) {
   scanning.value = true;
   try {
     const result = await api.importCandidates(target.trim());
+    // A slow answer for an older path must not replace the current one.
+    if (token !== scanToken) return;
     scan.value = result;
-    picked.value = result.versions[0]?.id ?? "";
+    // Pointing at `versions/<id>` means that one, not the newest.
+    picked.value = result.picked ?? result.versions[0]?.id ?? "";
   } catch {
     // Not a readable directory (yet); Import reports the real error.
   } finally {
-    scanning.value = false;
+    if (token === scanToken) scanning.value = false;
   }
 }
 
@@ -136,12 +141,15 @@ async function run() {
               }}{{ candidate.loader ? ` · ${candidate.loader}${candidate.loader_version ? ` ${candidate.loader_version}` : ""}` : "" }}
             </option>
           </select>
-          <small v-if="scan.skipped.length">{{ t("import.skipped") }} {{ scan.skipped.join(", ") }}</small>
         </label>
         <label v-else>
           <span>{{ t("import.version") }} <small>{{ t("import.versionHint") }}</small></span>
           <input v-model="version" class="mono" spellcheck="false" :placeholder="t('import.versionPlaceholder')" />
         </label>
+        <p v-if="scan && scan.skipped.length" class="hint">
+          <Icon name="info" :size="13" />
+          <span>{{ t("import.skipped") }} {{ scan.skipped.join(", ") }}</span>
+        </p>
         <p class="hint">
           <Icon name="info" :size="13" />
           <span>{{ t("import.hint") }}</span>

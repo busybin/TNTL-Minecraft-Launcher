@@ -1243,13 +1243,20 @@ impl Launcher {
             return Ok(());
         }
         let account = account.expect("checked above");
+        // The skin pack format follows the game version, not the version
+        // directory: an imported `1.20.1-Forge_47.2.0` would otherwise parse
+        // as 1.20.0 and produce a pack the game rejects.
+        let game_version = self
+            .load_chain(&instance.layout(&self.root), &instance.version_id)
+            .map(|chain| environment_from_chain(&instance.version_id, &chain).game_version)
+            .unwrap_or_else(|_| instance.version_id.clone());
         match read_skin(&self.root, &account.id) {
             Some(png) => {
                 let variants = tntl_auth::arm_variants(&png, account.skin_model == SkinModel::Slim);
                 match variants {
                     Ok((wide, slim)) => {
                         if let Err(error) =
-                            tntl_instance::content::apply_default_skin(&game_dir, &instance.version_id, &wide, &slim)
+                            tntl_instance::content::apply_default_skin(&game_dir, &game_version, &wide, &slim)
                         {
                             eprintln!("cannot apply the offline skin: {error}");
                         }
@@ -1881,7 +1888,54 @@ impl Launcher {
 
     pub fn load_instance(&self, name: &str) -> Result<Instance> {
         let dir = self.instance_dir(name)?;
-        Instance::load(&dir).with_context(|| format!("cannot load instance {name} at {}", dir.display()))
+        let mut instance =
+            Instance::load(&dir).with_context(|| format!("cannot load instance {name} at {}", dir.display()))?;
+        if self.adopt_renamed_version(&mut instance) {
+            instance.save(&dir)?;
+        }
+        Ok(instance)
+    }
+
+    /// V4 stored the `id` inside the JSON when importing another launcher's
+    /// version. When that directory was renamed, the instance points at a
+    /// version that does not exist; rewrite it to the directory name when
+    /// exactly one sibling JSON claims that id.
+    fn adopt_renamed_version(&self, instance: &mut Instance) -> bool {
+        let layout = instance.layout(&self.root);
+        if layout.version_json(&instance.version_id).is_file() {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(layout.versions_dir()) else {
+            return false;
+        };
+        let mut found = None;
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().to_string();
+            let Ok(bytes) = fs::read(layout.version_json(&id)) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_slice::<VersionJson>(&bytes) else {
+                continue;
+            };
+            if json.id != instance.version_id {
+                continue;
+            }
+            if found.is_some() {
+                // Two directories claim the same id: leave it alone.
+                return false;
+            }
+            found = Some(id);
+        }
+        match found {
+            Some(id) => {
+                instance.version_id = id;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn create_instance(&self, instance: &Instance) -> Result<PathBuf> {
@@ -1945,11 +1999,23 @@ impl Launcher {
         let dir = self.instance_dir(name).ok()?;
         let path = dir.join(RUNNING_FILE);
         let bytes = fs::read(&path).ok()?;
-        let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                // A corrupt marker never blocks anything, but it would be
+                // re-read on every launch; drop it.
+                let _ = fs::remove_file(&path);
+                return None;
+            }
+        };
         let pid = value
             .get("pid")
             .and_then(serde_json::Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok())?;
+            .and_then(|pid| u32::try_from(pid).ok());
+        let Some(pid) = pid else {
+            let _ = fs::remove_file(&path);
+            return None;
+        };
         let started = value.get("start_time").and_then(serde_json::Value::as_u64);
         let same_process = match (started, process_start_time(pid)) {
             (Some(expected), Some(actual)) => expected == actual,
@@ -2299,8 +2365,11 @@ impl Launcher {
         if !path.is_dir() {
             bail!("{} is not a directory", path.display());
         }
-        let (root, _) = import_root(path);
-        Ok(scan_import_versions(&root))
+        let (root, picked) = import_root(path);
+        let mut scan = scan_import_versions(&root);
+        // Pointing at `versions/<id>` means that version, not the newest one.
+        scan.picked = picked.filter(|id| scan.versions.iter().any(|candidate| &candidate.id == id));
+        Ok(scan)
     }
 
     /// Register an existing `.minecraft` directory as an instance without
@@ -3513,14 +3582,15 @@ impl Launcher {
         invalidate_java_scan();
         let http = Http::new()?;
         let home = self.java_dir().join(sanitize_name(component));
-        if let Some(major) = tntl_runtime::adoptium::major_of(component) {
-            return Ok(tntl_runtime::adoptium::install(&http, &home, major, &mut |event| {
-                progress(event)
-            })?);
-        }
-        Ok(tntl_runtime::install(&http, &home, component, &mut |event| {
-            progress(event)
-        })?)
+        let installed = if let Some(major) = tntl_runtime::adoptium::major_of(component) {
+            tntl_runtime::adoptium::install(&http, &home, major, &mut |event| progress(event))
+        } else {
+            tntl_runtime::install(&http, &home, component, &mut |event| progress(event))
+        };
+        // Drop the scan made before the install (and any made while it ran), so
+        // the next plan sees the new runtime immediately.
+        invalidate_java_scan();
+        Ok(installed?)
     }
 
     /// Fetch a loader profile and check that it is safe to install.
@@ -5122,6 +5192,7 @@ impl Launcher {
     /// Copy an instance directory under a new name.
     pub fn duplicate_instance(&self, name: &str, new_name: &str) -> Result<PathBuf> {
         validate_name(new_name)?;
+        self.ensure_not_running(name)?;
         let source = self.instance_dir(name)?;
         if !source.join(tntl_instance::INSTANCE_FILE).exists() {
             bail!("instance {name} does not exist");
@@ -5716,7 +5787,7 @@ fn copy_game_dir(from: &Path, to: &Path) -> Result<()> {
             let relative = path.strip_prefix(from).unwrap_or(&path);
             if relative.components().count() == 1
                 && matches!(
-                    name.as_str(),
+                    name.to_ascii_lowercase().as_str(),
                     "logs" | "crash-reports" | "natives" | "versions" | "libraries" | "assets"
                 )
             {
@@ -6108,6 +6179,8 @@ pub struct ImportScan {
     pub root: PathBuf,
     /// Newest first, so the default pick is the most recently installed one.
     pub versions: Vec<ImportCandidate>,
+    /// Directory the user pointed at, when that was a single version folder.
+    pub picked: Option<String>,
     /// Directories under `versions/` with a missing or unreadable JSON.
     pub skipped: Vec<String>,
 }
@@ -6188,6 +6261,7 @@ fn scan_import_versions(root: &Path) -> ImportScan {
     ImportScan {
         root: root.to_path_buf(),
         versions,
+        picked: None,
         skipped,
     }
 }
@@ -7007,6 +7081,58 @@ mod tests {
             .to_string();
         assert!(error.contains("is running"), "{error}");
         let error = launcher.save_servers("live", &[]).unwrap_err().to_string();
+        assert!(error.contains("is running"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_candidates_preselect_the_clicked_version() {
+        let root = std::env::temp_dir().join(format!("tntl-import-picked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game = root.join("game");
+        for id in ["1.20.1", "1.21.1"] {
+            let path = game.join("versions").join(id).join(format!("{id}.json"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!(r#"{{"id":"{id}"}}"#)).unwrap();
+        }
+        let launcher = Launcher::from_root(Some(root.clone()));
+        assert_eq!(launcher.import_candidates(&game).unwrap().picked, None);
+        let scan = launcher.import_candidates(&game.join("versions/1.20.1")).unwrap();
+        assert_eq!(scan.picked.as_deref(), Some("1.20.1"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_renamed_version_from_an_older_import_is_repaired() {
+        let root = std::env::temp_dir().join(format!("tntl-import-repair-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        let game = root.join("game");
+        let json = game.join("versions/1.21.1-Neoforge/1.21.1-Neoforge.json");
+        fs::create_dir_all(json.parent().unwrap()).unwrap();
+        fs::write(&json, r#"{"id":"neoforge-21.1.264"}"#).unwrap();
+        let dir = launcher.instance_dir("old").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let mut instance = Instance::new("old", "neoforge-21.1.264");
+        instance.root = Some(game.clone());
+        instance.game_dir = Some(game);
+        instance.save(&dir).unwrap();
+
+        let loaded = launcher.load_instance("old").unwrap();
+        assert_eq!(loaded.version_id, "1.21.1-Neoforge");
+        // Persisted, so the next read does not have to repair again.
+        assert_eq!(Instance::load(&dir).unwrap().version_id, "1.21.1-Neoforge");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn duplicating_a_running_instance_is_refused() {
+        let root = std::env::temp_dir().join(format!("tntl-duplicate-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.create_instance(&Instance::new("live", "1.20.1")).unwrap();
+        launcher.mark_running("live", std::process::id()).unwrap();
+        let error = launcher.duplicate_instance("live", "copy").unwrap_err().to_string();
         assert!(error.contains("is running"), "{error}");
         let _ = fs::remove_dir_all(&root);
     }

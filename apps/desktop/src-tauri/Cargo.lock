@@ -3804,7 +3804,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tntl-app"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-auth"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "md-5",
  "png 0.18.1",
@@ -3847,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-curseforge"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3860,7 +3860,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-desktop"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3882,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-doctor"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3891,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-forge"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3904,7 +3904,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-ftb"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3916,7 +3916,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-instance"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "flate2",
  "serde",
@@ -3928,14 +3928,14 @@ dependencies = [
 
 [[package]]
 name = "tntl-java"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "tntl-launch"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "thiserror 2.0.21",
  "tntl-resolve",
@@ -3944,7 +3944,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-model"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "regex",
  "serde",
@@ -3953,7 +3953,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-modpack"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3965,7 +3965,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-modrinth"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3975,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-resolve"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3987,7 +3987,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-runtime"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "flate2",
  "hex",
@@ -4003,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-source"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "hex",
  "reqwest 0.12.28",
@@ -4017,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-status"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4026,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "tntl-store"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "hex",
  "serde",

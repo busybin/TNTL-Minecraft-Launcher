@@ -62,7 +62,9 @@ fn io_err(path: &Path, source: io::Error) -> ArchiveError {
 
 fn skipped(relative: &Path) -> bool {
     relative.components().next().is_some_and(|part| match part {
-        Component::Normal(name) => name.to_str().is_some_and(|name| SKIP.contains(&name)),
+        Component::Normal(name) => name
+            .to_str()
+            .is_some_and(|name| SKIP.contains(&name.to_ascii_lowercase().as_str())),
         _ => false,
     })
 }

@@ -57,7 +57,9 @@ pnpm tauri build --bundles nsis           # Windows installer (works cross-compi
 
 Bundles land in `$CARGO_TARGET_DIR/release/bundle/`. The AppImage is
 self-contained; the deb expects the distribution to provide webkit2gtk-4.1.
-The NSIS installer is configured but has not been built on Windows yet.
+Release builds use the integer version for the file names and package
+metadata; Windows executables also carry it in their version resource. The
+NSIS installer is built cross-compiled with `--bundles nsis`.
 
 ## Bundles
 

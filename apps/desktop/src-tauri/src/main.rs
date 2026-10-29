@@ -2047,6 +2047,12 @@ fn frontend_ready() {
     append_log("frontend", "the interface finished mounting");
 }
 
+/// Integer major version shown in the About card; `--version` prints the same.
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION_MAJOR")
+}
+
 /// Milliseconds: two launches within the same second used to share a log file.
 fn timestamp() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2143,13 +2149,14 @@ fn append_log(kind: &str, detail: &str) -> Option<PathBuf> {
 /// Details the launcher cannot ask the user for. A start that dies before the
 /// window opens is almost always a missing WebView2 runtime or a data folder
 /// the current account cannot write, so record both.
-fn startup_notes() -> String {
+fn startup_notes(root: &Path) -> String {
     let mut notes = vec![format!(
         "version {} on {} {}",
         env!("CARGO_PKG_VERSION_MAJOR"),
         std::env::consts::OS,
         std::env::consts::ARCH
     )];
+    notes.push(format!("launcher root {} writable={}", root.display(), writable(root)));
     match dirs::data_local_dir() {
         Some(local) => {
             let webview = local.join("io.github.busybin.tntl");
@@ -2266,12 +2273,12 @@ fn main() {
     }
 
     install_panic_hook();
-    append_log("start", &startup_notes());
+    let root = initial_root();
+    append_log("start", &startup_notes(&root));
 
     #[cfg(target_os = "linux")]
     configure_webview();
 
-    let root = initial_root();
     let started = tauri::Builder::default()
         .setup(|app| {
             // The window and the webview exist at this point. A log that stops
@@ -2396,6 +2403,7 @@ fn main() {
             open_path,
             open_url,
             frontend_ready,
+            app_version,
             launch_instance,
             stop_game,
             running_instance,
