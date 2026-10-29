@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -2119,12 +2119,99 @@ fn log_failure(kind: &str, detail: &str) -> Option<PathBuf> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // Every start appends, so keep the file from growing forever.
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 256 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
     let entry = format!("[{}] {kind}\n{detail}\n\n", timestamp());
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
         let _ = file.write_all(entry.as_bytes());
     }
     Some(path)
+}
+
+/// Details the launcher cannot ask the user for. A start that dies before the
+/// window opens is almost always a missing WebView2 runtime or a data folder
+/// the current account cannot write, so record both.
+fn startup_notes() -> String {
+    let mut notes = vec![format!(
+        "version {} on {} {}",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )];
+    match dirs::data_local_dir() {
+        Some(local) => {
+            let webview = local.join("io.github.busybin.tntl");
+            notes.push(format!(
+                "webview data {}: exists={} writable={}",
+                webview.display(),
+                webview.is_dir(),
+                writable(&webview)
+            ));
+            notes.push(webview_runtime(&local));
+        }
+        None => notes.push("no local app data directory".to_string()),
+    }
+    if let Some(data) = dirs::data_dir() {
+        let launcher = data.join("tntl");
+        notes.push(format!("launcher data {} writable={}", launcher.display(), writable(&launcher)));
+    }
+    notes.push(format!("elevated={}", elevated()));
+    notes.join("\n")
+}
+
+fn writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join("startup-probe");
+    let written = std::fs::write(&probe, b"ok").is_ok();
+    let _ = std::fs::remove_file(probe);
+    written
+}
+
+/// Whether the token carries the high mandatory level, i.e. whether this is the
+/// "run as administrator" launch the user compared against.
+fn elevated() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    std::process::Command::new("whoami")
+        .arg("/groups")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288"))
+        .unwrap_or(false)
+}
+
+fn webview_runtime(local: &Path) -> String {
+    let roots = [
+        PathBuf::from(r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application"),
+        local.join(r"Microsoft\EdgeWebView\Application"),
+    ];
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        // The runtime keeps its builds in version folders next to `SetupMetrics`.
+        let mut versions: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(|first: char| first.is_ascii_digit()))
+            .collect();
+        versions.sort_by_key(|name| {
+            let mut parts = [0u64; 4];
+            for (slot, part) in parts.iter_mut().zip(name.split('.')) {
+                *slot = part.parse().unwrap_or(0);
+            }
+            parts
+        });
+        if let Some(latest) = versions.last() {
+            return format!("webview2 runtime {latest} at {}", root.display());
+        }
+    }
+    "webview2 runtime not found".to_string()
 }
 
 fn report_failure(title: &str, detail: &str) {
@@ -2156,10 +2243,7 @@ fn main() {
     }
 
     install_panic_hook();
-    log_failure(
-        "start",
-        &format!("version {} on {}", env!("CARGO_PKG_VERSION_MAJOR"), std::env::consts::OS),
-    );
+    log_failure("start", &startup_notes());
 
     #[cfg(target_os = "linux")]
     configure_webview();
