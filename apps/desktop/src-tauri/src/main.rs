@@ -2021,6 +2021,7 @@ fn open_url(url: String) -> Result<(), String> {
             .arg("start")
             .arg("")
             .raw_arg(format!("\"{}\"", url.replace('"', "%22")));
+        command.creation_flags(0x0800_0000);
         command
     };
     #[cfg(target_os = "linux")]
@@ -2037,6 +2038,13 @@ fn open_url(url: String) -> Result<(), String> {
 
 fn message(error: impl std::fmt::Display) -> String {
     format!("{error:#}")
+}
+
+/// The frontend calls this once its views are mounted: the last startup stage
+/// in `launcher.log`. A window that opens but never logs this stays blank.
+#[tauri::command]
+fn frontend_ready() {
+    append_log("frontend", "the interface finished mounting");
 }
 
 /// Milliseconds: two launches within the same second used to share a log file.
@@ -2109,8 +2117,9 @@ fn initial_root() -> PathBuf {
 
 /// A GUI-subsystem binary dies without a word when startup fails or a thread
 /// panics, which is impossible to report from the user's side. Append to a log
-/// file and show the reason in a dialog instead.
-fn log_failure(kind: &str, detail: &str) -> Option<PathBuf> {
+/// file and show the reason in a dialog instead. Startup stages go here too, so
+/// a run that dies before the window opens shows how far it got.
+fn append_log(kind: &str, detail: &str) -> Option<PathBuf> {
     let path = dirs::data_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("tntl")
@@ -2156,7 +2165,11 @@ fn startup_notes() -> String {
     }
     if let Some(data) = dirs::data_dir() {
         let launcher = data.join("tntl");
-        notes.push(format!("launcher data {} writable={}", launcher.display(), writable(&launcher)));
+        notes.push(format!(
+            "launcher data {} writable={}",
+            launcher.display(),
+            writable(&launcher)
+        ));
     }
     notes.push(format!("elevated={}", elevated()));
     notes.join("\n")
@@ -2175,14 +2188,20 @@ fn writable(dir: &Path) -> bool {
 /// Whether the token carries the high mandatory level, i.e. whether this is the
 /// "run as administrator" launch the user compared against.
 fn elevated() -> bool {
-    if !cfg!(windows) {
-        return false;
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
     }
-    std::process::Command::new("whoami")
-        .arg("/groups")
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288"))
-        .unwrap_or(false)
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("whoami")
+            .arg("/groups")
+            .creation_flags(0x0800_0000)
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288"))
+            .unwrap_or(false)
+    }
 }
 
 fn webview_runtime(local: &Path) -> String {
@@ -2215,7 +2234,7 @@ fn webview_runtime(local: &Path) -> String {
 }
 
 fn report_failure(title: &str, detail: &str) {
-    let path = log_failure(title, detail);
+    let path = append_log(title, detail);
     let where_to = path
         .map(|path| format!("\n\nA log was written to {}", path.display()))
         .unwrap_or_default();
@@ -2238,18 +2257,28 @@ fn main() {
     // Answer `--version` before the toolkit starts: the packaged shell has no
     // CLI binary, so this is how a terminal finds out what is installed.
     if std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V") {
-        println!("tntl {}", env!("CARGO_PKG_VERSION_MAJOR"));
+        // A GUI-subsystem process may have no usable stdout handle (double
+        // click, or a terminal that did not pass one on); writing to it must
+        // not panic before the error hook exists.
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "tntl {}", env!("CARGO_PKG_VERSION_MAJOR"));
         return;
     }
 
     install_panic_hook();
-    log_failure("start", &startup_notes());
+    append_log("start", &startup_notes());
 
     #[cfg(target_os = "linux")]
     configure_webview();
 
     let root = initial_root();
     let started = tauri::Builder::default()
+        .setup(|_| {
+            // The window and the webview exist at this point. A log that stops
+            // at "window" means the frontend never became interactive.
+            append_log("window", "the main window was created");
+            Ok(())
+        })
         .manage(AppState {
             root: Mutex::new(root),
             game: Mutex::new(None),
@@ -2351,6 +2380,7 @@ fn main() {
             pick_save_file,
             open_path,
             open_url,
+            frontend_ready,
             launch_instance,
             stop_game,
             running_instance,
@@ -2390,4 +2420,5 @@ fn main() {
         report_failure("TNTL could not start", &format!("{error:#}"));
         std::process::exit(1);
     }
+    append_log("exit", "the event loop ended");
 }

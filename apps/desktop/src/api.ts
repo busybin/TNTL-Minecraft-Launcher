@@ -752,6 +752,7 @@ export const api = {
   exportInstance: (name: string, path: string, packName: string | null, packVersion: string) =>
     invoke<{ files: number; bytes: number }>("export_instance", { name, path, packName, packVersion }),
   launcherSettings: () => invoke<LauncherSettings>("launcher_settings"),
+  frontendReady: () => invoke<void>("frontend_ready"),
   saveLauncherSettings: (settings: LauncherSettings) =>
     invoke<LauncherSettings>("save_launcher_settings", { settings }),
   setInstanceIcon: (name: string, path: string) => invoke<string>("set_instance_icon", { name, path }),

@@ -564,6 +564,8 @@ onMounted(async () => {
       error.value = String(cause);
     }
   }
+  // Last startup stage in the launcher log; a blank window stops before it.
+  await api.frontendReady().catch(() => undefined);
 });
 
 onUnmounted(() => {

@@ -204,6 +204,11 @@ impl LaunchPlan {
 pub struct ResolveInput {
     /// Target version first, then its parents (`inheritsFrom` chain).
     pub chain: Vec<VersionJson>,
+    /// Directory name of the target version. Launchers rename a directory
+    /// without rewriting the `id` inside its JSON (HMCL keeps
+    /// `neoforge-21.1.264` in `versions/1.21.1-Neoforge`), and every file path
+    /// and `--version` follows the directory, not the JSON.
+    pub version_dir: Option<String>,
     pub roots: RootLayout,
     pub env: Environment,
     pub account: Account,
@@ -430,6 +435,7 @@ fn ensure_slash(url: &str) -> String {
 pub fn plan(input: &ResolveInput) -> Result<LaunchPlan, ResolveError> {
     let merged = merge(&input.chain, &input.env)?;
     let version_id = merged.id.clone();
+    let version_dir = input.version_dir.clone().unwrap_or_else(|| version_id.clone());
     let main_class = merged
         .main_class
         .clone()
@@ -444,11 +450,16 @@ pub fn plan(input: &ResolveInput) -> Result<LaunchPlan, ResolveError> {
     };
 
     // Client jar: prefer the target version, fall back to an ancestor's jar
-    // (loader versions such as Forge ship no jar of their own).
+    // (loader versions such as Forge ship no jar of their own). Each chain
+    // entry's directory is the id we loaded it by: the requested version for
+    // the first entry, the previous entry's `inheritsFrom` for the rest.
     let mut client_jar = None;
     let mut client_download: Option<(String, tntl_model::Artifact)> = None;
+    let mut parent_id: Option<&str> = Some(version_dir.as_str());
     for version in &input.chain {
-        let path = input.roots.client_jar(&version.id);
+        let dir_id = parent_id.unwrap_or(version.id.as_str());
+        parent_id = version.inherits_from.as_deref();
+        let path = input.roots.client_jar(dir_id);
         let download = version
             .downloads
             .as_ref()
@@ -462,7 +473,7 @@ pub fn plan(input: &ResolveInput) -> Result<LaunchPlan, ResolveError> {
         if client_download.is_none()
             && let Some(download) = download
         {
-            client_download = Some((version.id.clone(), download));
+            client_download = Some((dir_id.to_string(), download));
         }
     }
     let client_jar = match client_jar {
@@ -470,7 +481,7 @@ pub fn plan(input: &ResolveInput) -> Result<LaunchPlan, ResolveError> {
         None => {
             let (id, download) = match client_download {
                 Some(value) => value,
-                None => (version_id.clone(), tntl_model::Artifact::default()),
+                None => (version_dir.clone(), tntl_model::Artifact::default()),
             };
             let path = input.roots.client_jar(&id);
             planner.missing(
@@ -633,6 +644,7 @@ pub fn plan(input: &ResolveInput) -> Result<LaunchPlan, ResolveError> {
                 &classpath,
                 classpath_separator,
                 &input.launcher_version,
+                &version_dir,
             )
         });
         *arg = value;
@@ -689,6 +701,7 @@ pub fn plan(input: &ResolveInput) -> Result<LaunchPlan, ResolveError> {
                     &classpath,
                     classpath_separator,
                     &input.launcher_version,
+                    &version_dir,
                 )
             })
         })
@@ -702,6 +715,27 @@ pub fn plan(input: &ResolveInput) -> Result<LaunchPlan, ResolveError> {
         jvm_args.push(classpath.clone());
     }
     jvm_args.extend(input.options.extra_jvm_args.iter().cloned());
+    // The live console decodes the JVM's stdout as UTF-8. On Windows the
+    // output encoding follows the console code page (GBK on Chinese systems),
+    // which turned every non-ASCII log line into mojibake in the GUI, the saved
+    // launch log and the crash summary. These properties only affect the
+    // standard streams; file names and file contents keep the platform default.
+    if input.env.os_name() == "windows" {
+        for flag in [
+            "-Dstdout.encoding=UTF-8",
+            "-Dstderr.encoding=UTF-8",
+            "-Dsun.stdout.encoding=UTF-8",
+            "-Dsun.stderr.encoding=UTF-8",
+        ] {
+            let key = flag.split('=').next().unwrap_or(flag);
+            if !jvm_args
+                .iter()
+                .any(|arg| arg == key || arg.starts_with(&format!("{key}=")))
+            {
+                jvm_args.push(flag.to_string());
+            }
+        }
+    }
     // Versions before 1.13 list no JVM arguments at all, so nothing points the
     // JVM at the extracted natives.
     if !jvm_args.iter().any(|arg| arg.starts_with("-Djava.library.path")) {
@@ -781,6 +815,7 @@ fn lookup_variable(
     classpath: &str,
     classpath_separator: &str,
     launcher_version: &str,
+    version_dir: &str,
 ) -> Option<String> {
     let value = match key {
         "auth_player_name" | "auth_name" => account.username.clone(),
@@ -794,7 +829,7 @@ fn lookup_variable(
         // Telemetry-only values. Leaving the placeholders in makes the game
         // parse the literal `${clientid}` text.
         "clientid" | "auth_xuid" => String::new(),
-        "version_name" => merged.id.clone(),
+        "version_name" => version_dir.to_string(),
         "version_type" => merged.version_type.clone().unwrap_or_else(|| "release".to_string()),
         "game_directory" => options.game_dir.display().to_string(),
         "assets_root" | "game_assets" => assets_root.display().to_string(),
@@ -829,6 +864,7 @@ mod tests {
     fn input(os: OsName) -> ResolveInput {
         ResolveInput {
             chain: vec![fixture()],
+            version_dir: None,
             roots: RootLayout::new("/nonexistent/root"),
             env: Environment::fixed(os, tntl_model::Arch::X86_64),
             account: Account::offline("Player").unwrap(),
@@ -941,6 +977,35 @@ mod tests {
             .unwrap();
         assert!(classpath.contains(';'));
         assert!(plan.natives[0].path.to_string_lossy().contains("natives-windows"));
+        // The console stream has to be UTF-8 even on a GBK Windows install.
+        assert!(plan.jvm_args.iter().any(|arg| arg == "-Dstdout.encoding=UTF-8"));
+        assert!(plan.jvm_args.iter().any(|arg| arg == "-Dsun.stdout.encoding=UTF-8"));
+    }
+
+    #[test]
+    fn renamed_version_directories_resolve_their_own_files() {
+        // HMCL keeps the installer's id in the JSON of a renamed directory.
+        let mut input = input(OsName::Linux);
+        input.version_dir = Some("1.20.1-modpack".to_string());
+        let plan = super::plan(&input).unwrap();
+        let missing = plan
+            .missing
+            .iter()
+            .find(|missing| missing.kind == MissingKind::ClientJar)
+            .unwrap();
+        assert!(
+            missing.path.to_string_lossy().contains("1.20.1-modpack"),
+            "{}",
+            missing.path.display()
+        );
+        assert!(plan.game_args.iter().any(|arg| arg == "1.20.1-modpack"));
+        assert!(plan.classpath[0].ends_with("1.20.1-modpack/1.20.1-modpack.jar"));
+    }
+
+    #[test]
+    fn linux_does_not_force_the_stream_encoding() {
+        let plan = super::plan(&input(OsName::Linux)).unwrap();
+        assert!(!plan.jvm_args.iter().any(|arg| arg.starts_with("-Dstdout.encoding")));
     }
 
     #[test]

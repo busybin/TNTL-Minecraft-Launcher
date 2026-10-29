@@ -25,10 +25,16 @@ impl JavaInstall {
 
 /// Run a JVM and parse `-XshowSettings:properties -version`.
 pub fn probe(path: &Path) -> Option<JavaInstall> {
-    let output = Command::new(path)
-        .args(["-XshowSettings:properties", "-version"])
-        .output()
-        .ok()?;
+    let mut command = Command::new(path);
+    command.args(["-XshowSettings:properties", "-version"]);
+    // The desktop shell is a GUI process, so a console child would flash a
+    // black window on every probe (and discovery probes every JVM it finds).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }

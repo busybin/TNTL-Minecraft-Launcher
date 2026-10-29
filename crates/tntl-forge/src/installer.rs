@@ -706,7 +706,8 @@ fn run_java(java: &Path, classpath: &[PathBuf], main: &str, args: &[String], cwd
     let log_path = cwd.join("processor.log");
     let log = File::create(&log_path).map_err(|source| io(&log_path, source))?;
     let errors = log.try_clone().map_err(|source| io(&log_path, source))?;
-    let mut child = Command::new(java)
+    let mut command = Command::new(java);
+    command
         .arg("-cp")
         .arg(joined)
         .arg(main)
@@ -714,9 +715,15 @@ fn run_java(java: &Path, classpath: &[PathBuf], main: &str, args: &[String], cwd
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(errors))
-        .spawn()
-        .map_err(|source| io(java, source))?;
+        .stderr(Stdio::from(errors));
+    // A GUI launcher must not open a console window for each of the six to ten
+    // processors a Forge installer runs.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().map_err(|source| io(java, source))?;
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|source| io(java, source))? {

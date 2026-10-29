@@ -301,7 +301,10 @@ pub struct ExportReport {
     pub bytes: u64,
 }
 
-/// Top-level game directories that do not belong in a shareable pack.
+/// Top-level game directories that do not belong in a shareable pack. An
+/// imported `.minecraft` also holds the shared root (versions, libraries,
+/// assets); copying that into `overrides/` would add hundreds of megabytes the
+/// pack cannot use.
 const EXPORT_SKIP: &[&str] = &[
     "logs",
     "crash-reports",
@@ -309,6 +312,9 @@ const EXPORT_SKIP: &[&str] = &[
     "backups",
     "natives",
     "screenshots",
+    "versions",
+    "libraries",
+    "assets",
     ".mixin.out",
 ];
 
@@ -602,6 +608,45 @@ mod tests {
         assert_eq!(PackLoader::NeoForge.install_version("1.21.1", "21.1.264"), "21.1.264");
         assert_eq!(PackLoader::Fabric.install_version("1.20.1", "0.16.0"), "0.16.0");
         assert_eq!(PackLoader::from_key("quilt-loader"), Some(PackLoader::Quilt));
+    }
+
+    #[test]
+    fn export_leaves_the_shared_root_out_of_overrides() {
+        let dir = std::env::temp_dir().join(format!("tntl-modpack-export-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let game = dir.join("game");
+        fs::create_dir_all(game.join("mods")).unwrap();
+        fs::write(game.join("mods/a.jar"), b"jar").unwrap();
+        fs::create_dir_all(game.join("versions/1.20.1")).unwrap();
+        fs::write(game.join("versions/1.20.1/1.20.1.json"), b"{}").unwrap();
+        fs::create_dir_all(game.join("libraries/net")).unwrap();
+        fs::write(game.join("libraries/net/a.jar"), b"lib").unwrap();
+        fs::create_dir_all(game.join("assets/objects/aa")).unwrap();
+        fs::write(game.join("assets/objects/aa/bb"), b"obj").unwrap();
+        let output = dir.join("out.mrpack");
+        let options = ExportOptions {
+            name: "Pack",
+            version: "1",
+            game: "1.20.1",
+            loader: None,
+            summary: "",
+        };
+        export(&game, &output, &options).unwrap();
+        let file = fs::File::open(&output).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..zip.len())
+            .map(|index| zip.by_index(index).unwrap().name().to_string())
+            .collect();
+        assert!(names.iter().any(|name| name == "overrides/mods/a.jar"), "{names:?}");
+        // An imported game directory is the other launcher's root; the pack
+        // must not carry its versions, libraries and assets.
+        for prefix in ["overrides/versions/", "overrides/libraries/", "overrides/assets/"] {
+            assert!(
+                !names.iter().any(|name| name.starts_with(prefix)),
+                "{prefix} in {names:?}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

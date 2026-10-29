@@ -215,7 +215,7 @@ pub fn launch(plan: &LaunchPlan, options: &LaunchOptions) -> Result<GameProcess,
             path: options.log_path.clone(),
             source,
         })?;
-    let mut command = Command::new(&plan.java);
+    let mut command = Command::new(launch_binary(&plan.java));
     command
         .args(&plan.jvm_args)
         .arg(&plan.main_class)
@@ -223,6 +223,15 @@ pub fn launch(plan: &LaunchPlan, options: &LaunchOptions) -> Result<GameProcess,
         .current_dir(&plan.working_dir)
         .envs(&plan.env)
         .stdin(Stdio::null());
+    // `java.exe` is a console program; spawned from the GUI shell it would open
+    // a window that stays for the whole session (and closing it kills the game).
+    // `javaw.exe` is the window-less twin, and the flag covers a custom runtime
+    // where only `java.exe` exists.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
     #[cfg(unix)]
     apply_utf8_locale(&mut command, &plan.env);
     if options.detach_output {
@@ -265,6 +274,25 @@ pub fn launch(plan: &LaunchPlan, options: &LaunchOptions) -> Result<GameProcess,
         started: Instant::now(),
         pumps,
     })
+}
+
+/// The JVM binary to spawn. The JDK ships `javaw.exe` next to `java.exe`; it is
+/// the same JVM as a GUI-subsystem process, so no console window appears. When
+/// only `java.exe` exists the hidden-console flag covers it.
+fn launch_binary(java: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if java
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("java.exe"))
+        {
+            let javaw = java.with_file_name("javaw.exe");
+            if javaw.is_file() {
+                return javaw;
+            }
+        }
+    }
+    java.to_path_buf()
 }
 
 /// Java decodes file names with the process locale. Under `LANG=POSIX` or no

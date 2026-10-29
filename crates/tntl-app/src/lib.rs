@@ -1982,11 +1982,16 @@ impl Launcher {
     }
 
     /// Delete an instance and, when asked, the version directories only it used.
-    /// Returns the version ids that were removed.
+    /// Returns the version ids that were removed. Imported instances keep their
+    /// versions in the other launcher's root, so nothing is cleaned there.
     pub fn delete_instance_with_cleanup(&self, name: &str, cleanup: bool) -> Result<Vec<String>> {
+        let imported = self
+            .load_instance(name)
+            .map(|instance| instance.root.is_some())
+            .unwrap_or(false);
         let chain = self.instance_chain(name);
         self.delete_instance(name)?;
-        if !cleanup {
+        if !cleanup || imported {
             return Ok(Vec::new());
         }
         let mut removed = Vec::new();
@@ -2018,16 +2023,19 @@ impl Launcher {
         }
     }
 
-    /// Instances that launch through `id`, loader versions included.
+    /// Instances that launch through `id`, loader versions included. Versions
+    /// are only shared inside one root, so imported instances (another
+    /// launcher's `.minecraft`) are not counted for the launcher's own files.
     pub fn version_users(&self, id: &str) -> Vec<String> {
         self.instance_chains()
             .into_iter()
-            .filter(|(_, chain)| chain.iter().any(|version| version.as_str() == id))
-            .map(|(name, _)| name)
+            .filter(|(_, chain, launcher_root)| *launcher_root && chain.iter().any(|version| version.as_str() == id))
+            .map(|(name, _, _)| name)
             .collect()
     }
 
-    fn instance_chains(&self) -> Vec<(String, Vec<String>)> {
+    /// `(name, version chain, whether the chain lives in the launcher root)`.
+    fn instance_chains(&self) -> Vec<(String, Vec<String>, bool)> {
         let Ok(entries) = fs::read_dir(self.instances_dir()) else {
             return Vec::new();
         };
@@ -2039,9 +2047,14 @@ impl Launcher {
         names.sort();
         names
             .into_iter()
-            .map(|name| {
-                let chain = self.instance_chain(&name);
-                (name, chain)
+            .filter_map(|name| {
+                let dir = self.instance_dir(&name).ok()?;
+                let instance = Instance::load(&dir).ok()?;
+                let chain = self
+                    .load_chain(&instance.layout(&self.root), &instance.version_id)
+                    .map(|chain| chain.into_iter().map(|json| json.id).collect())
+                    .unwrap_or_else(|_| vec![instance.version_id.clone()]);
+                Some((name, chain, instance.root.is_none()))
             })
             .collect()
     }
@@ -2154,6 +2167,19 @@ impl Launcher {
         // not leak into the restored instance.
         instance.root = None;
         instance.game_dir = None;
+        // An imported game directory is archived under `minecraft/` together
+        // with its versions, libraries and assets. Without pointing the
+        // instance at it the restored copy would look for a version that only
+        // exists inside its own archive.
+        let minecraft = dir.join("minecraft");
+        let version_json = minecraft
+            .join("versions")
+            .join(&instance.version_id)
+            .join(format!("{}.json", instance.version_id));
+        if version_json.is_file() {
+            instance.root = Some(minecraft.clone());
+            instance.game_dir = Some(minecraft);
+        }
         instance.save(&dir)?;
         Ok(instance)
     }
@@ -2191,6 +2217,7 @@ impl Launcher {
         name: &str,
         entries: &[tntl_instance::servers::ServerEntry],
     ) -> Result<Vec<tntl_instance::servers::ServerEntry>> {
+        self.ensure_not_running(name)?;
         let game_dir = self.game_dir(name)?;
         tntl_instance::servers::save(&game_dir, entries)?;
         Ok(tntl_instance::servers::list(&game_dir)?)
@@ -2220,6 +2247,7 @@ impl Launcher {
     /// Remove data the game or the launcher can rebuild: logs, crash reports
     /// and extracted natives.
     pub fn cleanup(&self, name: &str) -> Result<CleanupReport> {
+        self.ensure_not_running(name)?;
         let dir = self.instance_dir(name)?;
         let game_dir = self.game_dir(name)?;
         let targets = [
@@ -2590,6 +2618,7 @@ impl Launcher {
         }
         let input = ResolveInput {
             chain,
+            version_dir: Some(instance.version_id.clone()),
             roots: layout,
             env,
             account,
@@ -2679,8 +2708,10 @@ impl Launcher {
             .map(|id| {
                 let instances = chains
                     .iter()
-                    .filter(|(_, chain)| chain.iter().any(|version| version.as_str() == id.as_str()))
-                    .map(|(name, _)| name.clone())
+                    .filter(|(_, chain, launcher_root)| {
+                        *launcher_root && chain.iter().any(|version| version.as_str() == id.as_str())
+                    })
+                    .map(|(name, _, _)| name.clone())
                     .collect::<Vec<_>>();
                 let bytes = dir_size(&self.versions_dir().join(&id));
                 InstalledVersion { id, bytes, instances }
@@ -4910,6 +4941,7 @@ impl Launcher {
 
     /// Zip one world into `<instance>/backups/worlds/`.
     pub fn backup_world(&self, name: &str, world: &str) -> Result<PathBuf> {
+        self.ensure_not_running(name)?;
         let dir = self.instance_dir(name)?;
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&dir);
@@ -4957,6 +4989,7 @@ impl Launcher {
     }
 
     pub fn delete_world(&self, name: &str, world: &str) -> Result<()> {
+        self.ensure_not_running(name)?;
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
         tntl_instance::worlds::delete(&game_dir, world)?;
@@ -4966,6 +4999,7 @@ impl Launcher {
 
     /// Copy a world inside the same instance.
     pub fn duplicate_world(&self, name: &str, world: &str) -> Result<WorldInfo> {
+        self.ensure_not_running(name)?;
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
         Ok(tntl_instance::worlds::duplicate(
@@ -4977,6 +5011,7 @@ impl Launcher {
 
     /// Import a world zip; also restores one of this instance's backups.
     pub fn import_world(&self, name: &str, archive: &Path) -> Result<WorldInfo> {
+        self.ensure_not_running(name)?;
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
         Ok(tntl_instance::worlds::import(&game_dir, archive)?)
@@ -4997,6 +5032,7 @@ impl Launcher {
         file: &str,
         enabled: bool,
     ) -> Result<Vec<DatapackInfo>> {
+        self.ensure_not_running(name)?;
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
         tntl_instance::datapacks::set_enabled(&game_dir, world, file, enabled)?;
@@ -5005,6 +5041,7 @@ impl Launcher {
 
     /// Copy a datapack zip into a world.
     pub fn add_datapack(&self, name: &str, world: &str, path: &Path) -> Result<Vec<DatapackInfo>> {
+        self.ensure_not_running(name)?;
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
         tntl_instance::datapacks::add(&game_dir, world, path)?;
@@ -5012,6 +5049,7 @@ impl Launcher {
     }
 
     pub fn delete_datapack(&self, name: &str, world: &str, file: &str) -> Result<Vec<DatapackInfo>> {
+        self.ensure_not_running(name)?;
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
         tntl_instance::datapacks::delete(&game_dir, world, file)?;
@@ -5062,15 +5100,18 @@ impl Launcher {
         let source_game = source_instance.game_dir(&source);
         // An imported instance keeps its game directory outside the launcher.
         // Copy it into the duplicate so the two instances stop sharing mods,
-        // saves and options.
+        // saves and options. Versions, libraries and assets stay in the shared
+        // root the original points at: copying those would duplicate gigabytes
+        // and the copy still has to resolve them from a root.
         if !source_game.starts_with(&source) {
-            let copy = copy_dir(&source_game, &target.join("minecraft"))
+            let copy = copy_game_data(&source_game, &target.join("minecraft"))
                 .with_context(|| format!("cannot copy the game directory of {name}"));
             if let Err(error) = copy {
                 let _ = fs::remove_dir_all(&target);
                 return Err(error);
             }
             instance.game_dir = None;
+            instance.root = source_instance.root.clone();
         }
         instance.save(&target)?;
         Ok(target)
@@ -5636,7 +5677,12 @@ fn copy_game_dir(from: &Path, to: &Path) -> Result<()> {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             let relative = path.strip_prefix(from).unwrap_or(&path);
-            if relative.components().count() == 1 && matches!(name.as_str(), "logs" | "crash-reports" | "natives") {
+            if relative.components().count() == 1
+                && matches!(
+                    name.as_str(),
+                    "logs" | "crash-reports" | "natives" | "versions" | "libraries" | "assets"
+                )
+            {
                 continue;
             }
             let meta = fs::symlink_metadata(&path)?;
@@ -5968,11 +6014,27 @@ fn copy_content(game_dir: &Path, kind: ProjectKind, source: &Path) -> Result<Pat
 /// Recursive copy used by instance duplication. Natives are regenerated on
 /// every launch, so they are skipped.
 fn copy_dir(source: &Path, target: &Path) -> std::io::Result<()> {
+    copy_dir_skipping(source, target, &["natives"])
+}
+
+/// Copy the game data of an imported `.minecraft` without the shared root that
+/// lives in the same folder: versions, libraries and assets belong to the root
+/// the instance points at, not to the instance directory.
+fn copy_game_data(source: &Path, target: &Path) -> std::io::Result<()> {
+    copy_dir_skipping(
+        source,
+        target,
+        &["natives", "versions", "libraries", "assets", "logs", "crash-reports"],
+    )
+}
+
+fn copy_dir_skipping(source: &Path, target: &Path, skip: &[&str]) -> std::io::Result<()> {
     fs::create_dir_all(target)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name == "natives" {
+        let text = name.to_string_lossy();
+        if skip.iter().any(|skip| text.eq_ignore_ascii_case(skip)) {
             continue;
         }
         let from = entry.path();
@@ -5982,7 +6044,7 @@ fn copy_dir(source: &Path, target: &Path) -> std::io::Result<()> {
             continue;
         }
         if meta.is_dir() {
-            copy_dir(&from, &to)?;
+            copy_dir_skipping(&from, &to, skip)?;
         } else if meta.is_file() {
             fs::copy(&from, &to)?;
         }
@@ -6766,6 +6828,116 @@ mod tests {
             vec!["1.20.1".to_string()]
         );
         assert!(launcher.installed_versions().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imported_instances_keep_their_versions_out_of_the_launcher_root() {
+        let root = std::env::temp_dir().join(format!("tntl-import-cleanup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        // The launcher's own copy of 1.20.1 is not used by any instance.
+        let json = launcher.layout().version_json("1.20.1");
+        fs::create_dir_all(json.parent().unwrap()).unwrap();
+        fs::write(&json, r#"{"id":"1.20.1"}"#).unwrap();
+
+        let game = root.join("external");
+        let external_json = game.join("versions/1.20.1/1.20.1.json");
+        fs::create_dir_all(external_json.parent().unwrap()).unwrap();
+        fs::write(&external_json, r#"{"id":"1.20.1"}"#).unwrap();
+        fs::create_dir_all(game.join("mods")).unwrap();
+        fs::write(game.join("mods/a.jar"), b"jar").unwrap();
+
+        launcher
+            .import_instance(&game, Some("imported"), None, &|_: InstallEvent| {})
+            .unwrap();
+        // Same id, different root: it does not use the launcher's copy.
+        assert!(launcher.version_users("1.20.1").is_empty());
+        assert!(launcher.installed_version_details()[0].instances.is_empty());
+
+        // Deleting the imported instance must not touch the launcher root.
+        assert!(
+            launcher
+                .delete_instance_with_cleanup("imported", true)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(launcher.version_installed("1.20.1"));
+        assert!(external_json.is_file());
+        launcher.delete_version("1.20.1").unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn duplicating_an_imported_instance_copies_only_game_data() {
+        let root = std::env::temp_dir().join(format!("tntl-import-duplicate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        let game = root.join("external");
+        let json = game.join("versions/1.20.1/1.20.1.json");
+        fs::create_dir_all(json.parent().unwrap()).unwrap();
+        fs::write(&json, r#"{"id":"1.20.1"}"#).unwrap();
+        fs::create_dir_all(game.join("mods")).unwrap();
+        fs::write(game.join("mods/a.jar"), b"jar").unwrap();
+        launcher
+            .import_instance(&game, Some("imported"), None, &|_: InstallEvent| {})
+            .unwrap();
+
+        let copy = launcher.duplicate_instance("imported", "copy").unwrap();
+        let instance = launcher.load_instance("copy").unwrap();
+        // The shared root stays where it was, so the copy can resolve the
+        // version without duplicating libraries and assets.
+        assert_eq!(instance.root.as_deref(), Some(game.as_path()));
+        assert_eq!(instance.game_dir(&copy), copy.join("minecraft"));
+        assert!(copy.join("minecraft/mods/a.jar").is_file());
+        assert!(!copy.join("minecraft/versions").exists());
+        assert!(instance.layout(&root).version_json("1.20.1").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_imported_instance_survives_an_archive_round_trip() {
+        let root = std::env::temp_dir().join(format!("tntl-import-archive-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        let game = root.join("external");
+        let json = game.join("versions/1.20.1/1.20.1.json");
+        fs::create_dir_all(json.parent().unwrap()).unwrap();
+        fs::write(&json, r#"{"id":"1.20.1"}"#).unwrap();
+        fs::create_dir_all(game.join("mods")).unwrap();
+        fs::write(game.join("mods/a.jar"), b"jar").unwrap();
+        launcher
+            .import_instance(&game, Some("imported"), None, &|_: InstallEvent| {})
+            .unwrap();
+
+        let archive = root.join("imported.zip");
+        launcher.export_archive("imported", &archive).unwrap();
+        let restored = launcher.import_archive(&archive, "restored").unwrap();
+        let dir = launcher.instance_dir("restored").unwrap();
+        assert_eq!(restored.root.as_deref(), Some(dir.join("minecraft").as_path()));
+        assert!(restored.layout(&root).version_json("1.20.1").is_file());
+        assert!(dir.join("minecraft/mods/a.jar").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn world_and_datapack_writes_need_the_game_to_be_stopped() {
+        let root = std::env::temp_dir().join(format!("tntl-guards-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.create_instance(&Instance::new("live", "1.20.1")).unwrap();
+        launcher.mark_running("live", std::process::id()).unwrap();
+        let error = launcher.backup_world("live", "world").unwrap_err().to_string();
+        assert!(error.contains("is running"), "{error}");
+        let error = launcher.duplicate_world("live", "world").unwrap_err().to_string();
+        assert!(error.contains("is running"), "{error}");
+        let error = launcher
+            .set_datapack_enabled("live", "world", "a.zip", false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is running"), "{error}");
+        let error = launcher.save_servers("live", &[]).unwrap_err().to_string();
+        assert!(error.contains("is running"), "{error}");
         let _ = fs::remove_dir_all(&root);
     }
 
