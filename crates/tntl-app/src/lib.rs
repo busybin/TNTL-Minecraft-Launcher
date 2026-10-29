@@ -2240,6 +2240,15 @@ impl Launcher {
         Ok(report)
     }
 
+    /// Versions inside an existing game root, for the import dialog.
+    pub fn import_candidates(&self, path: &Path) -> Result<ImportScan> {
+        if !path.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        let (root, _) = import_root(path);
+        Ok(scan_import_versions(&root))
+    }
+
     /// Register an existing `.minecraft` directory as an instance without
     /// copying anything: the instance keeps a pointer to that root.
     pub fn import_instance(
@@ -2252,50 +2261,38 @@ impl Launcher {
         if !path.is_dir() {
             bail!("{} is not a directory", path.display());
         }
-        let versions_dir = path.join("versions");
-        let mut found: Vec<(String, String)> = Vec::new();
-        if let Ok(entries) = fs::read_dir(&versions_dir) {
-            for entry in entries.flatten() {
-                let json_path = entry
-                    .path()
-                    .join(format!("{}.json", entry.file_name().to_string_lossy()));
-                let Ok(bytes) = fs::read(&json_path) else {
-                    continue;
-                };
-                let Ok(json) = serde_json::from_slice::<VersionJson>(&bytes) else {
-                    continue;
-                };
-                found.push((json.release_time.unwrap_or_default(), json.id));
+        let (root, picked) = import_root(path);
+        let scan = scan_import_versions(&root);
+        if scan.versions.is_empty() {
+            if !scan.skipped.is_empty() {
+                bail!(
+                    "{} has versions but none could be read: {}",
+                    root.join("versions").display(),
+                    scan.skipped.join(", ")
+                );
             }
-        }
-        if found.is_empty() {
             // A game directory that only holds mods, saves and configs: the
             // version has to be installed before the instance can launch.
-            return self.import_game_dir(path, name, version, progress);
+            return self.import_game_dir(&root, name, version.or(picked.as_deref()), progress);
         }
-        let version_id = match version {
-            Some(wanted) => {
-                if !found.iter().any(|(_, id)| id.as_str() == wanted) {
-                    bail!("version {wanted} not found in {}", versions_dir.display());
-                }
-                wanted.to_string()
-            }
-            None => {
-                found.sort();
-                found.last().map(|(_, id)| id.clone()).unwrap()
-            }
+        let chosen = match version.or(picked.as_deref()) {
+            Some(wanted) => pick_candidate(&scan, wanted)?,
+            None => scan
+                .versions
+                .first()
+                .expect("scan already checked for an empty version list"),
         };
         let instance_name = name
             .map(ToString::to_string)
-            .unwrap_or_else(|| sanitize_name(&version_id));
+            .unwrap_or_else(|| sanitize_name(&chosen.id));
         validate_name(&instance_name)?;
         let dir = self.instance_dir(&instance_name)?;
         if dir.join(tntl_instance::INSTANCE_FILE).exists() {
             bail!("instance {instance_name} already exists; pick another name");
         }
-        let mut instance = Instance::new(&instance_name, &version_id);
-        instance.root = Some(path.to_path_buf());
-        instance.game_dir = Some(path.to_path_buf());
+        let mut instance = Instance::new(&instance_name, &chosen.id);
+        instance.root = Some(root.clone());
+        instance.game_dir = Some(root);
         instance.save(&dir)?;
         Ok(instance)
     }
@@ -5993,7 +5990,146 @@ fn copy_dir(source: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Instance names become directory names, so they must stay boring.
+/// One version directory inside an existing game root.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportCandidate {
+    /// Directory name: the id everything else has to use.
+    pub id: String,
+    /// `id` inside the JSON, which launchers do not always keep in sync.
+    pub json_id: String,
+    pub game_version: String,
+    pub loader: Option<String>,
+    pub loader_version: Option<String>,
+    pub release_time: String,
+}
+
+/// What the import dialog shows for a chosen path.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportScan {
+    pub root: PathBuf,
+    /// Newest first, so the default pick is the most recently installed one.
+    pub versions: Vec<ImportCandidate>,
+    /// Directories under `versions/` with a missing or unreadable JSON.
+    pub skipped: Vec<String>,
+}
+
+/// Directory an import path points at. The picker hands over whatever the user
+/// clicked, which may be the game root, its `versions/` folder, or one version
+/// inside it.
+fn import_root(path: &Path) -> (PathBuf, Option<String>) {
+    if path.join("versions").is_dir() {
+        return (path.to_path_buf(), None);
+    }
+    let name = path.file_name().map(|name| name.to_string_lossy().to_string());
+    if name.as_deref() == Some("versions")
+        && let Some(parent) = path.parent()
+    {
+        return (parent.to_path_buf(), None);
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|parent| parent == "versions"))
+        && let Some(root) = parent.parent()
+    {
+        return (root.to_path_buf(), name);
+    }
+    (path.to_path_buf(), None)
+}
+
+fn scan_import_versions(root: &Path) -> ImportScan {
+    let mut versions = Vec::new();
+    let mut skipped = Vec::new();
+    if let Ok(entries) = fs::read_dir(root.join("versions")) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().to_string();
+            let Ok(bytes) = fs::read(entry.path().join(format!("{id}.json"))) else {
+                skipped.push(id);
+                continue;
+            };
+            let Ok(json) = serde_json::from_slice::<VersionJson>(&bytes) else {
+                skipped.push(id);
+                continue;
+            };
+            // Launchers rename a patch directory without rewriting the `id`
+            // inside its JSON (HMCL keeps `neoforge-21.1.264` in
+            // `versions/1.21.1-Neoforge`), so the directory name is the id.
+            let game_version = json
+                .inherits_from
+                .clone()
+                .or_else(|| {
+                    json.patches
+                        .iter()
+                        .find(|patch| patch.id.eq_ignore_ascii_case("game"))
+                        .map(|patch| patch.version.clone())
+                })
+                .map(|game| game.trim().to_string())
+                .filter(|game| !game.is_empty())
+                .unwrap_or_else(|| json.id.clone());
+            let loader = installed_loader(std::slice::from_ref(&json), &game_version).or_else(|| {
+                json.patches
+                    .iter()
+                    .find_map(|patch| LoaderKind::from_key(&patch.id).map(|kind| (kind, patch.version.clone())))
+            });
+            versions.push(ImportCandidate {
+                id,
+                json_id: json.id.clone(),
+                game_version,
+                loader: loader.as_ref().map(|(kind, _)| kind.key().to_string()),
+                loader_version: loader.map(|(_, version)| version),
+                release_time: json.release_time.unwrap_or_default(),
+            });
+        }
+    }
+    versions.sort_by(|left, right| {
+        (right.release_time.as_str(), right.id.as_str()).cmp(&(left.release_time.as_str(), left.id.as_str()))
+    });
+    ImportScan {
+        root: root.to_path_buf(),
+        versions,
+        skipped,
+    }
+}
+
+/// Resolve the version the user named: directory, JSON id, or a game version
+/// when only one version matches it.
+fn pick_candidate<'a>(scan: &'a ImportScan, wanted: &str) -> Result<&'a ImportCandidate> {
+    let wanted = wanted.trim();
+    if let Some(found) = scan
+        .versions
+        .iter()
+        .find(|candidate| candidate.id == wanted || candidate.json_id == wanted)
+    {
+        return Ok(found);
+    }
+    let by_game: Vec<&ImportCandidate> = scan
+        .versions
+        .iter()
+        .filter(|candidate| candidate.game_version == wanted)
+        .collect();
+    let names = |list: &[&ImportCandidate]| {
+        list.iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match by_game.len() {
+        1 => Ok(by_game[0]),
+        0 => bail!(
+            "version {wanted} not found in {}; available: {}",
+            scan.root.join("versions").display(),
+            names(&scan.versions.iter().collect::<Vec<_>>())
+        ),
+        _ => bail!(
+            "{} has more than one version for {wanted}; pass the directory name: {}",
+            scan.root.display(),
+            names(&by_game)
+        ),
+    }
+}
+
 /// Game version and loader read from a launcher log.
 struct DetectedInstall {
     game: String,
@@ -6331,6 +6467,44 @@ mod tests {
         assert!(launcher.instance_dir("CON").is_ok());
         assert!(launcher.instance_dir("foo.").is_ok());
         assert!(launcher.instance_dir("../escape").is_err());
+    }
+
+    #[test]
+    fn import_uses_the_version_directory_not_the_json_id() {
+        // HMCL keeps the installer's id inside the json (`neoforge-21.1.264`)
+        // while the directory is `1.21.1-Neoforge`; the directory is what the
+        // game root can resolve, so the instance has to store that id.
+        let root = std::env::temp_dir().join(format!("tntl-import-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game = root.join("game");
+        let version = game.join("versions").join("1.21.1-Neoforge");
+        fs::create_dir_all(&version).unwrap();
+        fs::write(
+            version.join("1.21.1-Neoforge.json"),
+            br#"{"id":"neoforge-21.1.264","inheritsFrom":"1.21.1","releaseTime":"2024-08-08T00:00:00+00:00","type":"release","libraries":[{"name":"net.neoforged:neoforge:21.1.264"}]}"#,
+        )
+        .unwrap();
+        let launcher = Launcher::from_root(Some(root.clone()));
+
+        let scan = launcher.import_candidates(&game).unwrap();
+        assert_eq!(scan.versions.len(), 1);
+        assert_eq!(scan.versions[0].id, "1.21.1-Neoforge");
+        assert_eq!(scan.versions[0].game_version, "1.21.1");
+        assert_eq!(scan.versions[0].loader.as_deref(), Some("neoforge"));
+        assert_eq!(scan.versions[0].loader_version.as_deref(), Some("21.1.264"));
+
+        let instance = launcher
+            .import_instance(&game, Some("nf"), None, &|_: InstallEvent| {})
+            .unwrap();
+        assert_eq!(instance.version_id, "1.21.1-Neoforge");
+
+        // Pointing at the version folder itself resolves the same game root.
+        let nested = launcher
+            .import_instance(&version, Some("nested"), None, &|_: InstallEvent| {})
+            .unwrap();
+        assert_eq!(nested.version_id, "1.21.1-Neoforge");
+        assert_eq!(nested.root.as_deref(), Some(game.as_path()));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

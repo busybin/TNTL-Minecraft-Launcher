@@ -215,6 +215,9 @@ enum Command {
         name: Option<String>,
         #[arg(long)]
         version: Option<String>,
+        /// Only list the versions found in the directory.
+        #[arg(long)]
+        list: bool,
     },
     /// Rename an instance (moves its directory).
     Rename { instance: String, name: String },
@@ -667,7 +670,12 @@ fn run(cli: Cli) -> Result<i32> {
         ),
         Command::Loaders { version, loader, limit } => cmd_loaders(&launcher, &version, &loader, limit),
         Command::Loader { instance, action } => cmd_loader(&launcher, &instance, action),
-        Command::Import { path, name, version } => cmd_import(&launcher, &path, name, version),
+        Command::Import {
+            path,
+            name,
+            version,
+            list,
+        } => cmd_import(&launcher, &path, name, version, list),
         Command::Rename { instance, name } => cmd_rename(&launcher, &instance, &name),
         Command::Delete { instance, yes, cleanup } => cmd_delete(&launcher, &instance, yes, cleanup),
         Command::Installed { delete, cleanup, json } => cmd_installed(&launcher, delete.as_deref(), cleanup, json),
@@ -1511,7 +1519,28 @@ fn cmd_loader(launcher: &Launcher, instance: &str, action: Option<LoaderAction>)
     Ok(0)
 }
 
-fn cmd_import(launcher: &Launcher, path: &Path, name: Option<String>, version: Option<String>) -> Result<i32> {
+fn cmd_import(
+    launcher: &Launcher,
+    path: &Path,
+    name: Option<String>,
+    version: Option<String>,
+    list: bool,
+) -> Result<i32> {
+    if list {
+        let scan = launcher.import_candidates(path)?;
+        if scan.versions.is_empty() {
+            println!("{} has no readable versions", scan.root.display());
+        }
+        for candidate in &scan.versions {
+            let loader = match (&candidate.loader, &candidate.loader_version) {
+                (Some(loader), Some(version)) => format!("{loader} {version}"),
+                (Some(loader), None) => loader.clone(),
+                _ => "vanilla".to_string(),
+            };
+            println!("{}\t{}\t{loader}", candidate.id, candidate.game_version);
+        }
+        return Ok(0);
+    }
     if path.join("mmc-pack.json").is_file() || path.join("instances").is_dir() {
         let instance = launcher.import_prism_instance(path, name.as_deref(), &|event| {
             if event.stage == "downloading" || event.stage == "assets" {
@@ -1537,7 +1566,7 @@ fn cmd_import(launcher: &Launcher, path: &Path, name: Option<String>, version: O
         "\nimported {} as instance {} (root {})",
         instance.version_id,
         instance.name,
-        path.display()
+        instance.game_dir(&launcher.instance_dir(&instance.name)?).display()
     );
     Ok(0)
 }

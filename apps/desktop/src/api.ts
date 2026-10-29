@@ -437,6 +437,21 @@ export interface ModSearchPage {
   limit: number;
 }
 
+export interface ImportCandidate {
+  id: string;
+  json_id: string;
+  game_version: string;
+  loader: string | null;
+  loader_version: string | null;
+  release_time: string;
+}
+
+export interface ImportScan {
+  root: string;
+  versions: ImportCandidate[];
+  skipped: string[];
+}
+
 export interface ModUpdate {
   file: string;
   name: string;
@@ -784,6 +799,7 @@ export const api = {
   addLocalMod: (name: string, path: string) => invoke<ModInfo[]>("add_local_mod", { name, path }),
   addLocalContent: (name: string, kind: ProjectKind, path: string) =>
     invoke<ContentListing>("add_local_content", { name, kind, path }),
+  importCandidates: (path: string) => invoke<ImportScan>("import_candidates", { path }),
   importInstance: (path: string, name: string | null, version: string | null) =>
     invoke<string>("import_instance", { path, name, version }),
   listMods: (name: string) => invoke<ModInfo[]>("list_mods", { name }),

@@ -596,6 +596,13 @@ fn remove_mod(
 }
 
 #[tauri::command]
+fn import_candidates(state: State<'_, AppState>, path: String) -> Result<tntl_app::ImportScan, String> {
+    state_launcher(&state)
+        .import_candidates(&PathBuf::from(path))
+        .map_err(message)
+}
+
+#[tauri::command]
 async fn import_instance(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -2100,6 +2107,46 @@ fn initial_root() -> PathBuf {
     Launcher::from_root(None).root
 }
 
+/// A GUI-subsystem binary dies without a word when startup fails or a thread
+/// panics, which is impossible to report from the user's side. Append to a log
+/// file and show the reason in a dialog instead.
+fn log_failure(kind: &str, detail: &str) -> Option<PathBuf> {
+    let path = dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("tntl")
+        .join("logs")
+        .join("launcher.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = format!("[{}] {kind}\n{detail}\n\n", timestamp());
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = file.write_all(entry.as_bytes());
+    }
+    Some(path)
+}
+
+fn report_failure(title: &str, detail: &str) {
+    let path = log_failure(title, detail);
+    let where_to = path
+        .map(|path| format!("\n\nA log was written to {}", path.display()))
+        .unwrap_or_default();
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(format!("TNTL {}", env!("CARGO_PKG_VERSION_MAJOR")))
+        .set_description(format!("{title}\n\n{detail}{where_to}"))
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let detail = format!("{info}\n\n{}", std::backtrace::Backtrace::force_capture());
+        report_failure("TNTL stopped unexpectedly", &detail);
+    }));
+}
+
 fn main() {
     // Answer `--version` before the toolkit starts: the packaged shell has no
     // CLI binary, so this is how a terminal finds out what is installed.
@@ -2108,11 +2155,17 @@ fn main() {
         return;
     }
 
+    install_panic_hook();
+    log_failure(
+        "start",
+        &format!("version {} on {}", env!("CARGO_PKG_VERSION_MAJOR"), std::env::consts::OS),
+    );
+
     #[cfg(target_os = "linux")]
     configure_webview();
 
     let root = initial_root();
-    tauri::Builder::default()
+    let started = tauri::Builder::default()
         .manage(AppState {
             root: Mutex::new(root),
             game: Mutex::new(None),
@@ -2145,6 +2198,7 @@ fn main() {
             delete_version,
             create_instance_from_version,
             rename_instance,
+            import_candidates,
             import_instance,
             list_mods,
             diagnose_instance,
@@ -2247,6 +2301,9 @@ fn main() {
             install_ftb_pack,
             server_status
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to start the desktop shell");
+        .run(tauri::generate_context!());
+    if let Err(error) = started {
+        report_failure("TNTL could not start", &format!("{error:#}"));
+        std::process::exit(1);
+    }
 }

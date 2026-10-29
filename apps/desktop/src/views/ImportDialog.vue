@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
-import { api, events, jobTag, type InstallEvent, type UnlistenFn } from "../api";
+import { onMounted, onUnmounted, ref, watch } from "vue";
+import { api, events, jobTag, type ImportScan, type InstallEvent, type UnlistenFn } from "../api";
 import Icon from "../components/Icon.vue";
 import { t } from "../i18n";
 
@@ -14,6 +14,39 @@ const busy = ref(false);
 const error = ref<string | null>(null);
 const stage = ref<InstallEvent | null>(null);
 const unlisteners: UnlistenFn[] = [];
+const scan = ref<ImportScan | null>(null);
+const picked = ref<string>("");
+const scanning = ref(false);
+let scanTimer: number | undefined;
+
+// Launchers disagree about the id inside a version json, so the dialog lists
+// what is actually on disk instead of making the user type it.
+async function refreshScan(target: string) {
+  picked.value = "";
+  scan.value = null;
+  if (!target.trim()) {
+    return;
+  }
+  scanning.value = true;
+  try {
+    const result = await api.importCandidates(target.trim());
+    scan.value = result;
+    picked.value = result.versions[0]?.id ?? "";
+  } catch {
+    // Not a readable directory (yet); Import reports the real error.
+  } finally {
+    scanning.value = false;
+  }
+}
+
+watch(
+  path,
+  (value) => {
+    window.clearTimeout(scanTimer);
+    scanTimer = window.setTimeout(() => void refreshScan(value ?? ""), 250);
+  },
+  { immediate: true },
+);
 
 async function browse() {
   try {
@@ -36,7 +69,10 @@ onMounted(async () => {
   }
 });
 
-onUnmounted(() => unlisteners.forEach((unlisten) => unlisten()));
+onUnmounted(() => {
+  window.clearTimeout(scanTimer);
+  unlisteners.forEach((unlisten) => unlisten());
+});
 
 async function run() {
   const target = path.value.trim();
@@ -51,7 +87,7 @@ async function run() {
     const imported = await api.importInstance(
       target,
       name.value.trim() || null,
-      version.value.trim() || null,
+      picked.value || version.value.trim() || null,
     );
     emit("imported", imported);
   } catch (cause) {
@@ -92,7 +128,17 @@ async function run() {
           <span>{{ t("import.name") }} <small>{{ t("import.nameHint") }}</small></span>
           <input v-model="name" spellcheck="false" :placeholder="t('import.optional')" />
         </label>
-        <label>
+        <label v-if="scan && scan.versions.length">
+          <span>{{ t("import.detected") }} <small>{{ t("import.detectedHint") }}</small></span>
+          <select v-model="picked">
+            <option v-for="candidate in scan.versions" :key="candidate.id" :value="candidate.id">
+              {{ candidate.id }} — {{ candidate.game_version
+              }}{{ candidate.loader ? ` · ${candidate.loader}${candidate.loader_version ? ` ${candidate.loader_version}` : ""}` : "" }}
+            </option>
+          </select>
+          <small v-if="scan.skipped.length">{{ t("import.skipped") }} {{ scan.skipped.join(", ") }}</small>
+        </label>
+        <label v-else>
           <span>{{ t("import.version") }} <small>{{ t("import.versionHint") }}</small></span>
           <input v-model="version" class="mono" spellcheck="false" :placeholder="t('import.versionPlaceholder')" />
         </label>
