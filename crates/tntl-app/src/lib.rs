@@ -2209,6 +2209,7 @@ impl Launcher {
         // `instances/<old name>/minecraft` and the saves "disappear".
         let mut dirty = instance.name != name;
         instance.name = name.to_string();
+        dirty |= adopt_in_place(&mut instance, &self.root);
         dirty |= self.adopt_renamed_version(&mut instance);
         dirty |= adopt_isolated_game_dir(&mut instance, &dir);
         if dirty {
@@ -2617,13 +2618,13 @@ impl Launcher {
     pub fn version_users(&self, id: &str) -> Vec<String> {
         self.instance_chains()
             .into_iter()
-            .filter(|(_, chain, launcher_root)| *launcher_root && chain.iter().any(|version| version == id))
+            .filter(|(_, chain, chain_root)| same_dir(chain_root, &self.root) && chain.iter().any(|v| v == id))
             .map(|(name, _, _)| name)
             .collect()
     }
 
-    /// `(name, version chain, whether the chain lives in the launcher root)`.
-    fn instance_chains(&self) -> Vec<(String, Vec<String>, bool)> {
+    /// `(name, version chain, root the chain resolves to)`.
+    fn instance_chains(&self) -> Vec<(String, Vec<String>, PathBuf)> {
         let Ok(entries) = fs::read_dir(self.instances_dir()) else {
             return Vec::new();
         };
@@ -2644,8 +2645,7 @@ impl Launcher {
                 // directory, so they cannot vouch for (or block) ours. The
                 // comparison must be path-based: `root: Some(<launcher root>)`
                 // is the launcher's own directory and does count.
-                let launcher_root = same_dir(&layout.root, &self.root);
-                Some((name, chain, launcher_root))
+                Some((name, chain, layout.root))
             })
             .collect()
     }
@@ -2969,6 +2969,7 @@ impl Launcher {
         // where HMCL and PCL2 put everything when isolation is on.
         instance.game_dir = Some(game_dir_for(&root, &chosen.id));
         instance.root = Some(root.clone());
+        instance.in_place = true;
         instance.save(&dir)?;
         // A name the user removed earlier is free now that the folder is new.
         let _ = self.restore_instance(&instance_name);
@@ -3038,6 +3039,7 @@ impl Launcher {
         let mut instance = Instance::new(&instance_name, &game);
         instance.root = Some(path.to_path_buf());
         instance.game_dir = Some(path.to_path_buf());
+        instance.in_place = true;
         instance.group = Some("Imported".to_string());
         instance.save(&dir)?;
         let _ = self.restore_instance(&instance_name);
@@ -3405,8 +3407,8 @@ impl Launcher {
             .map(|id| {
                 let instances = chains
                     .iter()
-                    .filter(|(_, chain, launcher_root)| {
-                        *launcher_root && chain.iter().any(|version| version.as_str() == id.as_str())
+                    .filter(|(_, chain, chain_root)| {
+                        same_dir(chain_root, &self.root) && chain.iter().any(|version| version.as_str() == id.as_str())
                     })
                     .map(|(name, _, _)| name.clone())
                     .collect::<Vec<_>>();
@@ -3431,8 +3433,8 @@ impl Launcher {
             }
             let instances = chains
                 .iter()
-                .filter(|(_, chain, launcher_root)| {
-                    *launcher_root && chain.iter().any(|version| version.as_str() == id.as_str())
+                .filter(|(_, chain, chain_root)| {
+                    same_dir(chain_root, &self.root) && chain.iter().any(|version| version.as_str() == id.as_str())
                 })
                 .map(|(name, _, _)| name.clone())
                 .collect();
@@ -3449,6 +3451,14 @@ impl Launcher {
     /// Remove one installed version. Refuses while an instance still uses it;
     /// shared libraries and assets are left alone.
     pub fn delete_version(&self, id: &str) -> Result<()> {
+        self.delete_version_with_roots(id, &[])
+    }
+
+    /// [`Self::delete_version`] that also looks at instances stored under
+    /// other data directories. An instance there may point its `root` at this
+    /// data directory (it was imported in place from here), and deleting a
+    /// version it launches through would break it.
+    pub fn delete_version_with_roots(&self, id: &str, other_roots: &[PathBuf]) -> Result<()> {
         validate_version_id(id)?;
         // Deleting version folders is only safe in a directory this launcher
         // owns; pointing the root at another launcher's `.minecraft` must stay
@@ -3462,6 +3472,25 @@ impl Launcher {
             bail!(
                 "version {id} is used by {}; remove those instances first",
                 users.join(", ")
+            );
+        }
+        // Instances of another data root can share this one's versions.
+        let mut foreign: Vec<String> = Vec::new();
+        for root in other_roots {
+            if !root.is_dir() || same_dir(root, &self.root) {
+                continue;
+            }
+            let other = Launcher::from_root(Some(root.clone()));
+            for (name, chain, chain_root) in other.instance_chains() {
+                if same_dir(&chain_root, &self.root) && chain.iter().any(|version| version == id) {
+                    foreign.push(format!("{name} ({})", root.display()));
+                }
+            }
+        }
+        if !foreign.is_empty() {
+            bail!(
+                "version {id} is used by {}; remove those instances first",
+                foreign.join(", ")
             );
         }
         // An instance whose metadata cannot be read may still launch through
@@ -7394,14 +7423,45 @@ fn same_dir(left: &Path, right: &Path) -> bool {
 /// Whether an instance points at a game directory outside our data directory,
 /// i.e. another launcher's `.minecraft`. Archive restores also set `root`, but
 /// to `<instance>/minecraft` inside our own tree, and those stay ours to
-/// repair. A true foreign root is read-only: its files belong to the launcher
-/// that made them.
+/// repair. An in-place import is maintainable too: the user chose that folder.
+/// A true foreign root is read-only: its files belong to the launcher that
+/// made them.
 fn foreign_instance_root(launcher_root: &Path, instance: &Instance) -> bool {
+    // An in-place import is ours to maintain: the user pointed the launcher at
+    // that folder and agreed to the install.
+    if instance.in_place {
+        return false;
+    }
     let Some(root) = instance.root.as_deref() else {
         return false;
     };
     let resolve = |path: &Path| tntl_store::simplify_path(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     !resolve(root).starts_with(resolve(launcher_root))
+}
+
+/// Instances created before `in_place` existed: a root outside our data
+/// directory that holds this instance's own game files is one the user
+/// imported in place, so it stays maintainable instead of being refused as
+/// another launcher's directory.
+fn adopt_in_place(instance: &mut Instance, launcher_root: &Path) -> bool {
+    if instance.in_place {
+        return false;
+    }
+    let (Some(root), Some(game)) = (instance.root.as_deref(), instance.game_dir.as_deref()) else {
+        return false;
+    };
+    let resolve = |path: &Path| tntl_store::simplify_path(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    let root_resolved = resolve(root);
+    if !root_resolved.is_dir() || root_resolved.starts_with(resolve(launcher_root)) {
+        return false;
+    }
+    // `group` is what the in-place installer writes; a `game_dir` inside
+    // `root` is the shape both import paths produce.
+    if instance.group.as_deref() == Some("Imported") || resolve(game).starts_with(&root_resolved) {
+        instance.in_place = true;
+        return true;
+    }
+    false
 }
 
 /// Every `versions/<dir>/<dir>.json` that parses, with its directory name.

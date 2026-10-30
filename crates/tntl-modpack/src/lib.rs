@@ -528,6 +528,7 @@ impl Modpack {
         let file = File::open(&self.archive).map_err(|error| io_error(&self.archive, error))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|error| ModpackError::Zip(error.to_string()))?;
         let mut written = 0;
+        let mut budget = tntl_store::EXTRACT_BUDGET;
         for prefix in [OVERRIDES_DIR, CLIENT_OVERRIDES_DIR] {
             let head = format!("{prefix}/");
             let mut entries = 0;
@@ -563,7 +564,7 @@ impl Modpack {
                     return Err(io_error(&target, error));
                 }
                 let mut out = File::create(&target).map_err(|error| io_error(&target, error))?;
-                io::copy(&mut entry, &mut out).map_err(|error| io_error(&target, error))?;
+                tntl_store::copy_entry(&mut entry, &mut out, &mut budget).map_err(|error| io_error(&target, error))?;
                 entries += 1;
             }
             written += entries;

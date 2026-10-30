@@ -766,7 +766,12 @@ fn installed_versions(state: State<'_, AppState>) -> Vec<InstalledVersion> {
 
 #[tauri::command]
 fn delete_version(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    state_launcher(&state).delete_version(&id).map_err(message)
+    // Another data directory may hold an instance whose game root is this one.
+    let roots = store::load_roots().roots;
+    let roots: Vec<PathBuf> = roots.into_iter().map(PathBuf::from).collect();
+    state_launcher(&state)
+        .delete_version_with_roots(&id, &roots)
+        .map_err(message)
 }
 
 /// Register a second instance on an installed version without downloading it.

@@ -79,6 +79,12 @@ pub struct Instance {
     /// Icon file stored in the instance directory, e.g. `icon.png`.
     #[serde(default)]
     pub icon: Option<PathBuf>,
+    /// The instance runs inside a game directory the user already had
+    /// (registered or installed in place). Repair and loader changes are
+    /// allowed there: the user pointed us at that folder, unlike a root that
+    /// was merely detected as another launcher's.
+    #[serde(default)]
+    pub in_place: bool,
 }
 
 /// A server address to join on launch.
@@ -154,6 +160,7 @@ impl Default for Instance {
             group: None,
             notes: String::new(),
             icon: None,
+            in_place: false,
         }
     }
 }

@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use sha1::{Digest, Sha1};
@@ -498,6 +498,28 @@ pub fn portable_file_name(name: &str) -> bool {
     !name.ends_with('.') && !name.ends_with(' ') && !DEVICE_NAMES.contains(&stem.as_str())
 }
 
+/// Bytes one archive may expand to. Instances, worlds and packs are large, so
+/// this is not a per-file cap; it only stops an archive that decompresses to
+/// something no game directory has (a zip bomb filling the disk).
+pub const EXTRACT_BUDGET: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Copy one archive entry into `writer`, subtracting what was written from
+/// `budget` and refusing to go past it. `writer` keeps whatever was written
+/// before the error, so callers extract into a fresh/partial directory.
+pub fn copy_entry<R: Read, W: Write>(reader: &mut R, writer: &mut W, budget: &mut u64) -> io::Result<u64> {
+    let allowed = *budget;
+    let mut limited = reader.take(allowed.saturating_add(1));
+    let written = io::copy(&mut limited, writer)?;
+    if written > allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive expands past the extraction limit",
+        ));
+    }
+    *budget -= written;
+    Ok(written)
+}
+
 /// Top-level game folders a pack must never write into. `saves` holds the
 /// player's worlds; a pack repair that replaces `level.dat` corrupts them.
 pub fn is_protected_game_path(relative: &Path) -> bool {
@@ -532,6 +554,31 @@ pub fn remove_dir_within(base: &Path, target: &Path) -> io::Result<()> {
     }
     match fs::remove_dir_all(&target) {
         Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remove a file or directory only when it resolves inside `base`. A link is
+/// removed itself, never followed; a junction to another disk is refused
+/// because its target lies outside the base.
+pub fn remove_within(base: &Path, target: &Path) -> io::Result<()> {
+    let resolve = |path: &Path| {
+        path.canonicalize()
+            .map(|resolved| simplify_path(&resolved))
+            .unwrap_or_else(|_| simplify_path(path))
+    };
+    let base = resolve(base);
+    let target = resolve(target);
+    if !target.starts_with(&base) || target == base {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is outside {}", target.display(), base.display()),
+        ));
+    }
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(&target),
+        Ok(_) => fs::remove_file(&target),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
@@ -684,6 +731,36 @@ pub fn extract_natives(jar: &Path, dest: &Path, excludes: &[String]) -> Result<u
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn extraction_budget_stops_an_archive_bomb() {
+        let mut budget = 4u64;
+        let mut out = Vec::new();
+        copy_entry(&mut &b"abc"[..], &mut out, &mut budget).unwrap();
+        assert_eq!(budget, 1);
+        assert_eq!(out, b"abc");
+        assert!(copy_entry(&mut &b"ab"[..], &mut out, &mut budget).is_err());
+        // The failed copy must not have been charged twice.
+        assert_eq!(budget, 1);
+    }
+
+    #[test]
+    fn removal_stays_inside_the_base() {
+        let dir = std::env::temp_dir().join(format!("tntl-remove-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("tntl-remove-out-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(dir.join("datapacks")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(dir.join("datapacks/a.zip"), b"x").unwrap();
+        fs::write(outside.join("keep.txt"), b"x").unwrap();
+        remove_within(&dir, &dir.join("datapacks/a.zip")).unwrap();
+        assert!(!dir.join("datapacks/a.zip").exists());
+        assert!(remove_within(&dir, &outside.join("keep.txt")).is_err());
+        assert!(outside.join("keep.txt").is_file());
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
 
     #[test]
     fn verifies_size_and_hash() {

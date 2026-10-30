@@ -342,6 +342,7 @@ pub fn import(archive: &Path, instances_dir: &Path, name: &str) -> Result<PathBu
 }
 
 fn extract(zip: &mut zip::ZipArchive<File>, prefix: &str, target: &Path) -> Result<(), ArchiveError> {
+    let mut budget = tntl_store::EXTRACT_BUDGET;
     for index in 0..zip.len() {
         let mut entry = zip
             .by_index(index)
@@ -362,7 +363,7 @@ fn extract(zip: &mut zip::ZipArchive<File>, prefix: &str, target: &Path) -> Resu
             fs::create_dir_all(parent).map_err(|error| io_err(parent, error))?;
         }
         let mut output = File::create(&destination).map_err(|error| io_err(&destination, error))?;
-        io::copy(&mut entry, &mut output).map_err(|error| io_err(&destination, error))?;
+        tntl_store::copy_entry(&mut entry, &mut output, &mut budget).map_err(|error| io_err(&destination, error))?;
     }
     Ok(())
 }

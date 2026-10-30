@@ -267,11 +267,9 @@ pub fn delete(game_dir: &Path, world: &str, name: &str) -> Result<(), DatapackEr
         if !path.exists() {
             continue;
         }
-        if path.is_dir() {
-            fs::remove_dir_all(&path).map_err(|error| io_error(&path, error))?;
-        } else {
-            fs::remove_file(&path).map_err(|error| io_error(&path, error))?;
-        }
+        // A datapack can be a file or a folder, and either may sit behind a
+        // link; never delete through it.
+        tntl_store::remove_within(game_dir, &path).map_err(|error| io_error(&path, error))?;
         removed = true;
     }
     if removed {

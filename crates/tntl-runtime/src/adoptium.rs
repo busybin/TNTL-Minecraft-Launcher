@@ -285,6 +285,7 @@ fn unpack_zip(archive: &Path, home: &Path) -> Result<usize, RuntimeError> {
     let file = fs::File::open(archive).map_err(|error| io_error(archive, error))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|error| RuntimeError::Archive(error.to_string()))?;
     let mut written = 0;
+    let mut budget = tntl_store::EXTRACT_BUDGET;
     for index in 0..zip.len() {
         let mut entry = zip
             .by_index(index)
@@ -303,7 +304,7 @@ fn unpack_zip(archive: &Path, home: &Path) -> Result<usize, RuntimeError> {
             fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
         }
         let mut out = fs::File::create(&dest).map_err(|error| io_error(&dest, error))?;
-        io::copy(&mut entry, &mut out).map_err(|error| io_error(&dest, error))?;
+        tntl_store::copy_entry(&mut entry, &mut out, &mut budget).map_err(|error| io_error(&dest, error))?;
         written += 1;
     }
     Ok(written)
@@ -313,6 +314,7 @@ fn unpack_tar_gz(archive: &Path, home: &Path) -> Result<usize, RuntimeError> {
     let file = fs::File::open(archive).map_err(|error| io_error(archive, error))?;
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
     let mut written = 0;
+    let mut budget = tntl_store::EXTRACT_BUDGET;
     for entry in tar
         .entries()
         .map_err(|error| RuntimeError::Archive(error.to_string()))?
@@ -327,6 +329,13 @@ fn unpack_tar_gz(archive: &Path, home: &Path) -> Result<usize, RuntimeError> {
         if !entry.header().entry_type().is_file() {
             continue;
         }
+        let size = entry.size();
+        if size > budget {
+            return Err(RuntimeError::Archive(
+                "archive expands past the extraction limit".to_string(),
+            ));
+        }
+        budget -= size;
         let Some(relative) = strip_top(&path.to_string_lossy()) else {
             continue;
         };

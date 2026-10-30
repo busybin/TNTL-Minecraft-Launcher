@@ -140,6 +140,7 @@ pub fn extract_overrides(
         source,
     })?;
     let mut written = 0;
+    let mut budget = tntl_store::EXTRACT_BUDGET;
     for index in 0..zip.len() {
         let mut entry = zip
             .by_index(index)
@@ -180,7 +181,7 @@ pub fn extract_overrides(
             path: target.clone(),
             source,
         })?;
-        io::copy(&mut entry, &mut out).map_err(|source| CurseForgeError::Io {
+        tntl_store::copy_entry(&mut entry, &mut out, &mut budget).map_err(|source| CurseForgeError::Io {
             path: target.clone(),
             source,
         })?;
