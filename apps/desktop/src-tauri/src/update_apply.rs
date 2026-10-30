@@ -39,7 +39,10 @@ pub fn plan(path: &Path) -> Plan {
             .unwrap_or(false)
         {
             if let Some(appimage) = std::env::var_os("APPIMAGE") {
-                return Plan::Replace(PathBuf::from(appimage));
+                // `$APPIMAGE` may be a symlink; replace the real file so the
+                // desktop entry keeps pointing at an executable.
+                let path = PathBuf::from(appimage);
+                return Plan::Replace(std::fs::canonicalize(&path).unwrap_or(path));
             }
         }
         return Plan::Manual;
@@ -55,7 +58,8 @@ pub fn plan(path: &Path) -> Plan {
 /// explain where it went.
 pub fn apply(app: &tauri::AppHandle, file: &Path) -> Result<String, String> {
     match plan(file) {
-        Plan::Manual => Err(file.display().to_string()),
+        // Not something we may install: the caller opens the folder instead.
+        Plan::Manual => Ok(format!("manual:{}", file.display())),
         Plan::Installer => {
             #[cfg(windows)]
             {
@@ -70,7 +74,7 @@ pub fn apply(app: &tauri::AppHandle, file: &Path) -> Result<String, String> {
             }
             #[cfg(not(windows))]
             {
-                Err(file.display().to_string())
+                Ok(format!("manual:{}", file.display()))
             }
         }
         Plan::Replace(target) => {
@@ -87,8 +91,12 @@ fn spawn_swap(file: &Path, target: &Path) -> Result<PathBuf, String> {
     let dir = file
         .parent()
         .ok_or_else(|| "update file has no directory".to_string())?;
+    ensure_writable(target)?;
     let script = dir.join("apply-update.cmd");
     let pid = std::process::id();
+    // `%` is expanded by cmd even inside quotes.
+    let new = file.display().to_string().replace('%', "%%");
+    let target_text = target.display().to_string().replace('%', "%%");
     let body = format!(
         "@echo off\r\n\
          setlocal\r\n\
@@ -98,11 +106,12 @@ fn spawn_swap(file: &Path, target: &Path) -> Result<PathBuf, String> {
          \x20 timeout /t 1 /nobreak >nul\r\n\
          \x20 goto wait\r\n\
          )\r\n\
-         copy /Y \"{new}\" \"{target}\" >nul\r\n\
-         start \"\" \"{target}\"\r\n\
-         del \"%~f0\"\r\n",
-        new = file.display(),
-        target = target.display()
+         copy /Y \"{new}\" \"{target_text}\" >nul 2>&1\r\n\
+         if errorlevel 1 (\r\n\
+         \x20 echo update failed, the old version is still installed > \"%~dp0apply-update.log\"\r\n\
+         )\r\n\
+         start \"\" \"{target_text}\"\r\n\
+         del \"%~f0\"\r\n"
     );
     std::fs::write(&script, body).map_err(|error| error.to_string())?;
     Command::new("cmd")
@@ -121,17 +130,22 @@ fn spawn_swap(file: &Path, target: &Path) -> Result<PathBuf, String> {
     let dir = file
         .parent()
         .ok_or_else(|| "update file has no directory".to_string())?;
+    ensure_writable(target)?;
     let script = dir.join("apply-update.sh");
     let pid = std::process::id();
+    let quote = |value: &Path| format!("'{}'", value.display().to_string().replace('\'', "'\\''"));
     let body = format!(
         "#!/bin/sh\n\
          while kill -0 {pid} 2>/dev/null; do sleep 1; done\n\
-         mv -f '{new}' '{target}'\n\
-         chmod +x '{target}'\n\
-         '{target}' >/dev/null 2>&1 &\n\
-         rm -f \"$0\"\n",
-        new = file.display(),
-        target = target.display()
+         if mv -f {new} {target}; then\n\
+         \x20 chmod +x {target}\n\
+         else\n\
+         \x20 echo \"update failed, the old version is still installed\" > \"$(dirname \"$0\")/apply-update.log\"\n\
+         fi\n\
+         rm -f \"$0\"\n\
+         exec {target} >/dev/null 2>&1\n",
+        new = quote(file),
+        target = quote(target)
     );
     std::fs::write(&script, &body).map_err(|error| error.to_string())?;
     Command::new("sh")
@@ -139,4 +153,19 @@ fn spawn_swap(file: &Path, target: &Path) -> Result<PathBuf, String> {
         .spawn()
         .map_err(|error| error.to_string())?;
     Ok(script)
+}
+
+/// Refuse to schedule a swap the process cannot perform: exiting the app and
+/// failing silently is worse than reporting the problem now.
+fn ensure_writable(target: &Path) -> Result<(), String> {
+    let dir = target
+        .parent()
+        .ok_or_else(|| "update target has no directory".to_string())?;
+    let probe = dir.join(".tntl-update-probe");
+    let writable = std::fs::write(&probe, b"ok").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    if !writable {
+        return Err(format!("{} is not writable", dir.display()));
+    }
+    Ok(())
 }

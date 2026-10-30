@@ -255,6 +255,9 @@ fn set_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, S
 /// Remove a directory from the list. The directory itself is never touched.
 #[tauri::command]
 fn forget_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, String> {
+    if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
+        return Err("close the running game before changing directories".to_string());
+    }
     let config = store::forget_root(&path)?;
     let configured = state
         .configured
@@ -271,9 +274,18 @@ fn forget_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse
             .roots
             .iter()
             .find(|entry| Path::new(entry).is_dir())
+            .cloned()
         {
-            *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = PathBuf::from(next);
-            current = next.clone();
+            // Remember the directory we hand over to, or the next start would
+            // read the pointer we just removed and go back there.
+            let next_path = PathBuf::from(&next);
+            let _ = store::remember_root(&next_path);
+            let mut bootstrap = store::load_bootstrap();
+            bootstrap.schema = 2;
+            bootstrap.root = Some(next.clone());
+            let _ = store::save_bootstrap(&bootstrap);
+            *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = next_path;
+            current = next;
         } else {
             *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = store::unconfigured_root();
             state
@@ -326,20 +338,36 @@ async fn import_added_path(
     let launcher = state_launcher(&state);
     let path = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || {
+        if path.join("mmc-pack.json").is_file() || path.join("instances").is_dir() {
+            let instance = launcher
+                .import_prism_instance(&path, None, &|_: InstallEvent| {})
+                .map_err(message)?;
+            return Ok(vec![instance.name]);
+        }
         let scan = launcher.import_candidates(&path).map_err(message)?;
-        let picked: Vec<String> = if versions.is_empty() {
-            scan.versions.iter().map(|candidate| candidate.id.clone()).collect()
-        } else {
+        // Pointing at `versions/<id>` means that one version, not all of them.
+        let picked: Vec<String> = if !versions.is_empty() {
             versions
+        } else if let Some(picked) = scan.picked.clone() {
+            vec![picked]
+        } else {
+            scan.versions.iter().map(|candidate| candidate.id.clone()).collect()
         };
         let mut added = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         for id in picked {
             // Reuse the existing importer so the game-dir detection and the
             // version-isolation rules stay in one place.
             match launcher.import_instance(&path, None, Some(&id), &|_: InstallEvent| {}) {
                 Ok(instance) => added.push(instance.name),
-                Err(error) => eprintln!("cannot register {id}: {error:#}"),
+                Err(error) => failures.push(format!("{id}: {error:#}")),
             }
+        }
+        if added.is_empty() && !failures.is_empty() {
+            return Err(failures.join("; "));
+        }
+        if !failures.is_empty() {
+            eprintln!("partly imported: {}", failures.join("; "));
         }
         Ok(added)
     })
@@ -2237,11 +2265,11 @@ fn configure_webview() {
     }
 }
 
-fn initial_root() -> PathBuf {
-    // An explicit override only counts when it is an absolute directory; a
-    // stray argument (a dropped file, an OS flag) must not become the data
-    // directory.
-    let explicit = std::env::var_os("TNTL_ROOT")
+/// Data directory passed on the command line or through `TNTL_ROOT`. Only an
+/// absolute directory counts: a dropped file or an OS flag must not become the
+/// data directory.
+fn env_root() -> Option<PathBuf> {
+    std::env::var_os("TNTL_ROOT")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::args()
@@ -2250,8 +2278,11 @@ fn initial_root() -> PathBuf {
                 .map(PathBuf::from)
         })
         .filter(|path| path.is_absolute() && path.is_dir())
-        .map(|path| tntl_store::simplify_path(&path));
-    if let Some(path) = explicit {
+        .map(|path| tntl_store::simplify_path(&path))
+}
+
+fn initial_root() -> PathBuf {
+    if let Some(path) = env_root() {
         return path;
     }
     if let Some(root) = store::configured_root() {
@@ -2399,7 +2430,9 @@ fn install_panic_hook() {
 }
 
 #[tauri::command]
-async fn update_check() -> Result<tntl_app::update::UpdateStatus, String> {
+async fn update_check(state: State<'_, AppState>) -> Result<tntl_app::update::UpdateStatus, String> {
+    // Building a Launcher applies the proxy the user configured.
+    let _ = state_launcher(&state);
     tauri::async_runtime::spawn_blocking(tntl_app::update::check)
         .await
         .map_err(|error| error.to_string())?
@@ -2409,8 +2442,10 @@ async fn update_check() -> Result<tntl_app::update::UpdateStatus, String> {
 #[tauri::command]
 async fn update_download(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     asset: tntl_app::update::UpdateAsset,
 ) -> Result<String, String> {
+    let _ = state_launcher(&state);
     let dir = store::bootstrap_dir()
         .ok_or_else(|| "no config directory available".to_string())?
         .join("updates");
@@ -2434,10 +2469,7 @@ async fn update_download(
 /// is only returned so the user can install it themselves.
 #[tauri::command]
 fn update_apply(app: tauri::AppHandle, path: String) -> Result<String, String> {
-    match update_apply::apply(&app, Path::new(&path)) {
-        Ok(action) => Ok(action),
-        Err(file) => Ok(format!("manual:{file}")),
-    }
+    update_apply::apply(&app, Path::new(&path))
 }
 
 #[tauri::command]
@@ -2498,7 +2530,9 @@ fn main() {
         })
         .manage(AppState {
             root: Mutex::new(root),
-            configured: std::sync::atomic::AtomicBool::new(store::configured_root().is_some()),
+            configured: std::sync::atomic::AtomicBool::new(
+                store::configured_root().is_some() || env_root().is_some(),
+            ),
             game: Mutex::new(None),
             launching: std::sync::atomic::AtomicBool::new(false),
         })

@@ -606,6 +606,7 @@ async function copyRoot() {
         </div>
       </header>
 
+      <p v-if="update?.note" class="hint">{{ update.note }}</p>
       <p v-if="update?.release" class="hint">
         {{ update.release.title }} · {{ update.release.published_at }}
       </p>

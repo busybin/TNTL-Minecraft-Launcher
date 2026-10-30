@@ -530,7 +530,11 @@ impl Modpack {
                 }
                 // Worlds are the player's, not the pack's: an override that
                 // ships `saves/...` would replace an existing world.
-                if relative.starts_with("saves") {
+                let first = relative
+                    .components()
+                    .next()
+                    .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase());
+                if first.as_deref() == Some("saves") {
                     eprintln!("skipping pack override into saves/: {name}");
                     continue;
                 }

@@ -1456,10 +1456,9 @@ impl Launcher {
             );
             request.loader_version = Some(loader.version.clone());
         }
-        let _report = self.install(&request, version_progress)?;
-
         let instance_dir = self.instance_dir(&name)?;
         let existed_before = instance_dir.exists();
+        let _report = self.install(&request, version_progress)?;
         // Same rule as the .mrpack path: a failure after the instance was
         // registered leaves a half installed instance that cannot be retried
         // under the same name, so drop it (only when this call created it).
@@ -1538,10 +1537,9 @@ impl Launcher {
         let mut request = InstallRequest::new(&game);
         request.instance = Some(name.clone());
         self.apply_manifest_loader(&mut request, &manifest)?;
-        let _report = self.install(&request, version_progress)?;
-
         let instance_dir = self.instance_dir(&name)?;
         let existed_before = instance_dir.exists();
+        let _report = self.install(&request, version_progress)?;
         let result = (|| -> Result<ModpackReport> {
             let instance = self.load_instance(&name)?;
             let game_dir = instance.game_dir(&instance_dir);
@@ -2270,7 +2268,11 @@ impl Launcher {
         let mut chain: Vec<String> = Vec::new();
         let mut current = Some(version_id.to_string());
         while let Some(wanted) = current {
-            let Some((dir, json)) = versions.iter().find(|(dir, json)| dir == &wanted || json.id == wanted) else {
+            // The directory name is authoritative; a JSON id is only a
+            // fallback, and only when exactly one directory claims it.
+            let exact = versions.iter().find(|(dir, _)| dir == &wanted);
+            let by_id: Vec<&(String, VersionJson)> = versions.iter().filter(|(_, json)| json.id == wanted).collect();
+            let Some((dir, json)) = exact.or_else(|| if by_id.len() == 1 { Some(by_id[0]) } else { None }) else {
                 break;
             };
             if chain.contains(dir) {
@@ -2283,6 +2285,19 @@ impl Launcher {
             chain.push(version_id.to_string());
         }
         chain
+    }
+
+    /// Instance directories whose `instance.json` is missing or unreadable.
+    fn instances_without_metadata(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(self.instances_dir()) else {
+            return vec!["<instances directory unreadable>".to_string()];
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter(|entry| Instance::load(&entry.path()).is_err())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect()
     }
 
     /// Instances that launch through version directory `id`. Imported instances
@@ -2651,7 +2666,7 @@ impl Launcher {
                 .install(&game, &options, progress)?;
 
             if let Some((kind, build)) = detected.and_then(|found| found.loader) {
-                self.install_loader(&instance_name, kind, build.as_deref(), progress)?;
+                self.install_loader_with(&instance_name, kind, build.as_deref(), progress, true)?;
                 return self.load_instance(&instance_name);
             }
             Ok(instance)
@@ -3027,10 +3042,20 @@ impl Launcher {
         let users = self.version_users(id);
         if !users.is_empty() {
             bail!(
-                "version {id} is used by {}; delete or move those instances first",
+                "version {id} is used by {}; remove those instances first",
                 users.join(", ")
             );
         }
+        // An instance whose metadata cannot be read may still launch through
+        // this version; never delete on an unknown.
+        let unreadable = self.instances_without_metadata();
+        if !unreadable.is_empty() {
+            bail!(
+                "{} cannot be read, so it is not known whether version {id} is in use",
+                unreadable.join(", ")
+            );
+        }
+        let _ = self.restore_version(id);
         let dir = self.versions_dir().join(id);
         fs::remove_dir_all(&dir).with_context(|| format!("cannot delete {}", dir.display()))
     }
@@ -3111,10 +3136,24 @@ impl Launcher {
         version: Option<&str>,
         progress: &(dyn Fn(InstallEvent) + Send + Sync),
     ) -> Result<LoaderStatus> {
+        self.install_loader_with(name, kind, version, progress, false)
+    }
+
+    /// `foreign_ok` is only set by the "install a version into this game
+    /// directory" import, where the user explicitly asked for files to land
+    /// there. Every other caller must keep another launcher's root read-only.
+    fn install_loader_with(
+        &self,
+        name: &str,
+        kind: LoaderKind,
+        version: Option<&str>,
+        progress: &(dyn Fn(InstallEvent) + Send + Sync),
+        foreign_ok: bool,
+    ) -> Result<LoaderStatus> {
         self.ensure_not_running(name)?;
         self.ensure_owned_root()?;
         let instance = self.load_instance(name)?;
-        if instance.root.is_some() {
+        if instance.root.is_some() && !foreign_ok {
             bail!(
                 "instance {name} lives in another launcher's directory; change its loader there, this launcher will not rewrite those files"
             );
@@ -3285,10 +3324,9 @@ impl Launcher {
             request.loader = Some(kind);
             request.loader_version = version;
         }
-        let report = self.install(&request, version_progress)?;
-
         let instance_dir = self.instance_dir(&name)?;
         let existed_before = instance_dir.exists();
+        let report = self.install(&request, version_progress)?;
         // A failure after the instance was registered would leave a half
         // installed, unrepairable instance that cannot be retried under the
         // same name. Drop it instead (only when this call created it).

@@ -160,7 +160,7 @@ pub fn classify(path: &Path) -> PathInfo {
         kind: "foreign".to_string(),
         instances: 0,
         versions: Vec::new(),
-        writable: writable(&path),
+        writable: false,
     };
     if !path.exists() {
         info.kind = "empty".to_string();
@@ -172,8 +172,17 @@ pub fn classify(path: &Path) -> PathInfo {
     }
     info.instances = count_instances(&path);
     let has = |name: &str| path.join(name).exists();
-    if has(tntl_app::ROOT_MARKER) || info.instances > 0 {
+    // Our own files settle it, even when every instance was removed: a data
+    // directory keeps shared `versions/`, which would otherwise look like a
+    // game directory.
+    let ours = has(tntl_app::ROOT_MARKER)
+        || info.instances > 0
+        || has("launcher.json")
+        || has("accounts.json")
+        || has("hidden.json");
+    if ours {
         info.kind = "data".to_string();
+        info.writable = writable(&path);
         return info;
     }
     if has("mmc-pack.json") || has_prism_instances(&path) {
@@ -189,7 +198,7 @@ pub fn classify(path: &Path) -> PathInfo {
     let is_version = path
         .parent()
         .and_then(|parent| parent.file_name())
-        .is_some_and(|name| name == "versions")
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("versions"))
         && path
             .file_name()
             .map(|name| path.join(format!("{}.json", name.to_string_lossy())).is_file())
@@ -207,6 +216,7 @@ pub fn classify(path: &Path) -> PathInfo {
     }
     if is_empty(&path) {
         info.kind = "empty".to_string();
+        info.writable = writable(&path);
     }
     info
 }

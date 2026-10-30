@@ -158,7 +158,11 @@ pub fn extract_overrides(
             return Err(CurseForgeError::Invalid(format!("unsafe archive entry: {name}")));
         }
         // Worlds are the player's, not the pack's.
-        if relative.starts_with("saves") {
+        let first = relative
+            .components()
+            .next()
+            .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase());
+        if first.as_deref() == Some("saves") {
             eprintln!("skipping pack override into saves/: {name}");
             continue;
         }

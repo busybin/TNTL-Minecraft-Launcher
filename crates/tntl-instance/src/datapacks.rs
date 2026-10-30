@@ -173,8 +173,9 @@ pub fn set_enabled(game_dir: &Path, world: &str, name: &str, enabled: bool) -> R
 }
 
 /// Disabled packs are stored per world; drop the folder when the world goes.
+/// The world directory is already gone by then, so only the name is checked.
 pub fn remove_world(game_dir: &Path, world: &str) -> Result<(), DatapackError> {
-    check_world(game_dir, world)?;
+    check_name(world)?;
     let dir = disabled_dir(game_dir, world);
     match fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),

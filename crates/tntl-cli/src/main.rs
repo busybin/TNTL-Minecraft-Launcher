@@ -570,6 +570,21 @@ enum LoaderAction {
     Check,
 }
 
+/// Data directory the GUI picked (`bootstrap.json`). The command line and the
+/// desktop app must agree on where the library is.
+fn configured_root() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = dirs::data_local_dir();
+    #[cfg(not(windows))]
+    let base = dirs::config_dir();
+    let path = base?.join("tntl").join("bootstrap.json");
+    let bytes = std::fs::read(path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let root = value.get("root")?.as_str()?.to_string();
+    let path = PathBuf::from(root);
+    path.is_dir().then_some(path)
+}
+
 fn main() {
     let cli = Cli::parse();
     match run(cli) {
@@ -582,7 +597,8 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<i32> {
-    let launcher = Launcher::from_root(cli.root);
+    let root = cli.root.or_else(configured_root);
+    let launcher = Launcher::from_root(root);
     match cli.command {
         Command::Java { offers, install } => cmd_java(&launcher, offers, install),
         Command::Versions { channel, limit } => cmd_versions(&channel, limit),

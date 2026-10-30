@@ -305,6 +305,19 @@ function closeRemovedFolder() {
   removedFolder.value = null;
 }
 
+/** Put the entry back; the files were never touched, so this is enough. */
+async function undoRemove() {
+  const target = removedFolder.value;
+  if (!target) return;
+  try {
+    await api.restoreInstance(target.name);
+    removedFolder.value = null;
+    await refresh();
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
 async function openRemovedFolder() {
   const target = removedFolder.value;
   if (!target) return;
@@ -363,6 +376,10 @@ async function applyRoot(path: string) {
   try {
     rootsState.value = await api.setRoot(path);
     detailInstance.value = null;
+    // Settings live inside the data directory: the old object belongs to the
+    // previous root and saving it here would copy its keys over.
+    settings.value = await api.launcherSettings().catch(() => settings.value);
+    applyTheme(settings.value.theme);
     await refresh();
   } catch (cause) {
     error.value = String(cause);
@@ -372,10 +389,17 @@ async function applyRoot(path: string) {
 async function forgetRoot(path: string) {
   try {
     rootsState.value = await api.forgetRoot(path);
-    if (rootsState.value.current !== root.value) {
-      detailInstance.value = null;
-      await refresh();
+    session.value = await api.session().catch(() => null);
+    if (!session.value?.configured) {
+      // The list is empty now: ask for a directory instead of showing an
+      // empty library that looks like data loss.
+      firstRun.value = true;
+      bootstrap.value = null;
+      instances.value = [];
+      return;
     }
+    detailInstance.value = null;
+    await refresh();
   } catch (cause) {
     error.value = String(cause);
   }
@@ -561,6 +585,9 @@ const unlisteners: UnlistenFn[] = [];
 async function onFirstRunDone(games: string | null) {
   firstRun.value = false;
   session.value = await api.session().catch(() => null);
+  settings.value = await api.launcherSettings().catch(() => settings.value);
+  applyTheme(settings.value.theme);
+  onboardingOpen.value = false;
   await refresh();
   if (games) openImport(games);
 }
@@ -892,6 +919,7 @@ onUnmounted(() => {
         <span>{{ t("app.removedKept", { name: removedFolder.name }) }}</span>
         <code :title="removedFolder.dir">{{ removedFolder.dir }}</code>
         <button class="ghost" type="button" @click="openRemovedFolder">{{ t("app.openFolder") }}</button>
+        <button class="ghost" type="button" @click="undoRemove">{{ t("app.undoRemove") }}</button>
         <button class="ghost" type="button" @click="closeRemovedFolder">{{ t("action.close") }}</button>
       </div>
     </Transition>

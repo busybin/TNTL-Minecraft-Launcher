@@ -276,11 +276,21 @@ impl<'a> Installer<'a> {
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
         })?;
         // Keep a hand-fixed or other-launcher JSON instead of overwriting it.
-        if let Err(error) = tntl_store::backup_existing(&self.roots.version_json(&summary.id)) {
-            return Err(SourceError::Io {
-                path: self.roots.version_json(&summary.id),
-                source: error,
-            });
+        // Copy rather than rename: if the write below fails, the original must
+        // still be at the path the launcher reads.
+        let target = self.roots.version_json(&summary.id);
+        if target.is_file() {
+            let mut backup = target.as_os_str().to_os_string();
+            backup.push(".bak");
+            let backup = std::path::PathBuf::from(backup);
+            if !backup.exists()
+                && let Err(error) = std::fs::copy(&target, &backup)
+            {
+                return Err(SourceError::Io {
+                    path: backup,
+                    source: error,
+                });
+            }
         }
         tntl_store::atomic_write(&self.roots.version_json(&summary.id), &body)?;
         Ok(json)
