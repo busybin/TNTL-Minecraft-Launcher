@@ -45,7 +45,7 @@ pub fn loader_build_number<'a>(version: &'a str, game_version: &str) -> &'a str 
 
 /// Forge-family mods declare the loader's own numbering (`[47,)`,
 /// `[47.4.0,)`), while the installed build is named `1.20.1-47.4.28`.
-fn effective_loader_version(
+pub fn effective_loader_version(
     instance: ModLoader,
     module: ModLoader,
     version: &str,

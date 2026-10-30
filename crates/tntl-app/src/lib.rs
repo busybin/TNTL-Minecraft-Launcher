@@ -189,6 +189,45 @@ pub const SETTINGS_FILE: &str = "launcher.json";
 /// launcher refuses to install, repair or delete anything inside it.
 pub const ROOT_MARKER: &str = "tntl.json";
 
+/// Directory that holds the launcher's own pointer files (`bootstrap.json`,
+/// `roots.json`), independent of the data directory.
+pub fn state_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = dirs::data_local_dir();
+    #[cfg(not(windows))]
+    let base = dirs::config_dir();
+    base.map(|dir| dir.join("tntl"))
+}
+
+/// Every data directory the user has opened, read from `roots.json` with the
+/// configured root as a fallback. Used where another root's instances may still
+/// point at this one (deleting a shared version); a missing or broken registry
+/// simply yields nothing.
+pub fn known_data_roots() -> Vec<PathBuf> {
+    let Some(dir) = state_dir() else {
+        return Vec::new();
+    };
+    let read = |name: &str| -> Option<serde_json::Value> {
+        let bytes = fs::read(dir.join(name)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let mut roots: Vec<PathBuf> = read("roots.json")
+        .and_then(|value| value.get("roots").and_then(|list| list.as_array()).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry.as_str())
+        .map(|entry| tntl_store::simplify_path(Path::new(entry)))
+        .collect();
+    if roots.is_empty()
+        && let Some(root) = read("bootstrap.json")
+            .and_then(|value| value.get("root").and_then(|root| root.as_str().map(str::to_string)))
+    {
+        roots.push(tntl_store::simplify_path(Path::new(&root)));
+    }
+    roots.retain(|root| root.is_dir());
+    roots
+}
+
 /// `<root>/hidden.json`: instances and versions the user removed from the
 /// library. Only this list changes; nothing on disk is moved or deleted.
 pub const HIDDEN_FILE: &str = "hidden.json";
@@ -2456,6 +2495,7 @@ impl Launcher {
     /// Move an instance directory and update the name inside `instance.json`.
     pub fn rename_instance(&self, old: &str, new: &str) -> Result<PathBuf> {
         validate_name(new)?;
+        self.ensure_owned_root()?;
         self.ensure_not_running(old)?;
         let old_dir = self.instance_dir(old)?;
         let new_dir = self.instance_dir(new)?;
@@ -2546,6 +2586,17 @@ impl Launcher {
                 continue;
             }
             let dir = entry.path();
+            // A folder name that is not valid UTF-8 cannot be addressed by a
+            // command, so it never appears in the library; listing it here at
+            // least offers "remove from the list".
+            if entry.file_name().to_str().is_none() {
+                broken.push(BrokenInstance {
+                    name,
+                    dir,
+                    error: "folder name is not valid UTF-8".to_string(),
+                });
+                continue;
+            }
             if let Err(error) = Instance::load(&dir) {
                 broken.push(BrokenInstance {
                     name,
@@ -2610,9 +2661,22 @@ impl Launcher {
     pub fn forget_instance_dir(&self, name: &str) -> Result<PathBuf> {
         valid_component(name)?;
         let dir = self.instances_dir().join(name);
-        if !dir.is_dir() {
-            bail!("{name} is not an instance directory");
-        }
+        // A folder whose name is not valid UTF-8 is listed under its lossy
+        // name; resolve it back so it can be dropped from the list too.
+        let dir = if dir.is_dir() {
+            dir
+        } else {
+            let entries = fs::read_dir(self.instances_dir())
+                .map(|entries| entries.flatten().map(|entry| entry.path()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let mut matches = entries
+                .into_iter()
+                .filter(|path| path.is_dir() && path.file_name().is_some_and(|file| file.to_string_lossy() == name));
+            match (matches.next(), matches.next()) {
+                (Some(found), None) => found,
+                _ => bail!("{name} is not an instance directory"),
+            }
+        };
         let mut hidden = self.hidden();
         if !hidden.hides_instance(name) {
             hidden.instances.push(name.to_string());
@@ -3461,7 +3525,9 @@ impl Launcher {
     /// Remove one installed version. Refuses while an instance still uses it;
     /// shared libraries and assets are left alone.
     pub fn delete_version(&self, id: &str) -> Result<()> {
-        self.delete_version_with_roots(id, &[])
+        // An instance in another data directory may point its `root` here, so
+        // the registry of known roots is consulted too.
+        self.delete_version_with_roots(id, &known_data_roots())
     }
 
     /// [`Self::delete_version`] that also looks at instances stored under
@@ -4738,7 +4804,7 @@ impl Launcher {
             // project again would put two jars with one id in `mods/`.
             let mut installed: Vec<String> = tntl_instance::mods::scan_for(&dir, loader, game_version)?
                 .into_iter()
-                .map(|module| module.id)
+                .flat_map(|module| std::iter::once(module.id).chain(module.provides))
                 .collect();
             // A re-install is matched by project id when the mod id differs
             // from the project slug (corelib vs its slug).
@@ -5983,6 +6049,7 @@ impl Launcher {
     /// Copy an instance directory under a new name.
     pub fn duplicate_instance(&self, name: &str, new_name: &str) -> Result<PathBuf> {
         validate_name(new_name)?;
+        self.ensure_owned_root()?;
         self.ensure_not_running(name)?;
         let source = self.instance_dir(name)?;
         if !source.join(tntl_instance::INSTANCE_FILE).exists() {
@@ -6830,8 +6897,6 @@ fn mark_blocked(mods: &mut [tntl_instance::mods::ModInfo], status: &LoaderStatus
     let forge_family = matches!(kind, "forge" | "neoforge");
     let label = loader_label(kind);
     let instance_loader = loader_from_key(kind);
-    let build =
-        tntl_doctor::mods::loader_build_number(status.version.as_deref().unwrap_or_default(), &status.game_version);
     for module in mods {
         // A Forge jar in a Fabric instance (or the other way round) can never
         // load, whatever its version bounds say. The wizard already switched it
@@ -6857,11 +6922,22 @@ fn mark_blocked(mods: &mut [tntl_instance::mods::ModInfo], status: &LoaderStatus
         }
         // Forge and NeoForge treat a bare version (`21.1.215`) as a
         // recommendation, so only bracketed ranges can rule a jar out.
-        let enforced = if forge_family {
-            tntl_doctor::mods::enforced_ranges(ModLoader::Forge, &module.loader_versions)
-        } else {
-            module.loader_versions.clone()
-        };
+        let enforced = tntl_doctor::mods::enforced_ranges(instance_loader, &module.loader_versions);
+        // Fabric and Quilt state their loader build directly; Forge-family
+        // metadata names the build inside `1.20.1-47.4.28`. Same rule as the
+        // doctor, so the list and the report never disagree.
+        let loader_actual = status
+            .version
+            .as_deref()
+            .and_then(|version| {
+                tntl_doctor::mods::effective_loader_version(
+                    instance_loader,
+                    module.loader,
+                    version,
+                    &status.game_version,
+                )
+            })
+            .filter(|actual| tntl_doctor::version::any_matches(actual, &enforced) == Some(false));
         // Fabric metadata states the game version precisely; Forge metadata is
         // sloppy (`[1.21,1.21.1)` for "1.21.x"), so compare the series there.
         let game_mismatch = if forge_family && !matches!(module.loader, ModLoader::Fabric | ModLoader::Quilt) {
@@ -6869,12 +6945,12 @@ fn mark_blocked(mods: &mut [tntl_instance::mods::ModInfo], status: &LoaderStatus
         } else {
             tntl_doctor::version::any_matches(&status.game_version, &module.game_versions)
         } == Some(false);
-        module.blocked = if forge_family && tntl_doctor::version::any_matches(build, &enforced) == Some(false) {
+        module.blocked = if let Some(actual) = loader_actual {
             Some(tntl_instance::mods::BlockedReason {
                 kind: "loader".to_string(),
                 loader: label.to_string(),
                 required: module.loader_versions.clone(),
-                actual: build.to_string(),
+                actual,
             })
         } else if game_mismatch {
             Some(tntl_instance::mods::BlockedReason {
@@ -7293,16 +7369,19 @@ fn portable_file_name(name: &str) -> bool {
     tntl_store::portable_file_name(name)
 }
 
-/// Reject names that cannot be one directory entry. Read-only paths stay
-/// permissive on purpose: a folder created on Linux may legally contain `:`,
-/// and an existing instance must remain openable. Names the launcher *creates*
-/// go through [`portable_file_name`] as well.
+/// Reject names that cannot be one directory entry. A Linux folder may legally
+/// contain `:`, but such an instance is listed as unreadable (it can still be
+/// dropped from the library) instead of resolving to a drive-relative path on
+/// Windows. Names the launcher *creates* go through [`portable_file_name`] too.
+///
+/// `:` is rejected even here: on Windows `Path::join("C:x")` replaces the base
+/// with a drive-relative path, so `cleanup_instance("C:..")` would escape the
+/// data directory.
 fn valid_component(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
         || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
+        || name.contains(['/', '\\', ':'])
         || name.chars().any(char::is_control)
     {
         bail!("invalid instance name: {name}");

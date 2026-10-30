@@ -22,11 +22,7 @@ pub struct Bootstrap {
 /// Where the pointer file lives. Local app data on Windows keeps it away from
 /// the old `%APPDATA%\tntl` data directory; on Linux it is the config dir.
 pub fn bootstrap_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let base = dirs::data_local_dir();
-    #[cfg(not(windows))]
-    let base = dirs::config_dir();
-    base.map(|dir| dir.join("tntl"))
+    tntl_app::state_dir()
 }
 
 fn bootstrap_path() -> Option<PathBuf> {

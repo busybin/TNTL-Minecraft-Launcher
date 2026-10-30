@@ -158,12 +158,9 @@ pub fn extract_overrides(
         if !target.starts_with(game_dir) {
             return Err(CurseForgeError::Invalid(format!("unsafe archive entry: {name}")));
         }
-        // Worlds are the player's, not the pack's.
-        let first = relative
-            .components()
-            .next()
-            .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase());
-        if first.as_deref() == Some("saves") {
+        // Worlds are the player's, not the pack's. `saves`, `saves.` and
+        // `saves /x` all fold onto the same folder on Windows.
+        if tntl_store::is_protected_game_path(&relative) {
             eprintln!("skipping pack override into saves/: {name}");
             continue;
         }

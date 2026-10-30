@@ -184,9 +184,19 @@ fn download_files(
     let files_total = files.len();
     let bytes_total: u64 = files.iter().map(|file| file.file_size).sum();
     let mut bytes_done = 0_u64;
+    // Two entries that differ only in case land on one file on Windows and
+    // macOS; the second would silently replace the first after its `.bak`.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (files_done, file) in files.iter().enumerate() {
         let relative = safe_relative(&file.path)
             .ok_or_else(|| ModpackError::Invalid(format!("unsafe file path: {}", file.path)))?;
+        let key = relative.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        if !seen.insert(key) {
+            return Err(ModpackError::Invalid(format!(
+                "pack lists the same file twice: {}",
+                file.path
+            )));
+        }
         // The override extractor already skips `saves/`; the index file list
         // must reject it too, or a repair overwrites the player's worlds.
         if tntl_store::is_protected_game_path(&relative) {
@@ -364,9 +374,7 @@ pub fn export(game_dir: &Path, output: &Path, options: &ExportOptions<'_>) -> Re
 
     // Write next to the target and rename, so a failed export does not destroy
     // the file the user exported earlier under the same name.
-    let mut staged_name = output.as_os_str().to_os_string();
-    staged_name.push(".part");
-    let staged = std::path::PathBuf::from(staged_name);
+    let staged = tntl_store::scratch_path(output, "mrpack");
     let file = File::create(&staged).map_err(|error| io_error(&staged, error))?;
     let mut zip = zip::ZipWriter::new(file);
     let file_options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);

@@ -104,10 +104,15 @@ pub fn save(game_dir: &Path, entries: &[ServerEntry]) -> Result<(), ServerError>
         path: game_dir.to_path_buf(),
         source: error,
     })?;
+    // First edit of the user's list keeps a copy; the NBT rewrite drops
+    // unknown-shaped rows it cannot parse back.
+    crate::content::backup_once(&path).map_err(|error| ServerError::Io {
+        path: path.clone(),
+        source: std::io::Error::other(error.to_string()),
+    })?;
     nbt::write_file(&path, &root)?;
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

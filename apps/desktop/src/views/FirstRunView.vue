@@ -12,7 +12,10 @@ const emit = defineEmits<{
 const busy = ref(false);
 const error = ref<string | null>(null);
 const picked = ref<PathInfo | null>(null);
-/** Game directory the user pointed at before choosing a data directory. */
+/**
+ * Game directory picked before a data directory existed. It survives the second
+ * pick so the import can be offered once the data directory is created.
+ */
 const gamePath = ref<string | null>(null);
 const report = ref<{ instances: number; suggested: string[]; backup: string } | null>(null);
 
@@ -24,10 +27,9 @@ async function pick() {
     const info = await api.pathInfo(path);
     picked.value = info;
     if (info.kind !== "data" && info.kind !== "empty") {
-      // A game directory can only be imported once a data directory exists.
+      // A game directory can only be imported once a data directory exists;
+      // the next pick chooses that directory and keeps this path.
       gamePath.value = info.path;
-    } else {
-      gamePath.value = null;
     }
   } catch (cause) {
     error.value = String(cause);

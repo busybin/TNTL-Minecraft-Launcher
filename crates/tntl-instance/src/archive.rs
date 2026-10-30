@@ -225,7 +225,7 @@ pub fn export(instance_dir: &Path, target: &Path) -> Result<ArchiveReport, Archi
         .filter(|relative| !relative.as_os_str().is_empty())
         .map(|_| game_dir.as_path());
 
-    let temporary = target.with_extension("zip.part");
+    let temporary = tntl_store::scratch_path(target, "zip");
     let file = File::create(&temporary).map_err(|error| io_err(&temporary, error))?;
     let mut zip = zip::ZipWriter::new(BufWriter::new(file));
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);

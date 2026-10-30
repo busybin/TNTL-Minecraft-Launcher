@@ -192,9 +192,20 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         fs::create_dir_all(parent).map_err(|error| io_err(parent, error))?;
     }
     let temp = temp_path(path);
-    fs::write(&temp, bytes).map_err(|error| io_err(&temp, error))?;
+    // Flush before the rename: a power cut may still lose the newest file, but
+    // it must not leave a zero-length one behind after the rename.
+    let mut file = File::create(&temp).map_err(|error| io_err(&temp, error))?;
+    file.write_all(bytes).map_err(|error| io_err(&temp, error))?;
+    file.sync_all().map_err(|error| io_err(&temp, error))?;
     fs::rename(&temp, path).map_err(|error| io_err(path, error))?;
     Ok(())
+}
+
+/// Unique sibling scratch path for write-then-rename exports (`.zip`, `.mrpack`,
+/// the generated skin pack). Never a fixed `foo.zip.part`: that would truncate
+/// a file the user happens to have under the same name.
+pub fn scratch_path(target: &Path, tag: &str) -> PathBuf {
+    temp_path(&target.with_extension(format!("{tag}.scratch")))
 }
 
 /// Unique sibling path for the write-then-rename dance. A pid alone is not
@@ -353,6 +364,11 @@ pub fn backup_copy(path: &Path) -> io::Result<Option<PathBuf>> {
 /// `x.bak-<unix>`, `x.bak-<unix>-<n>` or `x.broken-<unix>`. A plain `x.bak` is
 /// someone else's file (TNTL never writes that shape) and is left alone.
 pub fn is_backup_name(name: &str) -> bool {
+    // `content::backup_once` writes `x.tntl-bak` (no stamp) around
+    // `options.txt`/`servers.dat`; those are ours too.
+    if name.ends_with(".tntl-bak") {
+        return true;
+    }
     let Some((_, suffix)) = name.rsplit_once(".bak-") else {
         return ends_with_broken_suffix(name);
     };
@@ -445,6 +461,9 @@ pub fn purge_backups(root: &Path, keep: usize, max_age: std::time::Duration) -> 
 
 /// `foo.jar.bak-1700000000-1` → `foo.jar`.
 fn base_name(name: &str) -> String {
+    if let Some(base) = name.strip_suffix(".tntl-bak") {
+        return base.to_string();
+    }
     if let Some((base, _)) = name.rsplit_once(".broken-") {
         return base.to_string();
     }
@@ -803,6 +822,7 @@ mod tests {
     #[test]
     fn recognises_and_purges_our_backups() {
         assert!(!is_backup_name("a.jar.bak"));
+        assert!(is_backup_name("options.txt.tntl-bak"));
         assert!(is_backup_name("a.jar.bak-1700000000"));
         assert!(is_backup_name("a.jar.bak-1700000000-2"));
         assert!(is_backup_name("launcher.broken-1700000000"));

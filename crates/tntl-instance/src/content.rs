@@ -442,7 +442,7 @@ pub fn apply_default_skin(
     let dir = game_dir.join("resourcepacks");
     fs::create_dir_all(&dir).map_err(|error| io_error(&dir, error))?;
     let path = dir.join(SKIN_PACK);
-    let temporary = dir.join(format!("{SKIN_PACK}.part"));
+    let temporary = tntl_store::scratch_path(&path, "skin");
     let file = fs::File::create(&temporary).map_err(|error| io_error(&temporary, error))?;
     let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
     let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -476,9 +476,20 @@ pub fn apply_default_skin(
         zip.write_all(png).map_err(|error| io_error(&temporary, error))?;
     }
     zip.finish().map_err(|error| ContentError::Zip(error.to_string()))?;
+    // The same file name may already belong to the user. Only a pack whose
+    // recorded hash matches ours is replacable; anything else is backed up
+    // first, or it would be gone without a trace.
+    let marker = dir.join(SKIN_MARKER);
+    let ours = fs::read(&marker)
+        .ok()
+        .zip(tntl_store::sha1_file(&path).ok())
+        .is_some_and(|(recorded, actual)| recorded == actual.as_bytes());
+    if path.is_file() && !ours {
+        tntl_store::backup_existing(&path).map_err(|error| io_error(&path, error))?;
+    }
     fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
     if let Ok(hash) = tntl_store::sha1_file(&path) {
-        let _ = atomic_write(&dir.join(SKIN_MARKER), hash.as_bytes());
+        let _ = atomic_write(&marker, hash.as_bytes());
     }
     set_resource_pack(game_dir, SKIN_PACK, true)?;
     Ok(path)
@@ -542,7 +553,7 @@ pub fn remove_default_skin(game_dir: &Path) -> Result<(), ContentError> {
 }
 
 /// Copy `path` to `<name>.tntl-bak` the first time we are about to edit it.
-fn backup_once(path: &Path) -> Result<(), ContentError> {
+pub(crate) fn backup_once(path: &Path) -> Result<(), ContentError> {
     if !path.exists() {
         return Ok(());
     }

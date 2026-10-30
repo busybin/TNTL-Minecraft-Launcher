@@ -499,7 +499,13 @@ pub fn save_cape_image(root: &std::path::Path, id: &str, url: &str) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
     }
-    std::fs::write(&path, &bytes).map_err(|error| io_error(&path, error))
+    tntl_store::atomic_write(&path, &bytes).map_err(|error| {
+        let source = match error {
+            tntl_store::StoreError::Io { source, .. } => source,
+            other => std::io::Error::other(other.to_string()),
+        };
+        io_error(&path, source)
+    })
 }
 
 /// Download a skin URL into the local cache.
