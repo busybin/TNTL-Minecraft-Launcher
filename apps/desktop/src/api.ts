@@ -737,8 +737,20 @@ export const api = {
   loadInstance: (name: string) => invoke<InstanceConfig>("load_instance", { name }),
   saveInstance: (instance: InstanceConfig) => invoke<void>("save_instance", { instance }),
   clearInstanceJava: (name: string) => invoke<void>("clear_instance_java", { name }),
-  deleteInstance: (name: string, cleanup = false) =>
-    invoke<string[]>("delete_instance", { name, cleanup }),
+  // Removal only hides the entry; the files stay where they are.
+  deleteInstance: (name: string) => invoke<string>("delete_instance", { name }),
+  restoreInstance: (name: string) => invoke<void>("restore_instance", { name }),
+  unregisterVersion: (id: string) => invoke<void>("unregister_version", { id }),
+  restoreVersion: (id: string) => invoke<void>("restore_version", { id }),
+  session: () => invoke<SessionState>("session"),
+  pathInfo: (path: string) => invoke<PathInfo>("path_info", { path }),
+  chooseDataRoot: (path: string) => invoke<PathInfo>("choose_data_root", { path }),
+  migrateLegacy: () => invoke<MigrationReport>("migrate_legacy"),
+  importAddedPath: (path: string, versions: string[]) =>
+    invoke<string[]>("import_added_path", { path, versions }),
+  updateCheck: () => invoke<UpdateStatus>("update_check"),
+  updateDownload: (asset: UpdateAsset) => invoke<string>("update_download", { asset }),
+  updateApply: (path: string) => invoke<string>("update_apply", { path }),
   installedVersions: () => invoke<InstalledVersion[]>("installed_versions"),
   deleteVersion: (id: string) => invoke<void>("delete_version", { id }),
   createInstanceFromVersion: (versionId: string, name: string) =>
@@ -1020,3 +1032,52 @@ export function imageUrl(bytes: ArrayBuffer, file?: string | null): string {
   const extension = file?.split(".").pop()?.toLowerCase() ?? "png";
   return URL.createObjectURL(new Blob([bytes], { type: IMAGE_TYPES[extension] ?? "image/png" }));
 }
+
+export type SessionState = {
+  configured: boolean;
+  root: string;
+  onboarded: boolean;
+  legacy: string | null;
+  missing: string[];
+};
+
+export type PathInfo = {
+  path: string;
+  kind: "data" | "game" | "version" | "prism" | "mods" | "empty" | "foreign";
+  instances: number;
+  versions: string[];
+  writable: boolean;
+};
+
+export type MigrationReport = {
+  root: string;
+  instances: number;
+  suggested: string[];
+  dropped: string[];
+  backup: string;
+  settings_reset: boolean;
+};
+
+export type UpdateAsset = {
+  name: string;
+  url: string;
+  size: number;
+  digest: string | null;
+};
+
+export type UpdateStatus = {
+  current: number;
+  latest: number;
+  available: boolean;
+  release: {
+    tag: string;
+    version: number;
+    title: string;
+    notes: string;
+    prerelease: boolean;
+    published_at: string;
+    html_url: string;
+    asset: UpdateAsset | null;
+  } | null;
+  note: string | null;
+};

@@ -39,6 +39,8 @@ let closeArmed = false;
 const busy = ref<string | null>(null);
 const error = ref<string | null>(null);
 const toast = ref<string | null>(null);
+/** Instance just removed from the list; files stay until the user deletes them. */
+const removedFolder = ref<{ name: string; dir: string } | null>(null);
 
 const consoleOpen = ref(false);
 const consoleTitle = ref("");
@@ -282,16 +284,27 @@ function closeDetail() {
 }
 
 async function remove(name: string) {
-  if (!window.confirm(t("app.deleteConfirm", { name }))) return;
+  if (!window.confirm(t("app.removeConfirm", { name }))) return;
   try {
-    const removed = await api.deleteInstance(name, true);
+    // Only the list entry goes away; nothing on disk is touched.
+    const dir = await api.deleteInstance(name);
     if (detailInstance.value === name) detailInstance.value = null;
-    notify(
-      removed.length
-        ? t("app.deletedWithVersions", { name, count: removed.length })
-        : t("app.deleted", { name }),
-    );
+    removedFolder.value = { name, dir };
     await refresh();
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+function closeRemovedFolder() {
+  removedFolder.value = null;
+}
+
+async function openRemovedFolder() {
+  const target = removedFolder.value;
+  if (!target) return;
+  try {
+    await api.openPath(target.dir);
   } catch (cause) {
     error.value = String(cause);
   }
@@ -837,11 +850,43 @@ onUnmounted(() => {
 
     <Transition name="toast">
       <div v-if="toast" class="toast">{{ toast }}</div>
+      <div v-if="removedFolder" class="removed-banner">
+        <span>{{ t("app.removedKept", { name: removedFolder.name }) }}</span>
+        <code :title="removedFolder.dir">{{ removedFolder.dir }}</code>
+        <button class="ghost" type="button" @click="openRemovedFolder">{{ t("app.openFolder") }}</button>
+        <button class="ghost" type="button" @click="closeRemovedFolder">{{ t("action.close") }}</button>
+      </div>
     </Transition>
   </div>
 </template>
 
 <style scoped>
+.removed-banner {
+  position: fixed;
+  left: 18px;
+  right: 18px;
+  bottom: 18px;
+  z-index: 30;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--border-strong);
+  background: var(--dialog-b, #1b1f23);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.4);
+  font-size: 12.5px;
+}
+
+.removed-banner code {
+  flex: 1 1 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
 .wallpaper {
   position: fixed;
   inset: 0;
