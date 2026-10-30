@@ -13,6 +13,7 @@ pub enum Plan {
     /// Replace the running portable executable.
     Replace(PathBuf),
     /// Hand the package to the platform's installer.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Installer,
     /// Deb belongs to the system package manager.
     Manual,

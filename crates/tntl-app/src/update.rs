@@ -102,10 +102,7 @@ pub fn check() -> Result<UpdateStatus> {
         .get_bytes_with(
             &url,
             2 * 1024 * 1024,
-            &[
-                ("Accept", "application/vnd.github+json"),
-                ("User-Agent", "TNTL"),
-            ],
+            &[("Accept", "application/vnd.github+json"), ("User-Agent", "TNTL")],
         )
         .context("cannot read the release list")?;
     let raw: Vec<RawRelease> = serde_json::from_slice(&body).context("unexpected release list")?;
@@ -187,9 +184,7 @@ fn pick_asset(assets: &[RawAsset]) -> Option<UpdateAsset> {
     };
     for suffix in wanted {
         let found = assets.iter().find(|asset| {
-            asset.name.ends_with(suffix)
-                && safe_url(&asset.browser_download_url)
-                && !asset.name.is_empty()
+            asset.name.ends_with(suffix) && safe_url(&asset.browser_download_url) && !asset.name.is_empty()
         });
         if let Some(asset) = found {
             return Some(UpdateAsset {
@@ -213,20 +208,11 @@ pub fn safe_url(url: &str) -> bool {
 }
 
 /// Download the asset into `dir` and verify it. Returns the file path.
-pub fn download(
-    asset: &UpdateAsset,
-    dir: &Path,
-    progress: &mut dyn FnMut(u64),
-) -> Result<PathBuf> {
+pub fn download(asset: &UpdateAsset, dir: &Path, progress: &mut dyn FnMut(u64)) -> Result<PathBuf> {
     if !safe_url(&asset.url) {
         bail!("refusing to download from {}", asset.url);
     }
-    let name = asset
-        .name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    let name = asset.name.rsplit(['/', '\\']).next().unwrap_or_default().to_string();
     if name.is_empty() || name.contains("..") {
         bail!("unusable update file name");
     }

@@ -178,7 +178,8 @@ fn choose_data_root(state: State<'_, AppState>, path: String) -> Result<store::P
     if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
         return Err("close the running game before switching directories".to_string());
     }
-    let mut path = tntl_store::simplify_path(Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path)));
+    let canonical = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path));
+    let path = tntl_store::simplify_path(&canonical);
     if !path.exists() {
         std::fs::create_dir_all(&path)
             .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
@@ -224,7 +225,8 @@ fn set_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, S
     if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
         return Err("close the running game before switching directories".to_string());
     }
-    let path = tntl_store::simplify_path(Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path)));
+    let canonical = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path));
+    let path = tntl_store::simplify_path(&canonical);
     if !path.is_dir() {
         return Err(format!("{} is not a directory", path.display()));
     }
@@ -2233,14 +2235,6 @@ fn configure_webview() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
-}
-
-#[derive(Default, Serialize, serde::Deserialize)]
-struct RootConfig {
-    #[serde(default)]
-    roots: Vec<String>,
-    #[serde(default)]
-    current: Option<String>,
 }
 
 fn initial_root() -> PathBuf {

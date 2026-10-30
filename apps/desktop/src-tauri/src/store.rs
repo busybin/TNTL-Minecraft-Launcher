@@ -150,12 +150,6 @@ pub struct PathInfo {
     pub writable: bool,
 }
 
-impl PathInfo {
-    pub fn is_data(&self) -> bool {
-        self.kind == "data"
-    }
-}
-
 /// What a picked directory is. Order matters: our own marker wins over
 /// `versions/`, because a launcher data directory has one too.
 pub fn classify(path: &Path) -> PathInfo {
@@ -347,11 +341,13 @@ pub fn migrate_legacy(root: &Path) -> Result<MigrationReport, String> {
     let mut seen: Vec<String> = Vec::new();
     let mut candidates: Vec<String> = load_roots().roots;
     for path in legacy_roots_paths(Some(&root)) {
-        if let Ok(bytes) = std::fs::read(&path)
-            && let Ok(old) = serde_json::from_slice::<RootConfig>(&bytes)
-        {
-            candidates.extend(old.roots);
-        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(old) = serde_json::from_slice::<RootConfig>(&bytes) else {
+            continue;
+        };
+        candidates.extend(old.roots);
     }
     candidates.push(root.display().to_string());
     for entry in candidates {

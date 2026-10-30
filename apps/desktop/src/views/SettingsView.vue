@@ -11,6 +11,7 @@ import {
   type LauncherSettings,
   type RuntimeProgress,
   type UnlistenFn,
+  type UpdateStatus,
 } from "../api";
 import Icon from "../components/Icon.vue";
 import TransferBar from "../components/TransferBar.vue";
@@ -39,6 +40,48 @@ function openGuide(url: string) {
 const savingSettings = ref(false);
 const settingsStatus = ref<string | null>(null);
 const appVersion = ref("");
+const update = ref<UpdateStatus | null>(null);
+const updateBusy = ref(false);
+const updateStatusText = ref<string | null>(null);
+
+async function checkUpdate() {
+  updateBusy.value = true;
+  updateStatusText.value = t("update.checking");
+  try {
+    const status = await api.updateCheck();
+    update.value = status;
+    updateStatusText.value = status.available
+      ? t("update.available", { version: status.latest })
+      : t("update.none");
+  } catch (cause) {
+    updateStatusText.value = String(cause);
+  } finally {
+    updateBusy.value = false;
+  }
+}
+
+async function installUpdate() {
+  const asset = update.value?.release?.asset;
+  if (!asset) return;
+  updateBusy.value = true;
+  updateStatusText.value = t("update.installing");
+  try {
+    const file = await api.updateDownload(asset);
+    const action = await api.updateApply(file);
+    if (action.startsWith("manual:")) {
+      updateStatusText.value = t("update.manual");
+      const path = action.slice("manual:".length);
+      const folder = path.replace(/[\\/][^\\/]*$/, "");
+      await api.openPath(folder || path).catch(() => undefined);
+    } else {
+      updateStatusText.value = t("update.done");
+    }
+  } catch (cause) {
+    updateStatusText.value = `${t("update.failed")}: ${String(cause)}`;
+  } finally {
+    updateBusy.value = false;
+  }
+}
 
 onMounted(async () => {
   // The About card must not hard-code the version; the backend owns it.
@@ -551,7 +594,47 @@ async function copyRoot() {
           <Icon :name="copied ? 'check' : 'copy'" :size="14" />{{ copied ? t("settings.copied") : t("settings.copy") }}
         </button>
       </div>
-      <p class="hint"><code>MLC_ROOT=/path</code> — {{ t("settings.rootHint") }}</p>
+      <p class="hint"><code>TNTL_ROOT=/path</code> — {{ t("settings.rootHint") }}</p>
+    </section>
+
+    <section class="card panel">
+      <header>
+        <span class="chip"><Icon name="download" :size="16" /></span>
+        <div>
+          <h2>{{ t("update.title") }}</h2>
+          <p>{{ t("update.hint") }}</p>
+        </div>
+      </header>
+
+      <p v-if="update?.release" class="hint">
+        {{ update.release.title }} · {{ update.release.published_at }}
+      </p>
+      <details v-if="update?.release?.notes" class="hint">
+        <summary>{{ update.release.tag }}</summary>
+        <pre class="mono notes">{{ update.release.notes }}</pre>
+      </details>
+
+      <div class="setting-actions">
+        <button class="ghost small" :disabled="updateBusy" @click="checkUpdate">
+          <Icon name="refresh" :size="13" /> {{ t("update.check") }}
+        </button>
+        <button
+          v-if="update?.available && update.release?.asset"
+          class="primary small"
+          :disabled="updateBusy"
+          @click="installUpdate"
+        >
+          <Icon name="download" :size="13" /> {{ t("update.download") }}
+        </button>
+        <button
+          v-if="update?.release?.html_url"
+          class="ghost small"
+          @click="openGuide(update.release.html_url)"
+        >
+          GitHub
+        </button>
+        <span v-if="updateStatusText" class="hint">{{ updateStatusText }}</span>
+      </div>
     </section>
 
     <section class="card panel">

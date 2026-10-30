@@ -10,6 +10,7 @@ import {
   imageUrl,
   type LauncherSettings,
   type RootsState,
+  type SessionState,
   type UnlistenFn,
 } from "./api";
 import Icon from "./components/Icon.vue";
@@ -24,6 +25,7 @@ import InstanceDetail from "./views/InstanceDetail.vue";
 import ImportDialog from "./views/ImportDialog.vue";
 import ModpackDialog from "./views/ModpackDialog.vue";
 import OnboardingDialog from "./views/OnboardingDialog.vue";
+import FirstRunView from "./views/FirstRunView.vue";
 import { t } from "./i18n";
 import { maybePromptJava } from "./javaPrompt";
 import { startInstallListeners } from "./installState";
@@ -103,6 +105,9 @@ const settings = ref<LauncherSettings>({
 });
 const backgroundUrl = ref<string | null>(null);
 const onboardingOpen = ref(false);
+/** Shown until the user picks a data directory; nothing is created for them. */
+const firstRun = ref(false);
+const session = ref<SessionState | null>(null);
 let themeMedia: MediaQueryList | null = null;
 
 const archiveOpen = ref(false);
@@ -378,10 +383,26 @@ async function forgetRoot(path: string) {
 
 async function chooseRoot() {
   rootMenuOpen.value = false;
-  const path = await api.pickFolder(t("app.chooseRoot"));
-  if (!path) return;
-  await applyRoot(path);
-  rootMenuOpen.value = true;
+  try {
+    const path = await api.pickFolder(t("app.chooseRoot"));
+    if (!path) return;
+    const info = await api.pathInfo(path);
+    if (info.kind === "data") {
+      await applyRoot(info.path);
+    } else if (info.kind === "empty") {
+      if (window.confirm(t("app.createRootConfirm", { path: info.path }))) {
+        await api.chooseDataRoot(info.path);
+        await refresh();
+      }
+    } else {
+      // A game directory: offer to register it instead of switching to it.
+      openImport(info.path);
+      return;
+    }
+    rootMenuOpen.value = true;
+  } catch (cause) {
+    error.value = String(cause);
+  }
 }
 
 async function pickArchive() {
@@ -537,8 +558,20 @@ async function onDrop(paths: string[]) {
 
 const unlisteners: UnlistenFn[] = [];
 
-onMounted(async () => {
+async function onFirstRunDone(games: string | null) {
+  firstRun.value = false;
+  session.value = await api.session().catch(() => null);
   await refresh();
+  if (games) openImport(games);
+}
+
+onMounted(async () => {
+  session.value = await api.session().catch(() => null);
+  if (session.value && !session.value.configured) {
+    firstRun.value = true;
+  } else {
+    await refresh();
+  }
   void startInstallListeners();
   try {
     settings.value = await api.launcherSettings();
@@ -606,6 +639,11 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <FirstRunView
+    v-if="firstRun"
+    :legacy="session?.legacy ?? null"
+    @done="onFirstRunDone"
+  />
   <div v-if="backgroundUrl" class="wallpaper" :style="{ backgroundImage: `url(${backgroundUrl})` }" />
 
   <div class="shell">
