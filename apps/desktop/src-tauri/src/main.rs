@@ -184,6 +184,12 @@ fn choose_data_root(state: State<'_, AppState>, path: String) -> Result<store::P
         std::fs::create_dir_all(&path)
             .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
     }
+    if is_network_path(&path) {
+        return Err(format!(
+            "{} is a network path; the data directory (and the account file in it) must be local",
+            path.display()
+        ));
+    }
     let info = store::classify(&path);
     match info.kind.as_str() {
         "data" | "empty" => {}
@@ -229,6 +235,9 @@ fn set_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, S
     let path = tntl_store::simplify_path(&canonical);
     if !path.is_dir() {
         return Err(format!("{} is not a directory", path.display()));
+    }
+    if is_network_path(&path) {
+        return Err(format!("{} is a network path; pick a local directory", path.display()));
     }
     let info = store::classify(&path);
     if info.kind != "data" && info.kind != "empty" {
@@ -2281,8 +2290,18 @@ fn env_root() -> Option<PathBuf> {
         .map(|path| tntl_store::simplify_path(&path))
 }
 
+/// Network shares are refused for the data directory: the account file holds
+/// refresh tokens and every write would travel over SMB.
+fn is_network_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.starts_with("\\\\") || text.starts_with("//")
+}
+
 fn initial_root() -> PathBuf {
     if let Some(path) = env_root() {
+        // The user named this directory explicitly, so it is a data directory
+        // even without a marker (older installs and `--root`-style usage).
+        let _ = Launcher::from_root(Some(path.clone())).mark_root();
         return path;
     }
     if let Some(root) = store::configured_root() {
@@ -2468,8 +2487,29 @@ async fn update_download(
 /// Swap the executable (or start the installer) and exit; on Linux deb the file
 /// is only returned so the user can install it themselves.
 #[tauri::command]
-fn update_apply(app: tauri::AppHandle, path: String) -> Result<String, String> {
-    update_apply::apply(&app, Path::new(&path))
+fn update_apply(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
+    if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
+        return Err("close the running game before installing an update".to_string());
+    }
+    // Only files this launcher downloaded may be installed, whatever the
+    // webview asks for.
+    let file = PathBuf::from(&path);
+    let updates = store::bootstrap_dir()
+        .ok_or_else(|| "no config directory available".to_string())?
+        .join("updates");
+    let inside = file
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(updates.canonicalize().ok())
+        .is_some_and(|(parent, updates)| parent == updates);
+    if !inside {
+        return Err(format!("{} is not a downloaded update", file.display()));
+    }
+    update_apply::apply(&app, &file)
 }
 
 #[tauri::command]

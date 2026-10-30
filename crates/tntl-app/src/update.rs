@@ -198,13 +198,24 @@ fn pick_asset(assets: &[RawAsset]) -> Option<UpdateAsset> {
     None
 }
 
-/// HTTPS on a GitHub host, nothing else.
+/// HTTPS on a GitHub host, pinned to this repository. A release asset URL is
+/// `https://github.com/<owner>/<repo>/releases/download/...`; accepting the
+/// host alone would let any repository be an update source.
 pub fn safe_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
     let host = rest.split('/').next().unwrap_or_default();
-    ASSET_HOSTS.contains(&host)
+    if !ASSET_HOSTS.contains(&host) {
+        return false;
+    }
+    if host == "github.com" {
+        let path = rest.split_once('/').map(|(_, path)| path).unwrap_or_default();
+        return path.starts_with(&format!("{REPO}/releases/download/"));
+    }
+    // GitHub's CDN hosts are opaque, but the link came from the API response
+    // for our repository.
+    true
 }
 
 /// Download the asset into `dir` and verify it. Returns the file path.
@@ -218,6 +229,15 @@ pub fn download(asset: &UpdateAsset, dir: &Path, progress: &mut dyn FnMut(u64)) 
     }
     let dest = dir.join(&name);
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    // Without a digest the only check would be a size the same response
+    // provides; require at least one of them and never reuse an old file.
+    let digest = asset.digest.as_deref().and_then(|value| value.strip_prefix("sha256:"));
+    if digest.is_none() && asset.size == 0 {
+        bail!("the release does not publish a checksum for this file");
+    }
+    if dest.exists() {
+        let _ = std::fs::remove_file(&dest);
+    }
     let http = Http::new().context("cannot create the HTTP client")?;
     let mut request = DownloadRequest::new(&asset.url, &dest);
     if asset.size > 0 {
@@ -229,10 +249,7 @@ pub fn download(asset: &UpdateAsset, dir: &Path, progress: &mut dyn FnMut(u64)) 
     if matches!(outcome, DownloadOutcome::AlreadyValid) && asset.size > 0 {
         // Already there from an earlier attempt; still verify below.
     }
-    if let Some(digest) = &asset.digest
-        && let Some(expected) = digest.strip_prefix("sha256:")
-        && !expected.is_empty()
-    {
+    if let Some(expected) = digest.filter(|value| !value.is_empty()) {
         let actual = sha256_file(&dest)?;
         if !actual.eq_ignore_ascii_case(expected) {
             // Never keep a file that does not match what GitHub published.

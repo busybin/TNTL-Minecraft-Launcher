@@ -2123,6 +2123,9 @@ impl Launcher {
             );
         }
         instance.save(&dir)?;
+        // A name the user removed earlier is free now that the directory is
+        // gone; without this the fresh instance would be invisible forever.
+        let _ = self.restore_instance(&instance.name);
         Ok(dir)
     }
 
@@ -4499,6 +4502,10 @@ impl Launcher {
             // Only a file whose contents still match what we downloaded may go.
             // Anything else (another build the user pinned, a local fork, an
             // edited jar) stays and is reported instead of deleted.
+            if !module.enabled {
+                // Switched off on purpose: keep it and let the user decide.
+                continue;
+            }
             if !record.matches_recorded_hash(ProjectKind::Mod, &dir, &module.file) {
                 eprintln!(
                     "keeping {}: it changed since it was installed, so it is not deleted automatically",
@@ -5636,7 +5643,9 @@ impl ModrinthContent {
         let Some(recorded) = self.recorded_hash(kind, file) else {
             return false;
         };
-        let path = dir.join(file);
+        let plain = dir.join(file);
+        let disabled = dir.join(format!("{file}{}", tntl_instance::mods::DISABLED_SUFFIX));
+        let path = if plain.is_file() { plain } else { disabled };
         tntl_store::sha1_file(&path)
             .map(|actual| actual.eq_ignore_ascii_case(recorded))
             .unwrap_or(false)
@@ -6805,7 +6814,13 @@ pub fn list_instances(launcher: &Launcher) -> Result<Vec<Instance>> {
             continue;
         }
         match Instance::load(&entry.path()) {
-            Ok(instance) => instances.push(instance),
+            Ok(mut instance) => {
+                // Every command resolves the directory from the name, so a
+                // folder renamed in Explorer must report its own name or the
+                // row cannot be opened, saved or removed.
+                instance.name = name;
+                instances.push(instance)
+            }
             // One broken `instance.json` must not blank the whole library, but
             // it should not disappear silently either.
             Err(error) => eprintln!("skipping instance {}: {error:#}", entry.path().display()),

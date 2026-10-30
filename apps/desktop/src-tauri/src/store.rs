@@ -286,6 +286,10 @@ pub struct MigrationReport {
 
 /// Old data directory that predates the bootstrap file.
 pub fn legacy_root() -> Option<PathBuf> {
+    // Migration runs once; afterwards the old directory is just a directory.
+    if load_bootstrap().migrated_at.is_some() {
+        return None;
+    }
     let mut candidates = Vec::new();
     if let Some(dir) = dirs::data_dir() {
         candidates.push(dir.join("tntl"));
@@ -363,6 +367,9 @@ pub fn migrate_legacy(root: &Path) -> Result<MigrationReport, String> {
     for entry in candidates {
         let path = tntl_store::simplify_path(Path::new(&entry));
         if !path.exists() {
+            // A sleeping NAS or unplugged USB is not a reason to forget the
+            // directory; the picker already marks dead entries.
+            config.roots.push(entry.clone());
             dropped.push(entry);
             continue;
         }
@@ -387,11 +394,12 @@ pub fn migrate_legacy(root: &Path) -> Result<MigrationReport, String> {
 
     // Settings: keep the theme (appearance), reset the rest. Language lives in
     // the frontend's own storage and survives on its own.
+    // Keep everything the user typed (proxy credentials, CurseForge key,
+    // Microsoft client id) and only force the two fields this version owns.
     let previous = launcher.settings();
     let settings = tntl_app::LauncherSettings {
-        theme: previous.theme,
         onboarded: true,
-        ..Default::default()
+        ..previous
     };
     let settings_reset = launcher.save_settings(&settings).is_ok();
 

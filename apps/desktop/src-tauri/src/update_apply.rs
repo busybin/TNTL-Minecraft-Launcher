@@ -100,16 +100,23 @@ fn spawn_swap(file: &Path, target: &Path) -> Result<PathBuf, String> {
     let body = format!(
         "@echo off\r\n\
          setlocal\r\n\
+         rem Absolute paths only: cmd searches the working directory first.\r\n\
+         set \"PATH=%SystemRoot%\\System32\"\r\n\
          :wait\r\n\
-         tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\n\
+         \"%SystemRoot%\\System32\\tasklist.exe\" /FI \"PID eq {pid}\" /NH /FO CSV 2>nul | \"%SystemRoot%\\System32\\findstr.exe\" /C:\"\\\"{pid}\\\"\" >nul\r\n\
          if not errorlevel 1 (\r\n\
-         \x20 timeout /t 1 /nobreak >nul\r\n\
+         \x20 \"%SystemRoot%\\System32\\timeout.exe\" /t 1 /nobreak >nul\r\n\
          \x20 goto wait\r\n\
          )\r\n\
+         copy /Y \"{target_text}\" \"{target_text}.old\" >nul 2>&1\r\n\
          copy /Y \"{new}\" \"{target_text}\" >nul 2>&1\r\n\
          if errorlevel 1 (\r\n\
-         \x20 echo update failed, the old version is still installed > \"%~dp0apply-update.log\"\r\n\
+         \x20 copy /Y \"{target_text}.old\" \"{target_text}\" >nul 2>&1\r\n\
+         \x20 echo update failed, the previous version was restored > \"%~dp0apply-update.log\"\r\n\
+         \x20 del \"%~f0\"\r\n\
+         \x20 exit /b 1\r\n\
          )\r\n\
+         del \"{target_text}.old\" >nul 2>&1\r\n\
          start \"\" \"{target_text}\"\r\n\
          del \"%~f0\"\r\n"
     );
@@ -136,19 +143,25 @@ fn spawn_swap(file: &Path, target: &Path) -> Result<PathBuf, String> {
     let quote = |value: &Path| format!("'{}'", value.display().to_string().replace('\'', "'\\''"));
     let body = format!(
         "#!/bin/sh\n\
+         # Absolute tools only: PATH is inherited from the launcher.\n\
          while kill -0 {pid} 2>/dev/null; do sleep 1; done\n\
-         if mv -f {new} {target}; then\n\
-         \x20 chmod +x {target}\n\
+         /bin/cp -f {target} {target}.old 2>/dev/null\n\
+         if /bin/mv -f {new} {target}; then\n\
+         \x20 /bin/chmod +x {target}\n\
+         \x20 /bin/rm -f {target}.old\n\
          else\n\
-         \x20 echo \"update failed, the old version is still installed\" > \"$(dirname \"$0\")/apply-update.log\"\n\
+         \x20 /bin/cp -f {target}.old {target} 2>/dev/null\n\
+         \x20 echo \"update failed, the previous version was restored\" > \"$(dirname \"$0\")/apply-update.log\"\n\
+         \x20 /bin/rm -f \"$0\"\n\
+         \x20 exit 1\n\
          fi\n\
-         rm -f \"$0\"\n\
+         /bin/rm -f \"$0\"\n\
          exec {target} >/dev/null 2>&1\n",
         new = quote(file),
         target = quote(target)
     );
     std::fs::write(&script, &body).map_err(|error| error.to_string())?;
-    Command::new("sh")
+    Command::new("/bin/sh")
         .arg(&script)
         .spawn()
         .map_err(|error| error.to_string())?;
