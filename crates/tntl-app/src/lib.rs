@@ -955,6 +955,7 @@ impl Launcher {
     /// Add an offline account and make it the active one. A fresh account wears
     /// a random built-in skin so its avatar and in-game player are not blank.
     pub fn add_offline_account(&self, name: &str) -> Result<AccountView> {
+        self.ensure_owned_root()?;
         let mut store = AccountStore::load(&self.root)?;
         let id = store.upsert(StoredAccount::offline(name)?)?;
         store.set_current(&id)?;
@@ -969,6 +970,7 @@ impl Launcher {
     /// rule), so it changes too; the skin and the active-account pick move with
     /// it. Microsoft names come from Mojang and are read-only here.
     pub fn rename_offline_account(&self, id: &str, name: &str) -> Result<AccountView> {
+        self.ensure_owned_root()?;
         let name = name.trim();
         let mut store = AccountStore::load(&self.root)?;
         let account = store.get(id).cloned().with_context(|| format!("no account {id}"))?;
@@ -1114,6 +1116,7 @@ impl Launcher {
     }
 
     pub fn remove_account(&self, id: &str) -> Result<()> {
+        self.ensure_owned_root()?;
         let mut store = AccountStore::load(&self.root)?;
         if !store.remove(id)? {
             bail!("no account {id}");
@@ -1124,6 +1127,7 @@ impl Launcher {
     }
 
     pub fn set_current_account(&self, id: &str) -> Result<AccountView> {
+        self.ensure_owned_root()?;
         let mut store = AccountStore::load(&self.root)?;
         store.set_current(id)?;
         self.view_of(id)
@@ -1131,6 +1135,7 @@ impl Launcher {
 
     /// Change the arm model or the offline in-game toggle.
     pub fn update_account(&self, id: &str, skin_model: Option<&str>, apply_skin: Option<bool>) -> Result<AccountView> {
+        self.ensure_owned_root()?;
         let mut store = AccountStore::load(&self.root)?;
         let account = store.get_mut(id).with_context(|| format!("no account {id}"))?;
         if let Some(model) = skin_model {
@@ -1145,6 +1150,7 @@ impl Launcher {
 
     /// Store and, for Microsoft accounts, upload a skin.
     pub fn set_account_skin(&self, id: &str, png: &[u8], skin_model: Option<&str>) -> Result<AccountView> {
+        self.ensure_owned_root()?;
         // Legacy 64x32 textures are expanded here so the game, the generated
         // resource pack and the preview all get the square layout.
         let skin = tntl_auth::prepare_skin(png)?;
@@ -1171,6 +1177,7 @@ impl Launcher {
     }
 
     pub fn clear_account_skin(&self, id: &str) -> Result<AccountView> {
+        self.ensure_owned_root()?;
         let mut store = AccountStore::load(&self.root)?;
         let account = store.get(id).cloned().with_context(|| format!("no account {id}"))?;
         tntl_auth::remove_skin(&self.root, id);
@@ -1195,6 +1202,7 @@ impl Launcher {
 
     /// Pick one of the account's capes, or `None` to hide it.
     pub fn set_account_cape(&self, id: &str, cape: Option<&str>) -> Result<AccountView> {
+        self.ensure_owned_root()?;
         let mut store = AccountStore::load(&self.root)?;
         let session = self.refresh_msa(&mut store, id)?;
         let profile = match cape.filter(|cape| !cape.is_empty()) {
@@ -1210,6 +1218,7 @@ impl Launcher {
 
     /// Query the Mojang profile again and refresh the cached skin and cape.
     pub fn refresh_account(&self, id: &str) -> Result<AccountView> {
+        self.ensure_owned_root()?;
         let session = AccountStore::update(&self.root, |store| {
             let convert = |error: anyhow::Error| tntl_auth::AuthError::Api(format!("{error:#}"));
             let session = self.refresh_msa(store, id).map_err(convert)?;
@@ -1246,6 +1255,7 @@ impl Launcher {
     }
 
     pub fn poll_msa_login_with(&self, client_id: Option<&str>, device_code: &str) -> Result<MsaPoll> {
+        self.ensure_owned_root()?;
         let client = client_id
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty())
