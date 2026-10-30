@@ -156,6 +156,56 @@ pub const MODRINTH_CONTENT_FILE: &str = "modrinth.content.json";
 /// Launcher-wide settings kept next to `instances/`.
 pub const SETTINGS_FILE: &str = "launcher.json";
 
+/// `<root>/tntl.json`: marks a directory as a launcher data directory. Without
+/// it the directory is treated as foreign (someone else's `.minecraft`) and the
+/// launcher refuses to install, repair or delete anything inside it.
+pub const ROOT_MARKER: &str = "tntl.json";
+
+/// `<root>/hidden.json`: instances and versions the user removed from the
+/// library. Only this list changes; nothing on disk is moved or deleted.
+pub const HIDDEN_FILE: &str = "hidden.json";
+
+/// Schema of the files this version writes. Older roots are migrated once.
+pub const ROOT_SCHEMA: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RootMarker {
+    pub schema: u32,
+    pub kind: String,
+    pub created: u64,
+}
+
+impl Default for RootMarker {
+    fn default() -> Self {
+        Self {
+            schema: ROOT_SCHEMA,
+            kind: "data".to_string(),
+            created: 0,
+        }
+    }
+}
+
+/// The "do not remember this" lists. Losing the file only makes entries
+/// reappear, which is the safe direction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hidden {
+    pub schema: u32,
+    pub instances: Vec<String>,
+    pub versions: Vec<String>,
+}
+
+impl Hidden {
+    pub fn hides_instance(&self, name: &str) -> bool {
+        self.instances.iter().any(|entry| entry == name)
+    }
+
+    pub fn hides_version(&self, id: &str) -> bool {
+        self.versions.iter().any(|entry| entry == id)
+    }
+}
+
 /// Where content comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1408,9 +1458,10 @@ impl Launcher {
         let _report = self.install(&request, version_progress)?;
 
         let instance_dir = self.instance_dir(&name)?;
+        let existed_before = instance_dir.exists();
         // Same rule as the .mrpack path: a failure after the instance was
         // registered leaves a half installed instance that cannot be retried
-        // under the same name, so drop it.
+        // under the same name, so drop it (only when this call created it).
         let result = (|| -> Result<ModpackReport> {
             let mut instance = self.load_instance(&name)?;
             let game_dir = instance.game_dir(&instance_dir);
@@ -1450,7 +1501,7 @@ impl Launcher {
                 files,
             })
         })();
-        if result.is_err() {
+        if result.is_err() && !existed_before {
             let _ = fs::remove_dir_all(&instance_dir);
         }
         result
@@ -1489,6 +1540,7 @@ impl Launcher {
         let _report = self.install(&request, version_progress)?;
 
         let instance_dir = self.instance_dir(&name)?;
+        let existed_before = instance_dir.exists();
         let result = (|| -> Result<ModpackReport> {
             let instance = self.load_instance(&name)?;
             let game_dir = instance.game_dir(&instance_dir);
@@ -1527,7 +1579,7 @@ impl Launcher {
                 files,
             })
         })();
-        if result.is_err() {
+        if result.is_err() && !existed_before {
             let _ = fs::remove_dir_all(&instance_dir);
         }
         result
@@ -1822,10 +1874,12 @@ impl Launcher {
             if !path.is_file() {
                 continue;
             }
-            // Leave files the user changed alone.
-            if let Some(sha1) = &entry.sha1
-                && !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1))
-            {
+            // Leave files the user changed alone. Without a recorded hash
+            // there is no way to prove the file is still ours, so keep it.
+            let Some(sha1) = &entry.sha1 else {
+                continue;
+            };
+            if !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1)) {
                 continue;
             }
             if fs::remove_file(&path).is_ok() {
@@ -1880,6 +1934,126 @@ impl Launcher {
 
     pub fn instances_dir(&self) -> PathBuf {
         self.root.join("instances")
+    }
+
+    pub fn root_marker_path(&self) -> PathBuf {
+        self.root.join(ROOT_MARKER)
+    }
+
+    /// A directory this launcher may write to: it carries our marker, or it is
+    /// empty/new so claiming it cannot lose anything. A non-empty directory
+    /// without the marker is someone else's game directory (a `.minecraft`
+    /// from another launcher) and is treated as read-only.
+    pub fn is_owned_root(&self) -> bool {
+        self.root_marker_path().is_file()
+    }
+
+    /// Whether the directory is another launcher's game directory. Those are
+    /// the directories we must never write into or delete from.
+    pub fn is_foreign_game_dir(&self) -> bool {
+        let has = |name: &str| self.root.join(name).exists();
+        has("versions") || has("mmc-pack.json") || (has("libraries") && has("assets")) || (has("mods") && has("saves"))
+    }
+
+    /// Mark a directory as a data directory. A directory that carries our own
+    /// files is claimed silently (that is the upgrade path from older builds);
+    /// another launcher's game directory is refused outright.
+    pub fn claim_root(&self) -> Result<()> {
+        if self.is_owned_root() {
+            return Ok(());
+        }
+        if self.is_foreign_game_dir() {
+            bail!(
+                "{} is a game directory, not a launcher data directory; use Import instead",
+                self.root.display()
+            );
+        }
+        let marker = RootMarker {
+            created: unix_secs(),
+            ..RootMarker::default()
+        };
+        tntl_store::atomic_write_json(&self.root_marker_path(), &marker)?;
+        Ok(())
+    }
+
+    /// Write the marker unconditionally. Used when the user confirms a
+    /// directory in the UI and by tests; normal writes go through
+    /// [`Self::claim_root`], which refuses foreign game directories.
+    pub fn mark_root(&self) -> Result<()> {
+        let marker = RootMarker {
+            created: unix_secs(),
+            ..RootMarker::default()
+        };
+        tntl_store::atomic_write_json(&self.root_marker_path(), &marker)?;
+        Ok(())
+    }
+
+    /// Guard for operations that write or delete inside the root.
+    pub fn ensure_owned_root(&self) -> Result<()> {
+        self.claim_root()
+    }
+
+    fn hidden_path(&self) -> PathBuf {
+        self.root.join(HIDDEN_FILE)
+    }
+
+    /// Entries the user removed from the library. A missing or broken file
+    /// means "nothing is hidden", which only makes entries reappear.
+    pub fn hidden(&self) -> Hidden {
+        fs::read(self.hidden_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_hidden(&self, hidden: &Hidden) -> Result<()> {
+        self.ensure_owned_root()?;
+        tntl_store::atomic_write_json(&self.hidden_path(), hidden)?;
+        Ok(())
+    }
+
+    /// Remove an instance from the library **without touching a single file**.
+    /// Returns the instance directory so the caller can offer to open it.
+    pub fn unregister_instance(&self, name: &str) -> Result<PathBuf> {
+        validate_name(name)?;
+        let dir = self.instance_dir(name)?;
+        if !dir.join(tntl_instance::INSTANCE_FILE).exists() {
+            bail!("instance {name} does not exist");
+        }
+        self.ensure_not_running(name)?;
+        let mut hidden = self.hidden();
+        if !hidden.hides_instance(name) {
+            hidden.instances.push(name.to_string());
+            hidden.instances.sort();
+        }
+        self.save_hidden(&hidden)?;
+        Ok(dir)
+    }
+
+    pub fn restore_instance(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        let mut hidden = self.hidden();
+        hidden.instances.retain(|entry| entry != name);
+        self.save_hidden(&hidden)
+    }
+
+    /// Hide a version row. Files stay where they are.
+    pub fn unregister_version(&self, id: &str) -> Result<()> {
+        validate_version_id(id)?;
+        self.ensure_owned_root()?;
+        let mut hidden = self.hidden();
+        if !hidden.hides_version(id) {
+            hidden.versions.push(id.to_string());
+            hidden.versions.sort();
+        }
+        self.save_hidden(&hidden)
+    }
+
+    pub fn restore_version(&self, id: &str) -> Result<()> {
+        validate_version_id(id)?;
+        let mut hidden = self.hidden();
+        hidden.versions.retain(|entry| entry != id);
+        self.save_hidden(&hidden)
     }
     pub fn instance_dir(&self, name: &str) -> Result<PathBuf> {
         valid_component(name)?;
@@ -1940,8 +2114,14 @@ impl Launcher {
 
     pub fn create_instance(&self, instance: &Instance) -> Result<PathBuf> {
         let dir = self.instance_dir(&instance.name)?;
-        if dir.join(tntl_instance::INSTANCE_FILE).exists() {
-            bail!("instance {} already exists; pick another name", instance.name);
+        // Any leftover directory is someone's data: an instance the user
+        // unregistered (files kept on purpose) or a folder they made by hand.
+        // Refusing is the only safe answer; a failed install must never wipe it.
+        if dir.exists() {
+            bail!(
+                "{} already exists; pick another name (nothing in it was touched)",
+                dir.display()
+            );
         }
         instance.save(&dir)?;
         Ok(dir)
@@ -2062,45 +2242,18 @@ impl Launcher {
         Ok(new_dir)
     }
 
-    /// Delete an instance directory (game files inside it included).
-    pub fn delete_instance(&self, name: &str) -> Result<()> {
-        self.ensure_not_running(name)?;
-        let dir = self.instance_dir(name)?;
-        if !dir.join(tntl_instance::INSTANCE_FILE).exists() {
-            bail!("instance {name} does not exist");
-        }
-        fs::remove_dir_all(&dir).with_context(|| format!("cannot delete {}", dir.display()))?;
-        Ok(())
+    /// Remove an instance from the library. **Nothing on disk changes**: the
+    /// name goes into `hidden.json` and the caller offers to open the folder so
+    /// the user can delete files by hand if they want to.
+    pub fn unregister(&self, name: &str) -> Result<PathBuf> {
+        self.unregister_instance(name)
     }
 
-    /// Delete an instance and, when asked, the version directories only it used.
-    /// Returns the version ids that were removed. Imported instances keep their
-    /// versions in the other launcher's root, so nothing is cleaned there.
-    pub fn delete_instance_with_cleanup(&self, name: &str, cleanup: bool) -> Result<Vec<String>> {
-        let imported = self
-            .load_instance(name)
-            .map(|instance| instance.root.is_some())
-            .unwrap_or(false);
-        let chain = self.instance_chain(name);
-        self.delete_instance(name)?;
-        if !cleanup || imported {
-            return Ok(Vec::new());
-        }
-        let mut removed = Vec::new();
-        for id in chain {
-            if !self.version_installed(&id) || !self.version_users(&id).is_empty() {
-                continue;
-            }
-            let dir = self.versions_dir().join(&id);
-            if fs::remove_dir_all(&dir).is_ok() {
-                removed.push(id);
-            }
-        }
-        Ok(removed)
-    }
-
-    /// Version ids an instance launches through, child first; empty when the
-    /// instance or its metadata cannot be read.
+    /// Version directory names an instance launches through, child first.
+    /// Directory names, not the `id` inside the JSON: a renamed version folder
+    /// (HMCL keeps `1.20.1-forge-47.2.0/` while its JSON still says
+    /// `1.20.1-forge-47.2.0-custom`) is launched through the directory name, so
+    /// comparing JSON ids makes a version that is in use look unused.
     pub fn instance_chain(&self, name: &str) -> Vec<String> {
         let Ok(dir) = self.instance_dir(name) else {
             return Vec::new();
@@ -2108,20 +2261,36 @@ impl Launcher {
         let Ok(instance) = Instance::load(&dir) else {
             return Vec::new();
         };
-        let layout = instance.layout(&self.root);
-        match self.load_chain(&layout, &instance.version_id) {
-            Ok(chain) => chain.into_iter().map(|json| json.id).collect(),
-            Err(_) => vec![instance.version_id.clone()],
-        }
+        self.chain_dirs(&instance.layout(&self.root), &instance.version_id)
     }
 
-    /// Instances that launch through `id`, loader versions included. Versions
-    /// are only shared inside one root, so imported instances (another
-    /// launcher's `.minecraft`) are not counted for the launcher's own files.
+    fn chain_dirs(&self, layout: &RootLayout, version_id: &str) -> Vec<String> {
+        let versions = version_dir_map(layout);
+        let mut chain: Vec<String> = Vec::new();
+        let mut current = Some(version_id.to_string());
+        while let Some(wanted) = current {
+            let Some((dir, json)) = versions.iter().find(|(dir, json)| dir == &wanted || json.id == wanted) else {
+                break;
+            };
+            if chain.contains(dir) {
+                break;
+            }
+            chain.push(dir.clone());
+            current = json.inherits_from.clone();
+        }
+        if chain.is_empty() {
+            chain.push(version_id.to_string());
+        }
+        chain
+    }
+
+    /// Instances that launch through version directory `id`. Imported instances
+    /// count too: a false "in use" only keeps a version around, while the
+    /// opposite deletes one that is still needed.
     pub fn version_users(&self, id: &str) -> Vec<String> {
         self.instance_chains()
             .into_iter()
-            .filter(|(_, chain, launcher_root)| *launcher_root && chain.iter().any(|version| version.as_str() == id))
+            .filter(|(_, chain, launcher_root)| *launcher_root && chain.iter().any(|version| version == id))
             .map(|(name, _, _)| name)
             .collect()
     }
@@ -2142,11 +2311,14 @@ impl Launcher {
             .filter_map(|name| {
                 let dir = self.instance_dir(&name).ok()?;
                 let instance = Instance::load(&dir).ok()?;
-                let chain = self
-                    .load_chain(&instance.layout(&self.root), &instance.version_id)
-                    .map(|chain| chain.into_iter().map(|json| json.id).collect())
-                    .unwrap_or_else(|_| vec![instance.version_id.clone()]);
-                Some((name, chain, instance.root.is_none()))
+                let layout = instance.layout(&self.root);
+                let chain = self.chain_dirs(&layout, &instance.version_id);
+                // Imported instances keep their versions in another launcher's
+                // directory, so they cannot vouch for (or block) ours. The
+                // comparison must be path-based: `root: Some(<launcher root>)`
+                // is the launcher's own directory and does count.
+                let launcher_root = same_dir(&layout.root, &self.root);
+                Some((name, chain, launcher_root))
             })
             .collect()
     }
@@ -2207,7 +2379,11 @@ impl Launcher {
             bail!("{} is not a file", source.display());
         }
         let file = format!("icon.{extension}");
-        fs::copy(source, dir.join(&file)).with_context(|| format!("cannot copy icon into {}", dir.display()))?;
+        // Copy to a sibling first: a read error half way must not destroy the
+        // icon the instance already has.
+        let staged = dir.join(format!(".{file}.part"));
+        fs::copy(source, &staged).with_context(|| format!("cannot copy icon into {}", dir.display()))?;
+        fs::rename(&staged, dir.join(&file)).with_context(|| format!("cannot store {}", file))?;
         for other in ICON_EXTENSIONS.iter().filter(|other| **other != extension) {
             let _ = fs::remove_file(dir.join(format!("icon.{other}")));
         }
@@ -2336,17 +2512,13 @@ impl Launcher {
         Ok(DiskUsage { entries, total })
     }
 
-    /// Remove data the game or the launcher can rebuild: logs, crash reports
-    /// and extracted natives.
+    /// Remove data the game or the launcher can rebuild: logs and extracted
+    /// natives. Crash reports live in the *game* directory, which may belong to
+    /// another launcher, so they are left alone.
     pub fn cleanup(&self, name: &str) -> Result<CleanupReport> {
         self.ensure_not_running(name)?;
         let dir = self.instance_dir(name)?;
-        let game_dir = self.game_dir(name)?;
-        let targets = [
-            ("logs", dir.join("logs")),
-            ("crash_reports", game_dir.join("crash-reports")),
-            ("natives", dir.join("natives")),
-        ];
+        let targets = [("logs", dir.join("logs")), ("natives", dir.join("natives"))];
         let mut report = CleanupReport::default();
         for (label, path) in targets {
             let bytes = dir_size(&path);
@@ -2384,6 +2556,7 @@ impl Launcher {
         if !path.is_dir() {
             bail!("{} is not a directory", path.display());
         }
+        self.ensure_owned_root()?;
         let (root, picked) = import_root(path);
         let scan = scan_import_versions(&root);
         if scan.versions.is_empty() {
@@ -2410,12 +2583,18 @@ impl Launcher {
             .unwrap_or_else(|| sanitize_name(&chosen.id));
         validate_name(&instance_name)?;
         let dir = self.instance_dir(&instance_name)?;
-        if dir.join(tntl_instance::INSTANCE_FILE).exists() {
-            bail!("instance {instance_name} already exists; pick another name");
+        if dir.exists() {
+            bail!(
+                "{} already exists; pick another name (nothing in it was touched)",
+                dir.display()
+            );
         }
         let mut instance = Instance::new(&instance_name, &chosen.id);
+        // Point at the game root, but keep the game directory of a
+        // version-isolated install (`versions/<id>/mods|saves|config`), which is
+        // where HMCL and PCL2 put everything when isolation is on.
+        instance.game_dir = Some(game_dir_for(&root, &chosen.id));
         instance.root = Some(root.clone());
-        instance.game_dir = Some(root);
         instance.save(&dir)?;
         Ok(instance)
     }
@@ -2447,8 +2626,11 @@ impl Launcher {
             .unwrap_or_else(|| sanitize_name(&game));
         validate_name(&instance_name)?;
         let dir = self.instance_dir(&instance_name)?;
-        if dir.join(tntl_instance::INSTANCE_FILE).exists() {
-            bail!("instance {instance_name} already exists; pick another name");
+        if dir.exists() {
+            bail!(
+                "{} already exists; pick another name (nothing in it was touched)",
+                dir.display()
+            );
         }
 
         let mut instance = Instance::new(&instance_name, &game);
@@ -2474,6 +2656,9 @@ impl Launcher {
             Ok(instance)
         })();
         if result.is_err() {
+            // The directory did not exist before this call, so it only holds
+            // what this failed attempt wrote. Files installed into the user's
+            // game directory are left alone on purpose.
             let _ = fs::remove_dir_all(&dir);
         }
         result
@@ -2530,8 +2715,11 @@ impl Launcher {
         };
         validate_name(&instance_name)?;
         let dir = self.instance_dir(&instance_name)?;
-        if dir.join(tntl_instance::INSTANCE_FILE).exists() {
-            bail!("instance {instance_name} already exists; pick another name");
+        if dir.exists() {
+            bail!(
+                "{} already exists; pick another name (nothing in it was touched)",
+                dir.display()
+            );
         }
 
         let mut request = InstallRequest::new(&game);
@@ -2791,11 +2979,12 @@ impl Launcher {
     /// Versions already present in `versions/`.
     pub fn installed_versions(&self) -> Vec<String> {
         let dir = self.versions_dir();
+        let hidden = self.hidden();
         let mut versions = Vec::new();
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let id = entry.file_name().to_string_lossy().to_string();
-                if self.version_installed(&id) {
+                if self.version_installed(&id) && !hidden.hides_version(&id) {
                     versions.push(id);
                 }
             }
@@ -2827,6 +3016,10 @@ impl Launcher {
     /// shared libraries and assets are left alone.
     pub fn delete_version(&self, id: &str) -> Result<()> {
         validate_version_id(id)?;
+        // Deleting version folders is only safe in a directory this launcher
+        // owns; pointing the root at another launcher's `.minecraft` must stay
+        // read-only.
+        self.ensure_owned_root()?;
         if !self.version_installed(id) {
             bail!("version {id} is not installed");
         }
@@ -2918,7 +3111,13 @@ impl Launcher {
         progress: &(dyn Fn(InstallEvent) + Send + Sync),
     ) -> Result<LoaderStatus> {
         self.ensure_not_running(name)?;
+        self.ensure_owned_root()?;
         let instance = self.load_instance(name)?;
+        if instance.root.is_some() {
+            bail!(
+                "instance {name} lives in another launcher's directory; change its loader there, this launcher will not rewrite those files"
+            );
+        }
         let layout = instance.layout(&self.root);
         let environment = self.environment(name)?;
         let game = environment.game_version;
@@ -3020,11 +3219,15 @@ impl Launcher {
         request: &InstallRequest,
         progress: &(dyn Fn(InstallEvent) + Send + Sync),
     ) -> Result<InstallReport> {
+        self.ensure_owned_root()?;
         if let Some(name) = request.instance.as_deref() {
             validate_name(name)?;
             let dir = self.instance_dir(name)?;
-            if dir.join(tntl_instance::INSTANCE_FILE).exists() {
-                bail!("instance {name} already exists; pick another name");
+            if dir.exists() {
+                bail!(
+                    "{} already exists; pick another name (nothing in it was touched)",
+                    dir.display()
+                );
             }
         }
 
@@ -3084,9 +3287,10 @@ impl Launcher {
         let report = self.install(&request, version_progress)?;
 
         let instance_dir = self.instance_dir(&name)?;
+        let existed_before = instance_dir.exists();
         // A failure after the instance was registered would leave a half
         // installed, unrepairable instance that cannot be retried under the
-        // same name. Drop it instead.
+        // same name. Drop it instead (only when this call created it).
         let result = (|| -> Result<ModpackReport> {
             let instance = self.load_instance(&name)?;
             let game_dir = instance.game_dir(&instance_dir);
@@ -3103,7 +3307,7 @@ impl Launcher {
                 files,
             })
         })();
-        if result.is_err() {
+        if result.is_err() && !existed_before {
             let _ = fs::remove_dir_all(&instance_dir);
         }
         result
@@ -3315,7 +3519,13 @@ impl Launcher {
         pack_progress: &(dyn Fn(PackEvent) + Send + Sync),
     ) -> Result<RepairReport> {
         self.ensure_not_running(name)?;
+        self.ensure_owned_root()?;
         let instance = self.load_instance(name)?;
+        if instance.root.is_some() {
+            bail!(
+                "instance {name} lives in another launcher's directory; repair it there, this launcher will not rewrite those files"
+            );
+        }
         let dir = self.instance_dir(name)?;
         let http = Http::new()?;
         let options = InstallOptions {
@@ -3460,10 +3670,12 @@ impl Launcher {
             if !path.is_file() {
                 continue;
             }
-            // Leave files the user changed alone.
-            if let Some(sha1) = &file.sha1
-                && !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1))
-            {
+            // Leave files the user changed alone. Without a recorded hash
+            // there is no way to prove the file is still ours, so keep it.
+            let Some(sha1) = &file.sha1 else {
+                continue;
+            };
+            if !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1)) {
                 continue;
             }
             if fs::remove_file(&path).is_ok() {
@@ -3794,7 +4006,14 @@ impl Launcher {
     fn mod_path(&self, name: &str, file: &str) -> Result<PathBuf> {
         let instance = self.load_instance(name)?;
         let dir = tntl_instance::mods::mods_dir(&instance.game_dir(&self.instance_dir(name)?));
-        if file.contains('/') || file.contains('\\') || file == ".." {
+        // `:` matters on Windows: `dir.join("C:x.jar")` is a drive-relative
+        // path and would leave the mods directory entirely.
+        if file.is_empty()
+            || file == "."
+            || file == ".."
+            || file.contains(['/', '\\', ':'])
+            || file.chars().any(char::is_control)
+        {
             bail!("invalid mod file name: {file}");
         }
         let direct = dir.join(file);
@@ -4238,6 +4457,16 @@ impl Launcher {
             if !same_id && !same_project {
                 continue;
             }
+            // Only a file whose contents still match what we downloaded may go.
+            // Anything else (another build the user pinned, a local fork, an
+            // edited jar) stays and is reported instead of deleted.
+            if !record.matches_recorded_hash(ProjectKind::Mod, &dir, &module.file) {
+                eprintln!(
+                    "keeping {}: it changed since it was installed, so it is not deleted automatically",
+                    module.file
+                );
+                continue;
+            }
             let path = dir.join(&module.file);
             fs::remove_file(&path).with_context(|| format!("failed to delete {}", path.display()))?;
             record.remove(ProjectKind::Mod, &module.file);
@@ -4251,8 +4480,20 @@ impl Launcher {
             return Ok(());
         }
         let mut record = ModrinthContent::load(&self.modrinth_content_path(name)?);
+        let dir = self
+            .load_instance(name)?
+            .game_dir(&self.instance_dir(name)?)
+            .join(kind.dir());
         for entry in entries {
             record.record(kind, &entry.file, &entry.project_id);
+            let landed = if dir.join(&entry.file).is_file() {
+                dir.join(&entry.file)
+            } else {
+                dir.join(format!("{}{}", entry.file, tntl_instance::mods::DISABLED_SUFFIX))
+            };
+            if let Ok(hash) = tntl_store::sha1_file(&landed) {
+                record.record_hash(kind, &entry.file, &hash);
+            }
         }
         record.save(&self.modrinth_content_path(name)?)
     }
@@ -4276,11 +4517,23 @@ impl Launcher {
                 .filter(|file| file != &entry.file)
                 .collect();
             for file in stale {
+                if !record.matches_recorded_hash(kind, &dir, &file) {
+                    eprintln!("keeping {file}: it changed since it was installed, so it is not deleted automatically");
+                    continue;
+                }
                 let _ = self.set_content_enabled(name, kind, &file, false);
                 let _ = tntl_instance::content::remove(&dir, &file);
                 record.remove(kind, &file);
             }
             record.record(kind, &entry.file, &entry.project_id);
+            let landed = if dir.join(&entry.file).is_file() {
+                dir.join(&entry.file)
+            } else {
+                dir.join(format!("{}{}", entry.file, tntl_instance::mods::DISABLED_SUFFIX))
+            };
+            if let Ok(hash) = tntl_store::sha1_file(&landed) {
+                record.record_hash(kind, &entry.file, &hash);
+            }
         }
         record.save(&self.modrinth_content_path(name)?)
     }
@@ -5288,6 +5541,11 @@ pub struct ContentFile {
 pub struct ModrinthContent {
     #[serde(default)]
     pub files: std::collections::BTreeMap<String, String>,
+    /// SHA-1 of the file this launcher wrote. Automatic clean-up only removes
+    /// files whose contents still match, so a jar or pack the user edited (or
+    /// dropped in under the same name) is never deleted behind their back.
+    #[serde(default)]
+    pub hashes: std::collections::BTreeMap<String, String>,
 }
 
 impl ModrinthContent {
@@ -5323,8 +5581,31 @@ impl ModrinthContent {
             .map(String::as_str)
     }
 
+    fn record_hash(&mut self, kind: ProjectKind, file: &str, hash: &str) {
+        self.hashes
+            .insert(Self::key(kind, strip_disabled(file)), hash.to_string());
+    }
+
+    fn recorded_hash(&self, kind: ProjectKind, file: &str) -> Option<&str> {
+        self.hashes
+            .get(&Self::key(kind, strip_disabled(file)))
+            .map(String::as_str)
+    }
+
+    /// Whether the file on disk is still the copy this launcher installed.
+    fn matches_recorded_hash(&self, kind: ProjectKind, dir: &Path, file: &str) -> bool {
+        let Some(recorded) = self.recorded_hash(kind, file) else {
+            return false;
+        };
+        let path = dir.join(file);
+        tntl_store::sha1_file(&path)
+            .map(|actual| actual.eq_ignore_ascii_case(recorded))
+            .unwrap_or(false)
+    }
+
     /// Forget one file; returns whether anything was recorded for it.
     fn remove(&mut self, kind: ProjectKind, file: &str) -> bool {
+        self.hashes.remove(&Self::key(kind, file));
         self.files.remove(&Self::key(kind, file)).is_some()
     }
 
@@ -5684,9 +5965,11 @@ fn remove_stale_pack_files(game_dir: &Path, old: &PackIndex, new: &PackIndex) ->
         if !path.is_file() {
             continue;
         }
-        if let Some(sha1) = &file.hashes.sha1
-            && !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1))
-        {
+        let Some(sha1) = &file.hashes.sha1 else {
+            // No hash in the index: cannot prove the file is still ours.
+            continue;
+        };
+        if !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1)) {
             continue;
         }
         if fs::remove_file(&path).is_ok() {
@@ -6464,20 +6747,85 @@ pub fn sanitize_name(value: &str) -> String {
 
 pub fn list_instances(launcher: &Launcher) -> Result<Vec<Instance>> {
     let dir = launcher.instances_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // A brand-new data directory has no `instances/` yet; that is "empty",
+        // not an error. Anything else (permissions, a dead network path) must
+        // reach the user instead of rendering as an empty library.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", dir.display())),
+    };
+    let hidden = launcher.hidden();
     let mut instances = Vec::new();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(instances);
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if hidden.hides_instance(&name) {
+            continue;
+        }
+        match Instance::load(&entry.path()) {
+            Ok(instance) => instances.push(instance),
+            // One broken `instance.json` must not blank the whole library, but
+            // it should not disappear silently either.
+            Err(error) => eprintln!("skipping instance {}: {error:#}", entry.path().display()),
+        }
+    }
+    instances.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(instances)
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// Compare two directories by resolved path: on Windows the same directory can
+/// be spelled `C:\x`, `c:\x` or `\\?\C:\x`.
+fn same_dir(left: &Path, right: &Path) -> bool {
+    let resolve = |path: &Path| tntl_store::simplify_path(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    resolve(left) == resolve(right)
+}
+
+/// Every `versions/<dir>/<dir>.json` that parses, with its directory name.
+fn version_dir_map(layout: &RootLayout) -> Vec<(String, VersionJson)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(layout.versions_dir()) else {
+        return out;
     };
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
             continue;
         }
-        if let Ok(instance) = Instance::load(&entry.path()) {
-            instances.push(instance);
-        }
+        let dir = entry.file_name().to_string_lossy().to_string();
+        let Ok(bytes) = fs::read(layout.version_json(&dir)) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_slice::<VersionJson>(&bytes) else {
+            continue;
+        };
+        out.push((dir, json));
     }
-    instances.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(instances)
+    out
+}
+
+/// Where the game keeps its data for a version that lives in another
+/// launcher's root. HMCL/PCL2 with version isolation put mods, saves and config
+/// inside `versions/<id>`; a plain vanilla layout keeps them in the root.
+fn game_dir_for(root: &Path, version_id: &str) -> PathBuf {
+    let Some(relative) = tntl_store::safe_relative(version_id) else {
+        return root.to_path_buf();
+    };
+    let version_dir = root.join("versions").join(relative);
+    const MARKERS: [&str; 5] = ["mods", "saves", "config", "options.txt", "logs"];
+    if MARKERS.iter().any(|marker| version_dir.join(marker).exists()) {
+        version_dir
+    } else {
+        root.to_path_buf()
+    }
 }
 
 /// Newest file in `<instance>/logs`, so the UI can offer "last log".
@@ -6691,6 +7039,7 @@ mod tests {
         )
         .unwrap();
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
 
         let scan = launcher.import_candidates(&game).unwrap();
         assert_eq!(scan.versions.len(), 1);
@@ -6718,6 +7067,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-running-recycled-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         let dir = launcher.instance_dir("demo").unwrap();
         fs::create_dir_all(&dir).unwrap();
 
@@ -6799,18 +7149,30 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-running-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         launcher.create_instance(&Instance::new("live", "1.20.1")).unwrap();
         // The test process itself is a live pid on Linux.
         launcher.mark_running("live", std::process::id()).unwrap();
-        assert!(launcher.delete_instance("live").is_err());
+        assert!(launcher.unregister("live").is_err());
         launcher.clear_running("live");
         assert_eq!(launcher.running_pid("live"), None);
-        launcher.delete_instance("live").unwrap();
+        launcher.unregister("live").unwrap();
+        // Unregistering hides the entry and leaves every file in place.
+        let live = launcher.instance_dir("live").unwrap();
+        assert!(live.join(tntl_instance::INSTANCE_FILE).is_file());
+        assert!(list_instances(&launcher).unwrap().is_empty());
         // A marker whose process is gone is cleaned up instead of blocking.
         launcher.create_instance(&Instance::new("stale", "1.20.1")).unwrap();
         launcher.mark_running("stale", 0).unwrap();
         assert_eq!(launcher.running_pid("stale"), None);
-        launcher.delete_instance("stale").unwrap();
+        launcher.unregister("stale").unwrap();
+        assert!(
+            launcher
+                .instance_dir("stale")
+                .unwrap()
+                .join(tntl_instance::INSTANCE_FILE)
+                .is_file()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -6819,6 +7181,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-instance-from-version-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         let path = launcher.layout().version_json("1.20.1");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, r#"{"id":"1.20.1"}"#).unwrap();
@@ -6836,6 +7199,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-offline-skin-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
 
         let account = launcher.add_offline_account("Skinny").unwrap();
         assert!(account.has_skin);
@@ -6855,6 +7219,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-rename-account-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         let before = launcher.add_offline_account("OldName").unwrap();
         assert_eq!(before.uuid, tntl_auth::offline_uuid("OldName"));
         fs::create_dir_all(tntl_auth::skins_dir(&root)).unwrap();
@@ -6878,6 +7243,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-account-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         let instance = Instance::new("test", "1.20.1");
         let error = launcher.effective_account(&instance).unwrap_err();
         assert!(error.to_string().contains("add an account first"), "{error}");
@@ -6924,6 +7290,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-version-cleanup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         let layout = launcher.layout();
         let write = |id: &str, parent: Option<&str>| {
             let path = layout.version_json(id);
@@ -6960,18 +7327,24 @@ mod tests {
         launcher.delete_version("1.19.4").unwrap();
         assert!(launcher.delete_version("1.19.4").is_err());
 
-        // Only the chain of the deleted instance goes away; shared versions stay.
+        // Unregistering only hides the entry: the versions stay installed and
+        // the instance still counts as their user, so nothing is deleted behind
+        // the user's back.
+        launcher.unregister("pack").unwrap();
         assert_eq!(
-            launcher.delete_instance_with_cleanup("pack", true).unwrap(),
-            vec!["1.20.1-fabric".to_string()]
+            launcher.installed_versions(),
+            vec!["1.20.1".to_string(), "1.20.1-fabric".to_string()]
         );
-        assert_eq!(launcher.installed_versions(), vec!["1.20.1".to_string()]);
-
-        assert_eq!(
-            launcher.delete_instance_with_cleanup("solo", true).unwrap(),
-            vec!["1.20.1".to_string()]
+        assert_eq!(launcher.version_users("1.20.1-fabric"), vec!["pack".to_string()]);
+        assert_eq!(list_instances(&launcher).unwrap().len(), 1);
+        // Files are untouched: the instance directory is still there.
+        assert!(
+            launcher
+                .instance_dir("pack")
+                .unwrap()
+                .join(tntl_instance::INSTANCE_FILE)
+                .is_file()
         );
-        assert!(launcher.installed_versions().is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -6980,6 +7353,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-import-cleanup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         // The launcher's own copy of 1.20.1 is not used by any instance.
         let json = launcher.layout().version_json("1.20.1");
         fs::create_dir_all(json.parent().unwrap()).unwrap();
@@ -6999,15 +7373,13 @@ mod tests {
         assert!(launcher.version_users("1.20.1").is_empty());
         assert!(launcher.installed_version_details()[0].instances.is_empty());
 
-        // Deleting the imported instance must not touch the launcher root.
-        assert!(
-            launcher
-                .delete_instance_with_cleanup("imported", true)
-                .unwrap()
-                .is_empty()
-        );
+        // Unregistering the imported instance must not touch any file, in the
+        // launcher root or in the other launcher's directory.
+        let unregistered = launcher.unregister("imported").unwrap();
+        assert!(unregistered.join(tntl_instance::INSTANCE_FILE).is_file());
         assert!(launcher.version_installed("1.20.1"));
         assert!(external_json.is_file());
+        // It keeps its versions in the other root, so our own copy is unused.
         launcher.delete_version("1.20.1").unwrap();
         let _ = fs::remove_dir_all(&root);
     }
@@ -7017,6 +7389,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-import-duplicate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         let game = root.join("external");
         let json = game.join("versions/1.20.1/1.20.1.json");
         fs::create_dir_all(json.parent().unwrap()).unwrap();
@@ -7044,6 +7417,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-import-archive-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         let game = root.join("external");
         let json = game.join("versions/1.20.1/1.20.1.json");
         fs::create_dir_all(json.parent().unwrap()).unwrap();
@@ -7069,6 +7443,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-guards-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         launcher.create_instance(&Instance::new("live", "1.20.1")).unwrap();
         launcher.mark_running("live", std::process::id()).unwrap();
         let error = launcher.backup_world("live", "world").unwrap_err().to_string();
@@ -7096,6 +7471,7 @@ mod tests {
             fs::write(path, format!(r#"{{"id":"{id}"}}"#)).unwrap();
         }
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         assert_eq!(launcher.import_candidates(&game).unwrap().picked, None);
         let scan = launcher.import_candidates(&game.join("versions/1.20.1")).unwrap();
         assert_eq!(scan.picked.as_deref(), Some("1.20.1"));
@@ -7107,6 +7483,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-import-repair-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         let game = root.join("game");
         let json = game.join("versions/1.21.1-Neoforge/1.21.1-Neoforge.json");
         fs::create_dir_all(json.parent().unwrap()).unwrap();
@@ -7130,6 +7507,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tntl-duplicate-guard-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
         launcher.create_instance(&Instance::new("live", "1.20.1")).unwrap();
         launcher.mark_running("live", std::process::id()).unwrap();
         let error = launcher.duplicate_instance("live", "copy").unwrap_err().to_string();
@@ -7210,6 +7588,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tntl-proxy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let launcher = Launcher::from_root(Some(dir.clone()));
+        launcher.mark_root().unwrap();
         let saved = launcher
             .save_settings(&LauncherSettings {
                 proxy_mode: "http".to_string(),

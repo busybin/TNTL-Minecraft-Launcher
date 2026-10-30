@@ -346,7 +346,10 @@ fn validate_profile(json: &VersionJson, game: &str, version: &str) -> Result<(),
         version: version.to_string(),
         message,
     };
-    if json.id.is_empty() || json.id.contains(['/', '\\']) {
+    // The id becomes a directory name under `cache/forge` and `versions`:
+    // reject anything that is not a plain portable file name (`.`/`..` used to
+    // wipe the whole cache).
+    if !portable_id(&json.id) {
         return Err(invalid(format!("unusable version id {:?}", json.id)));
     }
     if json.inherits_from.as_deref() != Some(game) {
@@ -356,6 +359,25 @@ fn validate_profile(json: &VersionJson, game: &str, version: &str) -> Result<(),
         )));
     }
     Ok(())
+}
+
+/// A version id that is safe as one directory name on every platform.
+fn portable_id(id: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
+        "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if id.is_empty() || id == "." || id == ".." || id.ends_with(['.', ' ']) {
+        return false;
+    }
+    if id
+        .chars()
+        .any(|ch| ch.is_control() || matches!(ch, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    let stem = id.split('.').next().unwrap_or(id).trim().to_ascii_uppercase();
+    !RESERVED.contains(&stem.as_str())
 }
 
 fn download_installer(

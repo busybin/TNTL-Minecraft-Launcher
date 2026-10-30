@@ -508,10 +508,12 @@ fn load_instance(state: State<'_, AppState>, name: String) -> Result<Instance, S
 }
 
 #[tauri::command]
-fn delete_instance(state: State<'_, AppState>, name: String, cleanup: Option<bool>) -> Result<Vec<String>, String> {
+fn delete_instance(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    // Removal from the library only: no file is moved, renamed or deleted.
     ensure_stopped(&state, &name)?;
     state_launcher(&state)
-        .delete_instance_with_cleanup(&name, cleanup.unwrap_or(false))
+        .unregister(&name)
+        .map(|dir| dir.display().to_string())
         .map_err(message)
 }
 

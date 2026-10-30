@@ -411,9 +411,9 @@ pub fn remove(dir: &Path, file: &str) -> Result<(), ContentError> {
     if file.is_empty()
         || file == "."
         || file == ".."
-        || file.contains('/')
-        || file.contains('\\')
+        || file.contains(['/', '\\', ':'])
         || file.starts_with('.')
+        || file.chars().any(char::is_control)
     {
         return Err(ContentError::InvalidName(file.to_string()));
     }
@@ -477,6 +477,9 @@ pub fn apply_default_skin(
     }
     zip.finish().map_err(|error| ContentError::Zip(error.to_string()))?;
     fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
+    if let Ok(hash) = tntl_store::sha1_file(&path) {
+        let _ = atomic_write(&dir.join(SKIN_MARKER), hash.as_bytes());
+    }
     set_resource_pack(game_dir, SKIN_PACK, true)?;
     Ok(path)
 }
@@ -508,16 +511,50 @@ fn pack_format(game_version: &str) -> u32 {
     }
 }
 
-/// Drop the generated skin pack again. A no-op when it was never written.
+/// Marker holding the SHA-1 of the skin pack this launcher wrote, so a file the
+/// user put there under the same name is never deleted.
+const SKIN_MARKER: &str = ".tntl-skin.sha1";
+
+/// Drop the generated skin pack again. A no-op when it was never written, and
+/// it never removes a `tntl-skin.zip` this launcher did not create.
 pub fn remove_default_skin(game_dir: &Path) -> Result<(), ContentError> {
-    let path = game_dir.join("resourcepacks").join(SKIN_PACK);
+    let dir = game_dir.join("resourcepacks");
+    let path = dir.join(SKIN_PACK);
+    let marker = dir.join(SKIN_MARKER);
+    let ours = fs::read_to_string(&marker)
+        .ok()
+        .map(|recorded| recorded.trim().to_string())
+        .filter(|recorded| !recorded.is_empty())
+        .is_some_and(|recorded| {
+            tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(&recorded))
+        });
     let enabled = enabled_resource_packs(game_dir)?.iter().any(|name| name == SKIN_PACK);
-    if path.exists() {
+    if ours && path.exists() {
         fs::remove_file(&path).map_err(|error| io_error(&path, error))?;
+    }
+    if ours || enabled {
+        let _ = fs::remove_file(&marker);
     }
     if enabled {
         set_resource_pack(game_dir, SKIN_PACK, false)?;
     }
+    Ok(())
+}
+
+/// Copy `path` to `<name>.tntl-bak` the first time we are about to edit it.
+fn backup_once(path: &Path) -> Result<(), ContentError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let backup = path.with_file_name(format!("{name}.tntl-bak"));
+    if backup.exists() {
+        return Ok(());
+    }
+    fs::copy(path, &backup).map_err(|error| io_error(&backup, error))?;
     Ok(())
 }
 
@@ -574,6 +611,7 @@ impl Options {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
         }
+        backup_once(path)?;
         atomic_write(path, text.as_bytes())?;
         Ok(())
     }
@@ -614,6 +652,7 @@ impl Properties {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
         }
+        backup_once(path)?;
         atomic_write(path, text.as_bytes())?;
         Ok(())
     }

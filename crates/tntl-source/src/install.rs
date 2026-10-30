@@ -275,6 +275,13 @@ impl<'a> Installer<'a> {
             path: self.roots.version_json(&summary.id),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
         })?;
+        // Keep a hand-fixed or other-launcher JSON instead of overwriting it.
+        if let Err(error) = tntl_store::backup_existing(&self.roots.version_json(&summary.id)) {
+            return Err(SourceError::Io {
+                path: self.roots.version_json(&summary.id),
+                source: error,
+            });
+        }
         tntl_store::atomic_write(&self.roots.version_json(&summary.id), &body)?;
         Ok(json)
     }

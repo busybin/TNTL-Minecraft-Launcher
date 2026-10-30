@@ -259,6 +259,64 @@ pub fn atomic_write_private_json<T: serde::Serialize>(path: &Path, value: &T) ->
     atomic_write_private(path, &bytes)
 }
 
+/// Strip the Windows verbatim prefix (`\\?\`, `\\?\UNC\`) that
+/// `canonicalize` adds. Paths stored in JSON, shown in the UI and compared for
+/// equality must not carry it: otherwise one directory shows up twice and the
+/// frontend's `path === root` check fails.
+pub fn simplify_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.as_os_str().to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && rest.len() > 2
+            && rest.as_bytes()[1] == b':'
+        {
+            return PathBuf::from(rest.to_string());
+        }
+        path.to_path_buf()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+/// Move an existing file aside instead of letting a download truncate it.
+/// Returns the backup path, or `None` when there was nothing to back up.
+pub fn backup_existing(path: &Path) -> io::Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let mut backup = path.with_file_name(format!("{name}.bak-{stamp}"));
+    let mut seq = 1;
+    while backup.exists() {
+        backup = path.with_file_name(format!("{name}.bak-{stamp}-{seq}"));
+        seq += 1;
+    }
+    fs::rename(path, &backup)?;
+    Ok(Some(backup))
+}
+
+/// Whether `path` itself is a symlink or (on Windows) a junction. Deletions and
+/// overwrites must not walk into one: `mods -> D:/shared/mods` is common in
+/// Prism/MultiMC layouts and taking the target with it is data loss.
+pub fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 /// Reject absolute paths, `..`, prefixes and drive letters.
 pub fn safe_relative(name: &str) -> Option<PathBuf> {
     let path = Path::new(name);

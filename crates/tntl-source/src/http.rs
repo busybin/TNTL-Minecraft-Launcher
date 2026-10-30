@@ -283,6 +283,15 @@ impl Http {
                             });
                         }
                     }
+                    // A different file is already there (another launcher
+                    // patched it, or the user fixed it by hand). Keep a copy
+                    // instead of truncating it.
+                    if request.dest.exists()
+                        && let Err(error) = tntl_store::backup_existing(&request.dest)
+                    {
+                        let _ = fs::remove_file(&temp);
+                        return Err(io_error(&request.dest, error));
+                    }
                     fs::rename(&temp, &request.dest).map_err(|error| io_error(&request.dest, error))?;
                     return Ok(DownloadOutcome::Downloaded);
                 }

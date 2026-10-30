@@ -262,9 +262,19 @@ fn write_archive(source: &Path, world: &str, target: &Path) -> Result<(), WorldE
     Ok(())
 }
 
-/// Delete a world directory.
+/// Delete a world directory. Refuses a directory that is a link (the target
+/// belongs to whoever it points at) and anything without `level.dat`, so a
+/// hand-made folder under `saves/` cannot be swept away by a typo.
 pub fn delete(game_dir: &Path, world: &str) -> Result<(), WorldError> {
     let path = world_path(game_dir, world)?;
+    if tntl_store::is_link(&path) {
+        return Err(WorldError::Invalid(format!("refusing to delete {world}: it is a link")));
+    }
+    if !path.join("level.dat").is_file() {
+        return Err(WorldError::Invalid(format!(
+            "{world} has no level.dat, so it is not a world"
+        )));
+    }
     fs::remove_dir_all(&path).map_err(|error| io_err(&path, error))
 }
 

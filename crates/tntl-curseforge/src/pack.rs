@@ -157,11 +157,20 @@ pub fn extract_overrides(
         if !target.starts_with(game_dir) {
             return Err(CurseForgeError::Invalid(format!("unsafe archive entry: {name}")));
         }
+        // Worlds are the player's, not the pack's.
+        if relative.starts_with("saves") {
+            eprintln!("skipping pack override into saves/: {name}");
+            continue;
+        }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|source| CurseForgeError::Io {
                 path: parent.to_path_buf(),
                 source,
             })?;
+        }
+        // Keep whatever is already there instead of truncating it.
+        if let Err(source) = tntl_store::backup_existing(&target) {
+            return Err(CurseForgeError::Io { path: target, source });
         }
         let mut out = File::create(&target).map_err(|source| CurseForgeError::Io {
             path: target.clone(),

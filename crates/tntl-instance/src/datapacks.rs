@@ -60,9 +60,12 @@ fn disabled_dir(game_dir: &Path, world: &str) -> PathBuf {
 
 fn check_world(game_dir: &Path, world: &str) -> Result<(), DatapackError> {
     let valid = !world.is_empty()
+        && world != "."
         && world != ".."
         && !world.contains('/')
         && !world.contains('\\')
+        && !world.contains(':')
+        && !world.chars().any(char::is_control)
         && saves_dir(game_dir).join(world).is_dir();
     if valid {
         Ok(())
@@ -72,7 +75,15 @@ fn check_world(game_dir: &Path, world: &str) -> Result<(), DatapackError> {
 }
 
 fn check_name(name: &str) -> Result<(), DatapackError> {
-    if name.is_empty() || name == ".." || name.contains('/') || name.contains('\\') || name.starts_with('.') {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains(':')
+        || name.starts_with('.')
+        || name.chars().any(char::is_control)
+    {
         return Err(DatapackError::Name(name.to_string()));
     }
     Ok(())
@@ -163,6 +174,7 @@ pub fn set_enabled(game_dir: &Path, world: &str, name: &str, enabled: bool) -> R
 
 /// Disabled packs are stored per world; drop the folder when the world goes.
 pub fn remove_world(game_dir: &Path, world: &str) -> Result<(), DatapackError> {
+    check_world(game_dir, world)?;
     let dir = disabled_dir(game_dir, world);
     match fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),

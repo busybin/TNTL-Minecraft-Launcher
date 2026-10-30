@@ -342,7 +342,12 @@ pub fn export(game_dir: &Path, output: &Path, options: &ExportOptions<'_>) -> Re
     let index_json = serde_json::to_vec_pretty(&index)
         .map_err(|error| ModpackError::Invalid(format!("cannot serialize the pack index: {error}")))?;
 
-    let file = File::create(output).map_err(|error| io_error(output, error))?;
+    // Write next to the target and rename, so a failed export does not destroy
+    // the file the user exported earlier under the same name.
+    let mut staged_name = output.as_os_str().to_os_string();
+    staged_name.push(".part");
+    let staged = std::path::PathBuf::from(staged_name);
+    let file = File::create(&staged).map_err(|error| io_error(&staged, error))?;
     let mut zip = zip::ZipWriter::new(file);
     let file_options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     zip.start_file(INDEX_FILE, file_options)
@@ -383,6 +388,7 @@ pub fn export(game_dir: &Path, output: &Path, options: &ExportOptions<'_>) -> Re
         }
     }
     zip.finish().map_err(|error| ModpackError::Zip(error.to_string()))?;
+    std::fs::rename(&staged, output).map_err(|error| io_error(output, error))?;
     Ok(report)
 }
 
@@ -522,8 +528,19 @@ impl Modpack {
                 if !target.starts_with(game_dir) {
                     return Err(ModpackError::Invalid(format!("unsafe archive entry: {name}")));
                 }
+                // Worlds are the player's, not the pack's: an override that
+                // ships `saves/...` would replace an existing world.
+                if relative.starts_with("saves") {
+                    eprintln!("skipping pack override into saves/: {name}");
+                    continue;
+                }
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+                }
+                // Keep whatever is already there (configs the user edited,
+                // options.txt) instead of truncating it.
+                if let Err(error) = tntl_store::backup_existing(&target) {
+                    return Err(io_error(&target, error));
                 }
                 let mut out = File::create(&target).map_err(|error| io_error(&target, error))?;
                 io::copy(&mut entry, &mut out).map_err(|error| io_error(&target, error))?;

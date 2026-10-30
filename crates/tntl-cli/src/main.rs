@@ -1578,14 +1578,19 @@ fn cmd_rename(launcher: &Launcher, old: &str, new: &str) -> Result<i32> {
 }
 
 fn cmd_delete(launcher: &Launcher, name: &str, yes: bool, cleanup: bool) -> Result<i32> {
-    if !yes && !confirm(&format!("delete instance {name} and its game directory?"))? {
+    if !yes && !confirm(&format!("remove instance {name} from the library? its files are kept"))? {
         println!("cancelled");
         return Ok(0);
     }
-    let removed = launcher.delete_instance_with_cleanup(name, cleanup)?;
-    println!("deleted {name}");
-    for id in removed {
-        println!("removed unused version {id}");
+    // Unregistering never touches the disk; the user deletes files by hand.
+    let dir = launcher.unregister(name)?;
+    println!("removed {name} from the library; files kept in {}", dir.display());
+    if cleanup {
+        let (removed, bytes) = launcher.delete_unused_versions()?;
+        for id in removed {
+            println!("removed unused version {id}");
+        }
+        println!("freed {}", human_bytes(bytes));
     }
     Ok(0)
 }
