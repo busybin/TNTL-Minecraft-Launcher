@@ -221,7 +221,7 @@ enum Command {
     },
     /// Rename an instance (moves its directory).
     Rename { instance: String, name: String },
-    /// Delete an instance and its game directory.
+    /// Remove an instance from the library; the files stay on disk.
     Delete {
         instance: String,
         /// Delete without asking.

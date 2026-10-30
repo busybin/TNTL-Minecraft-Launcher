@@ -169,6 +169,19 @@ export interface InstalledVersion {
   instances: string[];
 }
 
+/** An instance folder whose `instance.json` is missing or unreadable. */
+export interface BrokenInstance {
+  name: string;
+  dir: string;
+  error: string;
+}
+
+/** An instance the user removed from the library; its files are untouched. */
+export interface RemovedInstance {
+  name: string;
+  dir: string;
+}
+
 export interface CapeView {
   id: string;
   alias: string;
@@ -740,6 +753,10 @@ export const api = {
   // Removal only hides the entry; the files stay where they are.
   deleteInstance: (name: string) => invoke<string>("delete_instance", { name }),
   restoreInstance: (name: string) => invoke<void>("restore_instance", { name }),
+  brokenInstances: () => invoke<BrokenInstance[]>("broken_instances"),
+  removedInstances: () => invoke<RemovedInstance[]>("removed_instances"),
+  forgetInstanceDir: (name: string) => invoke<string>("forget_instance_dir", { name }),
+  hiddenVersions: () => invoke<InstalledVersion[]>("hidden_versions"),
   unregisterVersion: (id: string) => invoke<void>("unregister_version", { id }),
   restoreVersion: (id: string) => invoke<void>("restore_version", { id }),
   session: () => invoke<SessionState>("session"),

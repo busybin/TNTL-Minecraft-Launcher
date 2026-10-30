@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { api, formatDate, formatPlaytime, imageUrl, type InstanceView } from "../api";
+import { api, formatDate, formatPlaytime, imageUrl, type BrokenInstance, type InstanceView, type RemovedInstance } from "../api";
 import CoverArt from "../components/CoverArt.vue";
 import Icon from "../components/Icon.vue";
 import { t } from "../i18n";
 
 const props = defineProps<{
   instances: InstanceView[];
+  brokenDirs: BrokenInstance[];
+  removedEntries: RemovedInstance[];
   running: string | null;
   busy: string | null;
 }>();
@@ -17,6 +19,9 @@ defineEmits<{
   log: [name: string];
   open: [name: string];
   remove: [name: string];
+  forgetDir: [name: string];
+  restore: [name: string];
+  openPath: [path: string];
   new: [];
   importMc: [];
   importArchive: [];
@@ -307,6 +312,36 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
         </div>
       </section>
     </template>
+
+    <section v-if="brokenDirs.length || removedEntries.length" class="maintenance card">
+      <header class="section-head">
+        <h3>{{ t("instances.maintenance") }}</h3>
+        <span class="count">{{ brokenDirs.length + removedEntries.length }}</span>
+      </header>
+      <div v-for="entry in brokenDirs" :key="`broken-${entry.name}`" class="maint-row">
+        <div class="maint-text">
+          <strong>{{ entry.name }}</strong>
+          <small class="mono">{{ entry.dir }}</small>
+          <small class="maint-error" :title="entry.error">{{ entry.error }}</small>
+        </div>
+        <button class="ghost small" @click="$emit('openPath', entry.dir)">
+          <Icon name="folder" :size="13" />{{ t("instances.openFolder") }}
+        </button>
+        <button class="ghost small" @click="$emit('forgetDir', entry.name)">
+          <Icon name="close" :size="13" />{{ t("instances.forget") }}
+        </button>
+      </div>
+      <div v-for="entry in removedEntries" :key="`removed-${entry.name}`" class="maint-row">
+        <div class="maint-text">
+          <strong>{{ entry.name }}</strong>
+          <small class="mono">{{ entry.dir }}</small>
+          <small class="maint-note">{{ t("instances.removedNote") }}</small>
+        </div>
+        <button class="ghost small" @click="$emit('restore', entry.name)">
+          <Icon name="refresh" :size="13" />{{ t("instances.restore") }}
+        </button>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -560,6 +595,52 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
   flex-direction: column;
   gap: 12px;
   animation: rise 260ms ease both;
+}
+
+.maintenance {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  animation: rise 260ms ease both;
+}
+
+.maint-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.maint-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 180px;
+}
+
+.maint-text strong {
+  font-size: 13px;
+}
+
+.maint-text small {
+  font-size: 11px;
+  color: var(--muted-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.maint-text .maint-error {
+  color: var(--danger);
+}
+
+.maint-row .small {
+  font-size: 11px;
+  padding: 4px 10px;
 }
 
 .section-head {

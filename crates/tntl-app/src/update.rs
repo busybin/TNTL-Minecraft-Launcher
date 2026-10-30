@@ -93,9 +93,30 @@ pub fn current_version() -> u32 {
     env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0)
 }
 
+/// Which build this copy should install. A copy installed from a package (or
+/// living in a system directory) cannot replace itself with an AppImage, so it
+/// updates from the `.deb` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstallKind {
+    /// Pick by platform alone.
+    #[default]
+    Auto,
+    AppImage,
+    /// Installed by the system package manager.
+    Package,
+    /// Installed by the NSIS setup.
+    Setup,
+    /// Stand-alone executable in a user directory.
+    Portable,
+}
+
 /// Ask GitHub for the newest release. Pre-releases count: every build of this
 /// project is published as one.
 pub fn check() -> Result<UpdateStatus> {
+    check_with(InstallKind::Auto)
+}
+
+pub fn check_with(kind: InstallKind) -> Result<UpdateStatus> {
     let http = Http::new().context("cannot create the HTTP client")?;
     let url = format!("{API}/{REPO}/releases?per_page=20");
     let body = http
@@ -125,7 +146,7 @@ pub fn check() -> Result<UpdateStatus> {
             note: Some("no release found".to_string()),
         });
     };
-    let (asset, note) = match pick_asset(&release.assets) {
+    let (asset, note) = match pick_asset(&release.assets, kind) {
         Some(asset) => (Some(asset), None),
         None => (
             None,
@@ -172,13 +193,22 @@ pub fn parse_version(tag: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// Build for this platform. Windows portable first (no installer, no admin),
-/// then the NSIS package; Linux AppImage first, then the deb.
-fn pick_asset(assets: &[RawAsset]) -> Option<UpdateAsset> {
+/// Build for this platform and this kind of install. Windows portable first (no
+/// installer, no admin), then the NSIS package; Linux AppImage first, then the
+/// deb. A copy installed by the package manager must never be offered an
+/// AppImage: replacing `/usr/bin/...` is not something it can do.
+fn pick_asset(assets: &[RawAsset], kind: InstallKind) -> Option<UpdateAsset> {
     let wanted: &[&str] = if cfg!(windows) {
-        &["win64.exe", "setup.exe"]
+        match kind {
+            InstallKind::Setup => &["setup.exe"],
+            _ => &["win64.exe", "setup.exe"],
+        }
     } else if cfg!(target_os = "linux") {
-        &[".AppImage", ".deb"]
+        match kind {
+            InstallKind::AppImage => &[".AppImage"],
+            InstallKind::Package => &[".deb"],
+            _ => &[".AppImage", ".deb"],
+        }
     } else {
         &[]
     };

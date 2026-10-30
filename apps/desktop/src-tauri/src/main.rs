@@ -337,6 +337,7 @@ async fn migrate_legacy(state: State<'_, AppState>) -> Result<store::MigrationRe
 /// copied and nothing is overwritten.
 #[tauri::command]
 async fn import_added_path(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: String,
     versions: Vec<String>,
@@ -346,10 +347,13 @@ async fn import_added_path(
     }
     let launcher = state_launcher(&state);
     let path = PathBuf::from(path);
+    let job = "import".to_string();
     tauri::async_runtime::spawn_blocking(move || {
+        let _cancel = tntl_source::cancel::begin();
+        let progress = |event: InstallEvent| emit_tagged(&app, "install-progress", &job, &event);
         if path.join("mmc-pack.json").is_file() || path.join("instances").is_dir() {
             let instance = launcher
-                .import_prism_instance(&path, None, &|_: InstallEvent| {})
+                .import_prism_instance(&path, None, &progress)
                 .map_err(message)?;
             return Ok(vec![instance.name]);
         }
@@ -362,12 +366,15 @@ async fn import_added_path(
         } else {
             scan.versions.iter().map(|candidate| candidate.id.clone()).collect()
         };
+        if picked.is_empty() {
+            return Err("no version directory to register was found".to_string());
+        }
         let mut added = Vec::new();
         let mut failures: Vec<String> = Vec::new();
         for id in picked {
             // Reuse the existing importer so the game-dir detection and the
             // version-isolation rules stay in one place.
-            match launcher.import_instance(&path, None, Some(&id), &|_: InstallEvent| {}) {
+            match launcher.import_instance(&path, None, Some(&id), &progress) {
                 Ok(instance) => added.push(instance.name),
                 Err(error) => failures.push(format!("{id}: {error:#}")),
             }
@@ -2452,10 +2459,54 @@ fn install_panic_hook() {
 async fn update_check(state: State<'_, AppState>) -> Result<tntl_app::update::UpdateStatus, String> {
     // Building a Launcher applies the proxy the user configured.
     let _ = state_launcher(&state);
-    tauri::async_runtime::spawn_blocking(tntl_app::update::check)
+    tauri::async_runtime::spawn_blocking(|| tntl_app::update::check_with(install_kind()))
         .await
         .map_err(|error| error.to_string())?
         .map_err(message)
+}
+
+/// How this copy was installed; decides which release asset can replace it.
+fn install_kind() -> tntl_app::update::InstallKind {
+    #[cfg(windows)]
+    {
+        let system = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .map(|dir| {
+                let text = dir.to_string_lossy().to_ascii_lowercase();
+                text.contains("program files") || text.contains("programdata")
+            })
+            .unwrap_or(false);
+        return if system {
+            tntl_app::update::InstallKind::Setup
+        } else {
+            tntl_app::update::InstallKind::Portable
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("APPIMAGE").is_some() {
+            return tntl_app::update::InstallKind::AppImage;
+        }
+        let system = std::env::current_exe()
+            .ok()
+            .map(|exe| {
+                let text = exe.to_string_lossy();
+                ["/usr/", "/opt/", "/snap/", "/app/"]
+                    .iter()
+                    .any(|prefix| text.starts_with(prefix))
+            })
+            .unwrap_or(false);
+        return if system {
+            tntl_app::update::InstallKind::Package
+        } else {
+            tntl_app::update::InstallKind::Portable
+        };
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        tntl_app::update::InstallKind::Auto
+    }
 }
 
 #[tauri::command]
@@ -2527,6 +2578,47 @@ fn restore_instance(state: State<'_, AppState>, name: String) -> Result<(), Stri
     state_launcher(&state).restore_instance(&name).map_err(message)
 }
 
+/// Instance folders the library cannot read, so the user can open or drop them.
+#[tauri::command]
+async fn broken_instances(state: State<'_, AppState>) -> Result<Vec<tntl_app::BrokenInstance>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || Ok(launcher.broken_instances()))
+        .await
+        .map_err(message)?
+}
+
+/// Removed entries whose files are still on disk.
+#[tauri::command]
+async fn removed_instances(state: State<'_, AppState>) -> Result<Vec<tntl_app::RemovedInstance>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || Ok(launcher.removed_instances()))
+        .await
+        .map_err(message)?
+}
+
+/// Forget a folder even when its `instance.json` is broken or missing.
+#[tauri::command]
+async fn forget_instance_dir(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher
+            .forget_instance_dir(&name)
+            .map(|dir| dir.display().to_string())
+            .map_err(message)
+    })
+    .await
+    .map_err(message)?
+}
+
+/// Versions hidden from the list but still installed.
+#[tauri::command]
+async fn hidden_versions(state: State<'_, AppState>) -> Result<Vec<tntl_app::InstalledVersion>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || Ok(launcher.hidden_version_details()))
+        .await
+        .map_err(message)?
+}
+
 fn main() {
     // Answer `--version` before the toolkit starts: the packaged shell has no
     // CLI binary, so this is how a terminal finds out what is installed.
@@ -2542,6 +2634,26 @@ fn main() {
     install_panic_hook();
     let root = initial_root();
     append_log("start", &startup_notes(&root));
+    let configured = store::configured_root().is_some() || env_root().is_some();
+    // Backups pile up next to every file we had to overwrite. Drop the old
+    // ones in the background; only files this project named `*.bak*` are
+    // candidates, and the newest few of each file stay.
+    if configured {
+        let root = root.clone();
+        std::thread::spawn(move || {
+            let detail = match tntl_store::purge_backups(&root, 3, std::time::Duration::from_secs(30 * 24 * 3600)) {
+                Ok(report) if report.files > 0 => Some(format!(
+                    "removed {} old backup file(s), {} bytes",
+                    report.files, report.bytes
+                )),
+                Ok(_) => None,
+                Err(error) => Some(format!("cannot clean old backups: {error}")),
+            };
+            if let Some(detail) = detail {
+                let _ = append_log("backups", &detail);
+            }
+        });
+    }
 
     #[cfg(target_os = "linux")]
     configure_webview();
@@ -2570,9 +2682,7 @@ fn main() {
         })
         .manage(AppState {
             root: Mutex::new(root),
-            configured: std::sync::atomic::AtomicBool::new(
-                store::configured_root().is_some() || env_root().is_some(),
-            ),
+            configured: std::sync::atomic::AtomicBool::new(configured),
             game: Mutex::new(None),
             launching: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2588,6 +2698,10 @@ fn main() {
             unregister_version,
             restore_version,
             restore_instance,
+            broken_instances,
+            removed_instances,
+            forget_instance_dir,
+            hidden_versions,
             update_check,
             update_download,
             update_apply,

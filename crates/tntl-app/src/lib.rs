@@ -2290,17 +2290,73 @@ impl Launcher {
         chain
     }
 
-    /// Instance directories whose `instance.json` is missing or unreadable.
-    fn instances_without_metadata(&self) -> Vec<String> {
+    /// Instance directories the library cannot load. They are listed so the
+    /// user can open the folder or drop the entry; a broken `instance.json`
+    /// used to make a directory invisible with no way to remove it.
+    pub fn broken_instances(&self) -> Vec<BrokenInstance> {
+        let hidden = self.hidden();
         let Ok(entries) = fs::read_dir(self.instances_dir()) else {
-            return vec!["<instances directory unreadable>".to_string()];
+            return Vec::new();
         };
-        entries
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .filter(|entry| Instance::load(&entry.path()).is_err())
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect()
+        let mut broken = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if hidden.hides_instance(&name) {
+                continue;
+            }
+            let dir = entry.path();
+            if let Err(error) = Instance::load(&dir) {
+                broken.push(BrokenInstance {
+                    name,
+                    dir,
+                    error: format!("{error:#}"),
+                });
+            }
+        }
+        broken.sort_by(|left, right| left.name.cmp(&right.name));
+        broken
+    }
+
+    /// Names of instance directories the library cannot read.
+    fn instances_without_metadata(&self) -> Vec<String> {
+        self.broken_instances().into_iter().map(|entry| entry.name).collect()
+    }
+
+    /// Instance directories the user removed from the library. The files are
+    /// still there, so the entries can be put back.
+    pub fn removed_instances(&self) -> Vec<RemovedInstance> {
+        let hidden = self.hidden();
+        let mut removed = Vec::new();
+        for name in hidden.instances {
+            let Ok(dir) = self.instance_dir(&name) else {
+                continue;
+            };
+            if dir.is_dir() {
+                removed.push(RemovedInstance { name, dir });
+            }
+        }
+        removed.sort_by(|left, right| left.name.cmp(&right.name));
+        removed
+    }
+
+    /// Drop an instance directory from the library even when its
+    /// `instance.json` is missing or unreadable. Nothing on disk changes.
+    pub fn forget_instance_dir(&self, name: &str) -> Result<PathBuf> {
+        valid_component(name)?;
+        let dir = self.instances_dir().join(name);
+        if !dir.is_dir() {
+            bail!("{name} is not an instance directory");
+        }
+        let mut hidden = self.hidden();
+        if !hidden.hides_instance(name) {
+            hidden.instances.push(name.to_string());
+            hidden.instances.sort();
+        }
+        self.save_hidden(&hidden)?;
+        Ok(dir)
     }
 
     /// Instances that launch through version directory `id`. Imported instances
@@ -3029,6 +3085,36 @@ impl Launcher {
                 InstalledVersion { id, bytes, instances }
             })
             .collect()
+    }
+
+    /// Hidden versions that are still on disk, so they can be restored.
+    pub fn hidden_version_details(&self) -> Vec<InstalledVersion> {
+        let hidden = self.hidden();
+        let chains = self.instance_chains();
+        let mut versions = Vec::new();
+        let Ok(entries) = fs::read_dir(self.versions_dir()) else {
+            return versions;
+        };
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().to_string();
+            if !self.version_installed(&id) || !hidden.hides_version(&id) {
+                continue;
+            }
+            let instances = chains
+                .iter()
+                .filter(|(_, chain, launcher_root)| {
+                    *launcher_root && chain.iter().any(|version| version.as_str() == id.as_str())
+                })
+                .map(|(name, _, _)| name.clone())
+                .collect();
+            versions.push(InstalledVersion {
+                bytes: dir_size(&self.versions_dir().join(&id)),
+                id,
+                instances,
+            });
+        }
+        versions.sort_by(|left, right| left.id.cmp(&right.id));
+        versions
     }
 
     /// Remove one installed version. Refuses while an instance still uses it;
@@ -6935,6 +7021,22 @@ pub struct InstalledVersion {
     pub instances: Vec<String>,
 }
 
+/// An instance directory the library cannot read. It stays in the list so the
+/// user can open or forget it instead of it silently disappearing.
+#[derive(Debug, Clone, Serialize)]
+pub struct BrokenInstance {
+    pub name: String,
+    pub dir: PathBuf,
+    pub error: String,
+}
+
+/// An instance the user removed from the library; its files are untouched.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemovedInstance {
+    pub name: String,
+    pub dir: PathBuf,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CleanupReport {
     /// Directories that were removed, by label.
@@ -7399,6 +7501,64 @@ mod tests {
                 .join(tntl_instance::INSTANCE_FILE)
                 .is_file()
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn broken_instances_stay_visible_and_can_be_forgotten() {
+        let root = std::env::temp_dir().join(format!("tntl-broken-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        launcher.create_instance(&Instance::new("good", "1.20.1")).unwrap();
+        // One folder with no metadata, one with an unreadable instance.json.
+        let orphan = launcher.instance_dir("orphan").unwrap();
+        fs::create_dir_all(&orphan).unwrap();
+        let broken = launcher.instance_dir("broken").unwrap();
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join(tntl_instance::INSTANCE_FILE), b"{not json").unwrap();
+
+        let names: Vec<String> = launcher
+            .broken_instances()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, vec!["broken".to_string(), "orphan".to_string()]);
+        // They are not part of the library itself.
+        assert_eq!(list_instances(&launcher).unwrap().len(), 1);
+
+        let dir = launcher.forget_instance_dir("broken").unwrap();
+        assert!(dir.join(tntl_instance::INSTANCE_FILE).is_file());
+        assert!(launcher.broken_instances().iter().all(|entry| entry.name != "broken"));
+        assert_eq!(launcher.removed_instances().len(), 1);
+        assert_eq!(launcher.removed_instances()[0].name, "broken");
+
+        launcher.restore_instance("broken").unwrap();
+        assert!(launcher.broken_instances().iter().any(|entry| entry.name == "broken"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_versions_can_be_listed_and_put_back() {
+        let root = std::env::temp_dir().join(format!("tntl-hidden-version-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let json = launcher.layout().version_json("1.20.1");
+        fs::create_dir_all(json.parent().unwrap()).unwrap();
+        fs::write(&json, r#"{"id":"1.20.1"}"#).unwrap();
+
+        assert_eq!(launcher.installed_versions(), vec!["1.20.1".to_string()]);
+        launcher.unregister_version("1.20.1").unwrap();
+        assert!(launcher.installed_versions().is_empty());
+        assert!(json.is_file());
+        let hidden = launcher.hidden_version_details();
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].id, "1.20.1");
+
+        launcher.restore_version("1.20.1").unwrap();
+        assert!(launcher.hidden_version_details().is_empty());
+        assert_eq!(launcher.installed_versions(), vec!["1.20.1".to_string()]);
         let _ = fs::remove_dir_all(&root);
     }
 

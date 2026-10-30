@@ -1,10 +1,18 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from "vue";
-import { api, events, jobTag, type ImportScan, type InstallEvent, type UnlistenFn } from "../api";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import {
+  api,
+  events,
+  jobTag,
+  type ImportScan,
+  type InstallEvent,
+  type PathInfo,
+  type UnlistenFn,
+} from "../api";
 import Icon from "../components/Icon.vue";
 import { t } from "../i18n";
 
-const emit = defineEmits<{ close: []; imported: [name: string] }>();
+const emit = defineEmits<{ close: []; imported: [names: string[]] }>();
 const props = defineProps<{ initialPath?: string }>();
 
 const path = ref(props.initialPath ?? "");
@@ -15,8 +23,9 @@ const error = ref<string | null>(null);
 const stage = ref<InstallEvent | null>(null);
 const unlisteners: UnlistenFn[] = [];
 const scan = ref<ImportScan | null>(null);
-const picked = ref<string>("");
-const scanning = ref(false);
+const info = ref<PathInfo | null>(null);
+/** Version directories to register; all of them unless the user unticks. */
+const selected = ref<string[]>([]);
 let scanTimer: number | undefined;
 let scanToken = 0;
 
@@ -24,25 +33,35 @@ let scanToken = 0;
 // what is actually on disk instead of making the user type it.
 async function refreshScan(target: string) {
   const token = ++scanToken;
-  picked.value = "";
+  selected.value = [];
   scan.value = null;
+  info.value = null;
   if (!target.trim()) {
     return;
   }
-  scanning.value = true;
   try {
+    const kind = await api.pathInfo(target.trim()).catch(() => null);
+    if (token !== scanToken) return;
+    info.value = kind;
     const result = await api.importCandidates(target.trim());
     // A slow answer for an older path must not replace the current one.
     if (token !== scanToken) return;
     scan.value = result;
-    // Pointing at `versions/<id>` means that one, not the newest.
-    picked.value = result.picked ?? result.versions[0]?.id ?? "";
+    // Pointing at `versions/<id>` means that one, not every version next to it.
+    selected.value = result.picked ? [result.picked] : result.versions.map((candidate) => candidate.id);
   } catch {
     // Not a readable directory (yet); Import reports the real error.
-  } finally {
-    if (token === scanToken) scanning.value = false;
   }
 }
+
+function toggle(id: string) {
+  selected.value = selected.value.includes(id)
+    ? selected.value.filter((entry) => entry !== id)
+    : [...selected.value, id];
+}
+
+const isPrism = computed(() => info.value?.kind === "prism");
+
 
 watch(
   path,
@@ -89,12 +108,25 @@ async function run() {
   error.value = null;
   stage.value = null;
   try {
+    if (!isPrism.value && scan.value?.versions.length && !selected.value.length) {
+      error.value = t("import.nothingSelected");
+      return;
+    }
+    // A Prism/MultiMC instance, or a game directory with several versions:
+    // register everything the user ticked, each as its own instance.
+    if (isPrism.value || selected.value.length > 1) {
+      const names = await api.importAddedPath(target, isPrism.value ? [] : selected.value);
+      if (!names.length) throw new Error(t("import.nothingAdded"));
+      emit("imported", names);
+      return;
+    }
+    const single = selected.value[0] ?? version.value.trim() ?? null;
     const imported = await api.importInstance(
       target,
       name.value.trim() || null,
-      picked.value || version.value.trim() || null,
+      single,
     );
-    emit("imported", imported);
+    emit("imported", [imported]);
   } catch (cause) {
     error.value = String(cause);
   } finally {
@@ -129,20 +161,32 @@ async function run() {
             </button>
           </div>
         </label>
-        <label>
+        <label v-if="selected.length <= 1">
           <span>{{ t("import.name") }} <small>{{ t("import.nameHint") }}</small></span>
           <input v-model="name" spellcheck="false" :placeholder="t('import.optional')" />
         </label>
-        <label v-if="scan && scan.versions.length">
+        <p v-if="isPrism" class="hint">
+          <Icon name="info" :size="13" />
+          <span>{{ t("import.prismHint") }}</span>
+        </p>
+        <div v-if="scan && scan.versions.length" class="field">
           <span>{{ t("import.detected") }} <small>{{ t("import.detectedHint") }}</small></span>
-          <select v-model="picked">
-            <option v-for="candidate in scan.versions" :key="candidate.id" :value="candidate.id">
-              {{ candidate.id }} — {{ candidate.game_version
-              }}{{ candidate.loader ? ` · ${candidate.loader}${candidate.loader_version ? ` ${candidate.loader_version}` : ""}` : "" }}
-            </option>
-          </select>
-        </label>
-        <label v-else>
+          <div class="candidates">
+            <label v-for="candidate in scan.versions" :key="candidate.id" class="candidate">
+              <input
+                type="checkbox"
+                :checked="selected.includes(candidate.id)"
+                @change="toggle(candidate.id)"
+              />
+              <span class="mono candidate-id">{{ candidate.id }}</span>
+              <small>
+                {{ candidate.game_version
+                }}{{ candidate.loader ? ` · ${candidate.loader}${candidate.loader_version ? ` ${candidate.loader_version}` : ""}` : "" }}
+              </small>
+            </label>
+          </div>
+        </div>
+        <label v-if="!isPrism && !(scan && scan.versions.length)">
           <span>{{ t("import.version") }} <small>{{ t("import.versionHint") }}</small></span>
           <input v-model="version" class="mono" spellcheck="false" :placeholder="t('import.versionPlaceholder')" />
         </label>
@@ -241,8 +285,51 @@ header .icon {
   color: var(--muted);
 }
 
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.field small,
 .body label small {
   color: var(--muted-2);
+}
+
+.candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 190px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--field);
+}
+
+.candidate {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 2px;
+  font-size: 11.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.candidate input {
+  width: auto;
+  margin: 0;
+}
+
+.candidate-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .row {

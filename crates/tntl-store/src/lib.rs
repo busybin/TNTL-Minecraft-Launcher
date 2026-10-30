@@ -308,6 +308,99 @@ pub fn backup_existing(path: &Path) -> io::Result<Option<PathBuf>> {
     Ok(Some(backup))
 }
 
+/// Whether a file name looks like a backup this project wrote next to a file it
+/// had to overwrite: `x.bak`, `x.bak-<unix>`, `x.bak-<unix>-<n>` or
+/// `x.broken-<unix>`.
+pub fn is_backup_name(name: &str) -> bool {
+    let Some((_, suffix)) = name.rsplit_once(".bak") else {
+        return ends_with_broken_suffix(name);
+    };
+    suffix.is_empty() || suffix.starts_with('-') && suffix[1..].chars().all(|ch| ch.is_ascii_digit() || ch == '-')
+}
+
+fn ends_with_broken_suffix(name: &str) -> bool {
+    let Some((_, stamp)) = name.rsplit_once(".broken-") else {
+        return false;
+    };
+    !stamp.is_empty() && stamp.chars().all(|ch| ch.is_ascii_digit())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackupPurge {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Delete our own backup files under `root`, keeping the newest `keep` per
+/// original name and only when they are older than `max_age`. Nothing else is
+/// touched: match is on the exact suffixes `backup_existing` writes.
+pub fn purge_backups(root: &Path, keep: usize, max_age: std::time::Duration) -> io::Result<BackupPurge> {
+    let now = std::time::SystemTime::now();
+    let mut groups: std::collections::HashMap<PathBuf, Vec<(PathBuf, std::time::SystemTime, u64)>> =
+        std::collections::HashMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            // A runaway tree (millions of asset objects) must not stall startup.
+            if visited > 500_000 {
+                break;
+            }
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !matches!(name.as_str(), "logs" | "natives" | "assets") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_backup_name(&name) {
+                continue;
+            }
+            let base = base_name(&name);
+            let modified = meta.modified().unwrap_or(now);
+            groups
+                .entry(dir.join(base))
+                .or_default()
+                .push((path, modified, meta.len()));
+        }
+    }
+    let mut report = BackupPurge::default();
+    for entries in groups.values_mut() {
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        for (path, modified, bytes) in entries.iter().skip(keep) {
+            let age = now.duration_since(*modified).unwrap_or_default();
+            if age < max_age {
+                continue;
+            }
+            if fs::remove_file(path).is_ok() {
+                report.files += 1;
+                report.bytes += bytes;
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// `foo.jar.bak-1700000000-1` → `foo.jar`.
+fn base_name(name: &str) -> String {
+    if let Some((base, _)) = name.rsplit_once(".broken-") {
+        return base.to_string();
+    }
+    match name.rsplit_once(".bak") {
+        Some((base, _)) => base.to_string(),
+        None => name.to_string(),
+    }
+}
+
 /// Whether `path` itself is a symlink or (on Windows) a junction. Deletions and
 /// overwrites must not walk into one: `mods -> D:/shared/mods` is common in
 /// Prism/MultiMC layouts and taking the target with it is data loss.
@@ -501,6 +594,33 @@ mod tests {
             std::path::PathBuf::from("/tmp/tntl-root/assets/objects/invalid/x")
         );
         assert!(roots.asset_object(&"a".repeat(40)).ends_with("a".repeat(40)));
+    }
+
+    #[test]
+    fn recognises_and_purges_our_backups() {
+        assert!(is_backup_name("a.jar.bak"));
+        assert!(is_backup_name("a.jar.bak-1700000000"));
+        assert!(is_backup_name("a.jar.bak-1700000000-2"));
+        assert!(is_backup_name("launcher.broken-1700000000"));
+        assert!(!is_backup_name("a.jar"));
+        assert!(!is_backup_name("a.baker"));
+        let dir = std::env::temp_dir().join(format!("tntl-backups-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("instances/x")).unwrap();
+        fs::write(dir.join("instances/x/options.txt"), b"keep").unwrap();
+        for stamp in 1..=3 {
+            fs::write(dir.join(format!("instances/x/options.txt.bak-{stamp}")), b"old").unwrap();
+        }
+        let report = purge_backups(&dir, 1, std::time::Duration::ZERO).unwrap();
+        assert_eq!(report.files, 2);
+        assert!(dir.join("instances/x/options.txt").is_file());
+        let left = fs::read_dir(dir.join("instances/x"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| is_backup_name(&entry.file_name().to_string_lossy()))
+            .count();
+        assert_eq!(left, 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

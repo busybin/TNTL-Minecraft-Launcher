@@ -59,7 +59,16 @@ pub fn plan(path: &Path) -> Plan {
 pub fn apply(app: &tauri::AppHandle, file: &Path) -> Result<String, String> {
     match plan(file) {
         // Not something we may install: the caller opens the folder instead.
-        Plan::Manual => Ok(format!("manual:{}", file.display())),
+        // A package has to go through the system package manager, which is a
+        // different instruction for the user than "run this file".
+        Plan::Manual => {
+            let is_package = file
+                .extension()
+                .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("deb"))
+                .unwrap_or(false);
+            let kind = if is_package { "package" } else { "manual" };
+            Ok(format!("{kind}:{}", file.display()))
+        }
         Plan::Installer => {
             #[cfg(windows)]
             {

@@ -5,10 +5,12 @@ import {
   api,
   events,
   type Bootstrap,
+  type BrokenInstance,
   type GameExit,
   type InstanceView,
   imageUrl,
   type LauncherSettings,
+  type RemovedInstance,
   type RootsState,
   type SessionState,
   type UnlistenFn,
@@ -35,6 +37,9 @@ type Page = "instances" | "install" | "accounts" | "settings";
 const page = ref<Page>("instances");
 const bootstrap = ref<Bootstrap | null>(null);
 const instances = ref<InstanceView[]>([]);
+/** Instance folders the library cannot load, and entries the user removed. */
+const brokenInstances = ref<BrokenInstance[]>([]);
+const removedInstances = ref<RemovedInstance[]>([]);
 const running = ref<string | null>(null);
 /** Second close request while a game runs always closes; see onCloseRequested. */
 let closeArmed = false;
@@ -148,10 +153,16 @@ let refreshToken = 0;
 async function refresh() {
   const token = ++refreshToken;
   try {
-    const data = await api.bootstrap();
+    const [data, broken, removed] = await Promise.all([
+      api.bootstrap(),
+      api.brokenInstances().catch(() => []),
+      api.removedInstances().catch(() => []),
+    ]);
     if (token !== refreshToken) return;
     bootstrap.value = data;
     instances.value = data.instances;
+    brokenInstances.value = broken;
+    removedInstances.value = removed;
     const current = await api.runningInstance();
     if (token !== refreshToken) return;
     running.value = current;
@@ -305,6 +316,37 @@ function closeRemovedFolder() {
   removedFolder.value = null;
 }
 
+/** Drop a folder whose `instance.json` is broken; nothing on disk changes. */
+async function forgetDir(name: string) {
+  if (!window.confirm(t("instances.forgetBrokenConfirm", { name }))) return;
+  try {
+    const dir = await api.forgetInstanceDir(name);
+    removedFolder.value = { name, dir };
+    await refresh();
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+/** Put a removed entry back; its files were never touched. */
+async function restoreRemoved(name: string) {
+  try {
+    await api.restoreInstance(name);
+    notify(t("instances.restored", { name }));
+    await refresh();
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+async function openAnyPath(path: string) {
+  try {
+    await api.openPath(path);
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
 /** Put the entry back; the files were never touched, so this is enough. */
 async function undoRemove() {
   const target = removedFolder.value;
@@ -347,9 +389,11 @@ function openImport(initial = "") {
   importOpen.value = true;
 }
 
-function onImported(name: string) {
+function onImported(names: string[]) {
   importOpen.value = false;
-  notify(t("app.imported", { name }));
+  notify(names.length === 1
+    ? t("app.imported", { name: names[0] })
+    : t("app.importedMany", { count: names.length }));
   refresh();
 }
 
@@ -784,6 +828,8 @@ onUnmounted(() => {
             v-if="page === 'instances'"
             key="instances"
             :instances="instances"
+            :broken-dirs="brokenInstances"
+            :removed-entries="removedInstances"
             :running="running"
             :busy="busy"
             @launch="launch"
@@ -791,6 +837,9 @@ onUnmounted(() => {
             @log="showLog"
             @open="openDetail"
             @remove="remove"
+            @forget-dir="forgetDir"
+            @restore="restoreRemoved"
+            @open-path="openAnyPath"
             @new="goPage('install')"
             @import-mc="openImport()"
             @import-archive="pickArchive"

@@ -27,24 +27,59 @@ const channel = ref<"release" | "snapshot" | "all">("release");
 
 /** Versions on this machine, with sizes and the instances that need them. */
 const local = ref<InstalledVersion[]>([]);
+/** Versions hidden from the list but still on disk. */
+const hidden = ref<InstalledVersion[]>([]);
 const localOpen = ref(false);
+const hiddenOpen = ref(false);
 const localBusy = ref<string | null>(null);
 const localTotal = computed(() => local.value.reduce((sum, version) => sum + version.bytes, 0));
 const unusedLocal = computed(() => local.value.filter((version) => !version.instances.length));
 
 async function loadLocal() {
   try {
-    const list = await api.installedVersions();
+    const [list, hiddenList] = await Promise.all([
+      api.installedVersions(),
+      api.hiddenVersions().catch(() => []),
+    ]);
     // Unused versions first: they are the ones worth deleting.
     local.value = list.sort((left, right) => left.instances.length - right.instances.length);
+    hidden.value = hiddenList;
   } catch {
     local.value = [];
+    hidden.value = [];
   }
 }
 
 function toggleLocal() {
   localOpen.value = !localOpen.value;
   if (localOpen.value) void loadLocal();
+}
+
+/** Hide a version from the list; its files stay where they are. */
+async function hideVersion(version: InstalledVersion) {
+  localBusy.value = version.id;
+  try {
+    await api.unregisterVersion(version.id);
+    await loadLocal();
+    emit("installed");
+  } catch (cause) {
+    loadError.value = String(cause);
+  } finally {
+    localBusy.value = null;
+  }
+}
+
+async function restoreHidden(version: InstalledVersion) {
+  localBusy.value = version.id;
+  try {
+    await api.restoreVersion(version.id);
+    await loadLocal();
+    emit("installed");
+  } catch (cause) {
+    loadError.value = String(cause);
+  } finally {
+    localBusy.value = null;
+  }
 }
 
 async function removeVersion(version: InstalledVersion) {
@@ -345,7 +380,7 @@ watch(installing, (now, before) => {
 
       <p v-if="loadError" class="error">{{ loadError }}</p>
 
-      <section v-if="local.length" class="local">
+      <section v-if="local.length || hidden.length" class="local">
         <button class="local-head" @click="toggleLocal">
           <Icon name="cube" :size="13" />
           <span class="local-title">{{ t("install.local.title") }}</span>
@@ -372,6 +407,14 @@ watch(installing, (now, before) => {
               <Icon name="plus" :size="14" />
             </button>
             <button
+              class="icon"
+              :disabled="localBusy !== null"
+              :title="t('install.local.hide')"
+              @click="hideVersion(version)"
+            >
+              <Icon name="close" :size="14" />
+            </button>
+            <button
               class="icon danger"
               :disabled="version.instances.length > 0 || localBusy !== null"
               :title="version.instances.length
@@ -391,6 +434,31 @@ watch(installing, (now, before) => {
             <Icon name="trash" :size="13" />
             {{ t("install.local.cleanup", { count: unusedLocal.length }) }}
           </button>
+          <div v-if="hidden.length" class="local-hidden">
+            <button class="local-hidden-head" @click="hiddenOpen = !hiddenOpen">
+              <Icon name="chevron" :size="13" class="local-chev" :class="{ open: hiddenOpen }" />
+              <span>{{ t("install.local.hidden", { count: hidden.length }) }}</span>
+            </button>
+            <div v-if="hiddenOpen">
+              <p class="empty-note">{{ t("install.local.hiddenHint") }}</p>
+              <div v-for="version in hidden" :key="version.id" class="local-row">
+                <span class="mono local-id">{{ version.id }}</span>
+                <span class="mono local-bytes">{{ formatBytes(version.bytes) }}</span>
+                <span class="local-use">
+                  {{ version.instances.length
+                    ? t("install.local.usedBy", { names: version.instances.join(", ") })
+                    : t("install.local.unused") }}
+                </span>
+                <button
+                  class="ghost small"
+                  :disabled="localBusy !== null"
+                  @click="restoreHidden(version)"
+                >
+                  <Icon name="refresh" :size="13" />{{ t("install.local.restore") }}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -779,6 +847,28 @@ watch(installing, (now, before) => {
   gap: 6px;
   margin: 8px 14px 10px;
   font-size: 11.5px;
+}
+
+.local-hidden {
+  margin: 4px 14px 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.local-hidden-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: none;
+  border: 0;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.local-hidden .local-row {
+  padding: 4px 0;
 }
 
 .row {

@@ -68,10 +68,12 @@ async function installUpdate() {
   try {
     const file = await api.updateDownload(asset);
     const action = await api.updateApply(file);
-    if (action.startsWith("manual:")) {
-      updateStatusText.value = t("update.manual");
-      const path = action.slice("manual:".length);
+    if (action.startsWith("package:") || action.startsWith("manual:")) {
+      const path = action.slice(action.indexOf(":") + 1);
       const folder = path.replace(/[\\/][^\\/]*$/, "");
+      updateStatusText.value = action.startsWith("package:")
+        ? t("update.package", { file: path.split(/[\\/]/).pop() ?? path })
+        : t("update.manual");
       await api.openPath(folder || path).catch(() => undefined);
     } else {
       updateStatusText.value = t("update.done");
