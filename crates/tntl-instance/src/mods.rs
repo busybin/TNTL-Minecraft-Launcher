@@ -90,6 +90,9 @@ pub struct ModInfo {
     /// Mod ids this jar declares incompatible.
     #[serde(default)]
     pub breaks: Vec<String>,
+    /// Version predicates per broken id; an empty list means "any version".
+    #[serde(default)]
+    pub break_ranges: BTreeMap<String, Vec<String>>,
     /// Version predicates per required dependency id.
     #[serde(default)]
     pub dependency_ranges: BTreeMap<String, Vec<String>>,
@@ -150,7 +153,7 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
         let meta = entry.metadata().ok();
         let size = meta.as_ref().map(|meta| meta.len()).unwrap_or_default();
         let modified = meta.as_ref().and_then(modified_secs).unwrap_or_default();
-        let (metadata, nested) = read_jar(&entry.path(), neoforge_style);
+        let (metadata, nested) = read_jar(&entry.path(), neoforge_style, loader);
         let mut nested = nested;
         nested.sort();
         nested.dedup();
@@ -180,6 +183,7 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
             loader_versions: metadata.loader_versions,
             java_versions: metadata.java_versions,
             breaks: metadata.breaks,
+            break_ranges: metadata.break_ranges,
             dependency_ranges: metadata.dependency_ranges,
             fabric_dependency: fabric_depends.clone(),
             fabric_dependency_ranges: fabric_ranges.clone(),
@@ -214,7 +218,6 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
         .flat_map(|(info, ..)| std::iter::once(info.id.clone()).chain(info.provides.iter().cloned()))
         .map(|id| id.to_ascii_lowercase())
         .collect();
-    let fabric_api = installed.iter().any(|id| id == "fabric-api");
     for (info, forge_depends, fabric_depends, fabric_ranges, _) in &mut mods {
         // Everything this mod requires that the loader itself does not
         // provide: the frontend unions it into "this instance's
@@ -236,7 +239,6 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
             .dependency
             .iter()
             .filter(|dependency| !installed.iter().any(|id| id == &dependency.to_ascii_lowercase()))
-            .filter(|dependency| !(fabric_api && dependency.starts_with("fabric-")))
             .cloned()
             .collect();
         // A dependency whose jar is present but switched off stops the game
@@ -305,6 +307,7 @@ struct Metadata {
     loader_versions: Vec<String>,
     java_versions: Vec<String>,
     breaks: Vec<String>,
+    break_ranges: BTreeMap<String, Vec<String>>,
     dependency_ranges: BTreeMap<String, Vec<String>>,
     fabric_depends: Vec<String>,
     fabric_dependency_ranges: BTreeMap<String, Vec<String>>,
@@ -326,14 +329,14 @@ const BUILTIN_MODS: &[&str] = &[
 
 /// Metadata and bundled module ids of one jar. Both live in the same archive,
 /// so it is opened once.
-fn read_jar(path: &Path, neoforge_style: bool) -> (Metadata, Vec<String>) {
+fn read_jar(path: &Path, neoforge_style: bool, loader: Option<ModLoader>) -> (Metadata, Vec<String>) {
     let Ok(file) = fs::File::open(path) else {
         return (Metadata::default(), Vec::new());
     };
     let Ok(mut archive) = zip::ZipArchive::new(file) else {
         return (Metadata::default(), Vec::new());
     };
-    let metadata = read_metadata(&mut archive, neoforge_style).unwrap_or_default();
+    let metadata = read_metadata(&mut archive, neoforge_style, loader).unwrap_or_default();
     let nested = read_nested_ids(&mut archive);
     (metadata, nested)
 }
@@ -357,7 +360,11 @@ fn neoforge_metadata(game_version: &str) -> bool {
     }
 }
 
-fn read_metadata(archive: &mut zip::ZipArchive<fs::File>, neoforge_style: bool) -> io::Result<Metadata> {
+fn read_metadata(
+    archive: &mut zip::ZipArchive<fs::File>,
+    neoforge_style: bool,
+    loader: Option<ModLoader>,
+) -> io::Result<Metadata> {
     let fabric = read_entry(archive, "fabric.mod.json")?
         .map(|bytes| parse_json(&bytes, ModLoader::Fabric, &["id", "name", "version"]));
     let quilt = if fabric.is_none() {
@@ -384,46 +391,59 @@ fn read_metadata(archive: &mut zip::ZipArchive<fs::File>, neoforge_style: bool) 
         }
     }
     Ok(match (fabric.or(quilt), forge) {
-        (Some(fabric), Some(forge)) => combine(fabric, forge),
+        (Some(fabric), Some(forge)) => combine(fabric, forge, loader),
         (Some(only), None) | (None, Some(only)) => only,
         (None, None) => Metadata::default(),
     })
 }
 
 /// A universal jar (for example Serilum's mods) carries both metadata files.
-/// Keep both dependency sets: the instance's loader decides which applies.
-fn combine(fabric: Metadata, forge: Metadata) -> Metadata {
+/// Only the set the instance's loader actually reads may be trusted: keeping
+/// the Forge game/loader bounds on a Fabric instance made compatible jars look
+/// broken, and the other way round it hid the stricter Fabric requirement.
+fn combine(fabric: Metadata, forge: Metadata, loader: Option<ModLoader>) -> Metadata {
+    let fabric_side = matches!(loader, Some(ModLoader::Fabric | ModLoader::Quilt));
+    let primary = if fabric_side { &fabric } else { &forge };
+    let fallback = if fabric_side { &forge } else { &fabric };
     let mut provides = forge.provides.clone();
     provides.extend(fabric.provides.iter().cloned());
     provides.sort();
     provides.dedup();
-    let mut breaks = forge.breaks.clone();
-    breaks.extend(fabric.breaks.iter().cloned());
-    breaks.sort();
-    breaks.dedup();
+    // Keep both dependency sets: `scan_for` exposes the Fabric one to the UI
+    // for universal jars, and the instance's loader picks which list is real.
     Metadata {
-        id: forge.id.clone().or_else(|| fabric.id.clone()),
-        name: forge.name.clone().or_else(|| fabric.name.clone()),
-        version: forge.version.clone().or_else(|| fabric.version.clone()),
+        id: primary.id.clone().or_else(|| fallback.id.clone()),
+        name: primary.name.clone().or_else(|| fallback.name.clone()),
+        version: primary.version.clone().or_else(|| fallback.version.clone()),
         loader: ModLoader::Universal,
-        depends: forge.depends.clone(),
+        depends: primary.depends.clone(),
         provides,
         recognized: true,
-        game_versions: if forge.game_versions.is_empty() {
-            fabric.game_versions.clone()
-        } else {
-            forge.game_versions.clone()
-        },
-        loader_versions: forge.loader_versions.clone(),
-        java_versions: if forge.java_versions.is_empty() {
-            fabric.java_versions.clone()
-        } else {
-            forge.java_versions.clone()
-        },
-        breaks,
-        dependency_ranges: forge.dependency_ranges.clone(),
+        game_versions: primary.game_versions.clone(),
+        loader_versions: primary.loader_versions.clone(),
+        java_versions: primary.java_versions.clone(),
+        breaks: primary.breaks.clone(),
+        break_ranges: primary.break_ranges.clone(),
+        dependency_ranges: primary.dependency_ranges.clone(),
         fabric_depends: fabric.depends,
         fabric_dependency_ranges: fabric.dependency_ranges,
+    }
+}
+
+/// Whether a jar built for `module` can run on an instance running `instance`.
+/// Shared by the mod list, the install guard and the doctor so they never
+/// disagree about a jar.
+pub fn compatible(instance: ModLoader, module: ModLoader, game_version: &str) -> bool {
+    match (instance, module) {
+        (ModLoader::Fabric, ModLoader::Fabric) => true,
+        (ModLoader::Quilt, ModLoader::Quilt | ModLoader::Fabric) => true,
+        (ModLoader::Forge, ModLoader::Forge) => true,
+        (ModLoader::NeoForge, ModLoader::NeoForge) => true,
+        // NeoForge 1.20.1 was a Forge fork and still loads Forge mods.
+        (ModLoader::NeoForge, ModLoader::Forge) => game_version.starts_with("1.20.1"),
+        // Jars with both metadata files run on either loader.
+        (_, ModLoader::Universal) => true,
+        _ => false,
     }
 }
 
@@ -512,13 +532,15 @@ fn parse_json(bytes: &[u8], loader: ModLoader, keys: &[&str]) -> Metadata {
             .filter(|text| !text.is_empty() && !text.contains("${file.jarVersion}"))
             .map(ToString::to_string)
     };
+    let (breaks, break_ranges) = json_breaks(value.get("breaks"));
     let mut metadata = Metadata {
         id: field(keys[0]),
         name: field(keys[1]),
         version: field(keys[2]),
         loader,
         provides: provides(value.get("provides")),
-        breaks: json_ids(value.get("breaks")),
+        breaks,
+        break_ranges,
         recognized: true,
         ..Metadata::default()
     };
@@ -558,17 +580,39 @@ fn provides(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `breaks` is an object keyed by mod id (Fabric) or an array (Quilt).
-fn json_ids(value: Option<&serde_json::Value>) -> Vec<String> {
+/// `breaks` is an object keyed by mod id (Fabric) or an array of ids/objects
+/// (Quilt). A value may carry a version predicate: `{"other": "<1.0"}` only
+/// conflicts with those builds, while no value means every build.
+fn json_breaks(value: Option<&serde_json::Value>) -> (Vec<String>, BTreeMap<String, Vec<String>>) {
+    let mut ids = Vec::new();
+    let mut ranges = BTreeMap::new();
     match value {
-        Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| item.as_str().or_else(|| item.get("id").and_then(|id| id.as_str())))
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
+        Some(serde_json::Value::Object(map)) => {
+            for (id, value) in map {
+                let predicates = constraints(Some(value));
+                if !predicates.is_empty() {
+                    ranges.insert(id.clone(), predicates);
+                }
+                ids.push(id.clone());
+            }
+        }
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                let Some(id) = item.as_str().or_else(|| item.get("id").and_then(|id| id.as_str())) else {
+                    continue;
+                };
+                let predicates = constraints(item.get("versions"));
+                if !predicates.is_empty() {
+                    ranges.insert(id.to_string(), predicates);
+                }
+                ids.push(id.to_string());
+            }
+        }
+        _ => {}
     }
+    ids.sort();
+    ids.dedup();
+    (ids, ranges)
 }
 
 fn apply_dependency(metadata: &mut Metadata, id: &str, ranges: Vec<String>) {
@@ -607,13 +651,15 @@ fn parse_quilt(bytes: &[u8]) -> Metadata {
             .filter(|text| !text.is_empty() && !text.contains("${file.jarVersion}"))
             .map(ToString::to_string)
     };
+    let (breaks, break_ranges) = json_breaks(loader.get("breaks"));
     let mut metadata = Metadata {
         id: text(&loader["id"]),
         name: text(&loader["metadata"]["name"]).or_else(|| text(&loader["id"])),
         version: text(&loader["version"]),
         loader: ModLoader::Quilt,
         provides: provides(loader.get("provides")),
-        breaks: json_ids(loader.get("breaks")),
+        breaks,
+        break_ranges,
         recognized: true,
         ..Metadata::default()
     };
@@ -629,6 +675,39 @@ fn parse_quilt(bytes: &[u8]) -> Metadata {
     metadata
 }
 
+/// Arrays in real `mods.toml` files are wrapped over several lines
+/// (`provides = [\n  "a",\n  "b"\n]`). The line-oriented reader has to see
+/// one logical line or every alias after the first is lost.
+fn logical_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut pending: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(mut buffer) = pending.take() {
+            buffer.push(' ');
+            buffer.push_str(line.split('#').next().unwrap_or_default());
+            if line.contains(']') {
+                lines.push(buffer);
+            } else {
+                pending = Some(buffer);
+            }
+            continue;
+        }
+        if let Some((_, value)) = line.split_once('=')
+            && value.trim().starts_with('[')
+            && !value.split('#').next().unwrap_or_default().contains(']')
+        {
+            pending = Some(line.to_string());
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    if let Some(buffer) = pending {
+        lines.push(buffer);
+    }
+    lines
+}
+
 /// Forge and NeoForge keep mod metadata in a TOML file. Only the first
 /// `[[mods]]` table is needed, so a full TOML parser is overkill.
 fn parse_mods_toml(bytes: &[u8], loader: ModLoader) -> Metadata {
@@ -640,7 +719,7 @@ fn parse_mods_toml(bytes: &[u8], loader: ModLoader) -> Metadata {
     let mut inside = false;
     let mut saw_mods = false;
     let mut dependency: Option<Dependency> = None;
-    for raw in text.lines() {
+    for raw in logical_lines(&text) {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -735,10 +814,13 @@ impl Dependency {
             .unwrap_or_default();
         let incompatible = self.kind.as_deref() == Some("incompatible");
         if incompatible {
+            if !ranges.is_empty() {
+                metadata.break_ranges.entry(id.clone()).or_default().extend(ranges);
+            }
             metadata.breaks.push(id);
             return;
         }
-        let optional = !self.mandatory || self.kind.as_deref() == Some("optional");
+        let optional = !self.mandatory || matches!(self.kind.as_deref(), Some("optional" | "discouraged"));
         let server_only = self.side.as_deref() == Some("SERVER");
         if optional || server_only {
             return;
@@ -754,16 +836,18 @@ fn toml_value(value: &str) -> String {
     // everything after it is a comment. Splitting on `#` would have kept the
     // quote inside the id ("forge" #mandatory) and turned the loader itself
     // into a missing dependency.
-    if let Some(rest) = value.strip_prefix('"')
-        && let Some(end) = rest.find('"')
-    {
-        return rest[..end].to_string();
+    for quote in ['"', '\''] {
+        if let Some(rest) = value.strip_prefix(quote)
+            && let Some(end) = rest.find(quote)
+        {
+            return rest[..end].to_string();
+        }
     }
     let unquoted = match value.split_once('#') {
         Some((head, _)) => head.trim(),
         _ => value,
     };
-    unquoted.trim_matches('"').trim().to_string()
+    unquoted.trim_matches(['"', '\'']).trim().to_string()
 }
 
 /// `provides = ["fabric", "fabric-api"]` inside `[[mods]]`. Forge and NeoForge

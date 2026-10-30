@@ -17,6 +17,7 @@ const ar: Record<string, string> = {
   'firstRun.existing': 'يحتوي هذا المجلد على {count} نسخة بالفعل.',
   'firstRun.empty': 'سيُنشأ مجلد المشغّل هنا.',
   'firstRun.gameDir': 'هذا مجلد لعبة: اختر مجلد بيانات أولًا ثم استخدم الاستيراد.',
+  'firstRun.chooseDataDir': 'اختر مجلد البيانات',
   'firstRun.unwritable': 'لا يمكن الكتابة في هذا المجلد.',
   'firstRun.migrate': 'تبنّي البيانات القديمة وتنظيف إعداداتها',
   'firstRun.migrateBody': 'نسخة أقدم كانت تحفظ بياناتها في {path}. التبنّي ينسخ الإعدادات ويحتفظ بكل النسخ وينقل مجلدات الألعاب إلى قائمة الاستيراد.',

@@ -968,13 +968,7 @@ fn describe(filter: &Filter) -> String {
 }
 
 fn validate_filename(name: &str, kind: ProjectKind) -> Result<(), ModrinthError> {
-    if name.is_empty()
-        || name.contains('/')
-        || name.contains('\\')
-        || name == ".."
-        || name.chars().any(char::is_control)
-        || !kind.accepts(name)
-    {
+    if !tntl_store::valid_file_name(name) || !kind.accepts(name) {
         return Err(ModrinthError::Invalid(format!(
             "unsafe {} file name: {name}",
             kind.key()

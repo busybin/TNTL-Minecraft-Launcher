@@ -17,6 +17,7 @@ const es: Record<string, string> = {
   'firstRun.existing': 'Esta carpeta ya contiene {count} instancia(s).',
   'firstRun.empty': 'Aquí se creará un directorio del launcher.',
   'firstRun.gameDir': 'Es un directorio de juego: elige primero un directorio de datos y luego usa Importar.',
+  'firstRun.chooseDataDir': 'Elegir el directorio de datos',
   'firstRun.unwritable': 'Esta carpeta no permite escritura.',
   'firstRun.migrate': 'Adoptar los datos antiguos y limpiar su configuración',
   'firstRun.migrateBody': 'Una versión anterior guardaba sus datos en {path}. Al adoptarlos se copia la configuración, se conservan todas las instancias y los directorios de juego pasan a la lista de importación.',

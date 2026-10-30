@@ -30,17 +30,7 @@ pub fn loader_name(loader: ModLoader) -> &'static str {
 }
 
 fn compatible(instance: ModLoader, module: ModLoader, game_version: &str) -> bool {
-    match (instance, module) {
-        (ModLoader::Fabric, ModLoader::Fabric) => true,
-        (ModLoader::Quilt, ModLoader::Quilt | ModLoader::Fabric) => true,
-        (ModLoader::Forge, ModLoader::Forge) => true,
-        (ModLoader::NeoForge, ModLoader::NeoForge) => true,
-        // NeoForge 1.20.1 was a Forge fork and still loads Forge mods.
-        (ModLoader::NeoForge, ModLoader::Forge) => game_version.starts_with("1.20.1"),
-        // Jars with both metadata files run on either loader.
-        (_, ModLoader::Universal) => true,
-        _ => false,
-    }
+    tntl_instance::mods::compatible(instance, module, game_version)
 }
 
 /// `1.20.1-47.4.28` -> `47.4.28`: Forge-family metadata declares the loader's
@@ -62,10 +52,23 @@ fn effective_loader_version(
     game_version: &str,
 ) -> Option<String> {
     let forge_family = |loader: ModLoader| matches!(loader, ModLoader::Forge | ModLoader::NeoForge);
-    if forge_family(instance) && forge_family(module) {
+    // A universal jar on a Forge instance is read through its `mods.toml`,
+    // even though the jar also carries Fabric metadata.
+    if forge_family(instance) && (forge_family(module) || module == ModLoader::Universal) {
         return Some(loader_build_number(version, game_version).to_string());
     }
     Some(version.to_string())
+}
+
+/// The loader whose metadata a jar's dependency list comes from. A universal
+/// jar is read through Forge metadata on Forge and through Fabric metadata
+/// elsewhere, so bare version recommendations must be judged by that loader.
+fn metadata_loader(module: &ModInfo, instance: Option<ModLoader>) -> ModLoader {
+    if module.loader == ModLoader::Universal {
+        instance.unwrap_or(ModLoader::Forge)
+    } else {
+        module.loader
+    }
 }
 
 /// Forge reads a bare version (`1.20.1-1.2.7`) as a recommendation, so only
@@ -246,9 +249,9 @@ pub fn dependency_requirements(module: &ModInfo, loader: Option<ModLoader>) -> V
     dependencies
         .iter()
         .map(|dependency| {
-            let ranges = ranges_by_id
-                .get(dependency)
-                .map_or_else(Vec::new, |ranges| enforced_ranges(module.loader, ranges));
+            let ranges = ranges_by_id.get(dependency).map_or_else(Vec::new, |ranges| {
+                enforced_ranges(metadata_loader(module, loader), ranges)
+            });
             (dependency.clone(), ranges)
         })
         .collect()
@@ -274,7 +277,10 @@ fn dependencies(
             // the host jar's version says nothing about it.
             if let Some(ranges) = ranges_by_id.get(dependency)
                 && !nested_ids.contains(&key)
-                && any_matches(&provider.version, &enforced_ranges(module.loader, ranges)) == Some(false)
+                && any_matches(
+                    &provider.version,
+                    &enforced_ranges(metadata_loader(module, loader), ranges),
+                ) == Some(false)
             {
                 findings.push(
                     Finding::new(Severity::Error, "dependency_version")
@@ -358,6 +364,15 @@ fn conflicts(enabled: &[&ModInfo], by_id: &BTreeMap<String, Vec<&ModInfo>>) -> V
                 continue;
             };
             if other.iter().all(|entry| entry.file == module.file) {
+                continue;
+            }
+            // `breaks: {"other": "<1.0"}` only conflicts with those builds;
+            // a version the predicate cannot parse must not invent a conflict.
+            if let Some(ranges) = module.break_ranges.get(broken)
+                && other
+                    .iter()
+                    .all(|entry| any_matches(&entry.version, ranges) == Some(false))
+            {
                 continue;
             }
             let mut pair = [module.name.clone(), name_of(by_id, &key)];
@@ -502,6 +517,7 @@ mod tests {
             loader_versions: Vec::new(),
             java_versions: Vec::new(),
             breaks: Vec::new(),
+            break_ranges: BTreeMap::new(),
             dependency_ranges: BTreeMap::new(),
             fabric_dependency: Vec::new(),
             fabric_dependency_ranges: BTreeMap::new(),

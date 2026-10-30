@@ -158,6 +158,20 @@ impl Default for Instance {
     }
 }
 
+/// Only the file names [`crate::Instance`]'s icon commands write. Nothing with
+/// a directory component or an absolute path is accepted.
+fn valid_icon(icon: &Path) -> bool {
+    let mut components = icon.components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        return false;
+    };
+    if components.next().is_some() {
+        return false;
+    }
+    name.to_str()
+        .is_some_and(|name| matches!(name, "icon.png" | "icon.jpg" | "icon.jpeg" | "icon.webp" | "icon.gif"))
+}
+
 fn valid_instance_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -189,14 +203,26 @@ impl Instance {
         if instance.version_id.is_empty() {
             return Err(InstanceError::Invalid("version_id is empty".to_string()));
         }
+        // The id becomes `versions/<id>/<id>.json`; a value such as `../../x`
+        // from a crafted archive must not be able to read outside the root.
+        if !tntl_store::valid_component(&instance.version_id) {
+            return Err(InstanceError::Invalid(format!(
+                "unusable version id {:?}",
+                instance.version_id
+            )));
+        }
         // Both paths are resolved against the process working directory
         // otherwise, which silently changes when the launcher is started from
-        // another folder. They are always written absolute.
-        for (label, path) in [("root", &instance.root), ("game_dir", &instance.game_dir)] {
-            if let Some(path) = path
-                && !path.is_absolute()
+        // another folder. They are always written absolute; older builds wrote
+        // the caller's argument verbatim, so resolve those against the
+        // instance directory and persist the result.
+        let mut migrated = false;
+        for path in [&mut instance.root, &mut instance.game_dir] {
+            if let Some(value) = path.as_mut()
+                && !value.is_absolute()
             {
-                return Err(InstanceError::Invalid(format!("{label} must be an absolute path")));
+                *value = dir.join(&*value);
+                migrated = true;
             }
         }
         // Older builds stored Windows verbatim paths (`\\?\D:\...`). They work
@@ -210,6 +236,27 @@ impl Instance {
                 "unusable instance name {:?}",
                 instance.name
             )));
+        }
+        // `icon` is joined onto the instance directory by the icon commands.
+        // A crafted archive used to be able to name `/home/u/file` or
+        // `../../x` and have it read or deleted from the UI.
+        if instance.icon.as_deref().is_some_and(|icon| !valid_icon(icon)) {
+            instance.icon = None;
+            migrated = true;
+        }
+        // A `java` path is executed by the launcher. An archive must not be
+        // able to point it at an arbitrary binary; drop paths that are not a
+        // real file.
+        if instance
+            .java
+            .as_deref()
+            .is_some_and(|java| !java.is_absolute() || !java.is_file())
+        {
+            instance.java = None;
+            migrated = true;
+        }
+        if migrated {
+            let _ = instance.save(dir);
         }
         Ok(instance)
     }

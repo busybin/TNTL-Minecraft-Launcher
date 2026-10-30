@@ -284,11 +284,28 @@ pub fn simplify_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Move an existing file aside instead of letting a download truncate it.
+/// Move an existing **file** aside instead of letting a download truncate it.
 /// Returns the backup path, or `None` when there was nothing to back up.
+/// Directories and links are refused: renaming a directory away because a pack
+/// ships a file with the same name would remove the user's whole `mods/`, and
+/// moving a link would replace a shared file with a private copy.
 pub fn backup_existing(path: &Path) -> io::Result<Option<PathBuf>> {
-    if !path.exists() {
-        return Ok(None);
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a link; not replacing it", path.display()),
+        ));
+    }
+    if meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a directory; not replacing it with a file", path.display()),
+        ));
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -308,21 +325,51 @@ pub fn backup_existing(path: &Path) -> io::Result<Option<PathBuf>> {
     Ok(Some(backup))
 }
 
-/// Whether a file name looks like a backup this project wrote next to a file it
-/// had to overwrite: `x.bak`, `x.bak-<unix>`, `x.bak-<unix>-<n>` or
-/// `x.broken-<unix>`.
+/// Copy a file to a sibling `x.bak-<unix>` name without moving it. Used where
+/// the original must stay in place until the replacement has been written.
+pub fn backup_copy(path: &Path) -> io::Result<Option<PathBuf>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let mut backup = path.with_file_name(format!("{name}.bak-{stamp}"));
+    let mut seq = 1;
+    while backup.exists() {
+        backup = path.with_file_name(format!("{name}.bak-{stamp}-{seq}"));
+        seq += 1;
+    }
+    fs::copy(path, &backup)?;
+    Ok(Some(backup))
+}
+
+/// Whether a file name matches a backup this project writes on purpose:
+/// `x.bak-<unix>`, `x.bak-<unix>-<n>` or `x.broken-<unix>`. A plain `x.bak` is
+/// someone else's file (TNTL never writes that shape) and is left alone.
 pub fn is_backup_name(name: &str) -> bool {
-    let Some((_, suffix)) = name.rsplit_once(".bak") else {
+    let Some((_, suffix)) = name.rsplit_once(".bak-") else {
         return ends_with_broken_suffix(name);
     };
-    suffix.is_empty() || suffix.starts_with('-') && suffix[1..].chars().all(|ch| ch.is_ascii_digit() || ch == '-')
+    let mut parts = suffix.split('-');
+    // Unix seconds (10 digits today, 9 until 2286). Requiring a long stamp
+    // keeps hand-made names such as `config.yml.bak-20240101` out.
+    let stamp = parts.next().unwrap_or_default();
+    stamp.len() >= 9
+        && stamp.chars().all(|ch| ch.is_ascii_digit())
+        && parts.all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn ends_with_broken_suffix(name: &str) -> bool {
     let Some((_, stamp)) = name.rsplit_once(".broken-") else {
         return false;
     };
-    !stamp.is_empty() && stamp.chars().all(|ch| ch.is_ascii_digit())
+    stamp.len() >= 9 && stamp.chars().all(|ch| ch.is_ascii_digit())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -351,9 +398,15 @@ pub fn purge_backups(root: &Path, keep: usize, max_age: std::time::Duration) -> 
                 break;
             }
             let path = entry.path();
-            let Ok(meta) = entry.metadata() else {
+            // `symlink_metadata` keeps the walk inside the data root: a
+            // `mods -> D:/shared/mods` link must not be treated as a folder of
+            // ours, or the purge would delete files in its target.
+            let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_dir() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if !matches!(name.as_str(), "logs" | "natives" | "assets") {
@@ -395,7 +448,7 @@ fn base_name(name: &str) -> String {
     if let Some((base, _)) = name.rsplit_once(".broken-") {
         return base.to_string();
     }
-    match name.rsplit_once(".bak") {
+    match name.rsplit_once(".bak-") {
         Some((base, _)) => base.to_string(),
         None => name.to_string(),
     }
@@ -408,6 +461,80 @@ pub fn is_link(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|meta| meta.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+/// Windows reserves these device names in every directory.
+const DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// A single path component that is legal on every platform the launcher
+/// supports. Read paths use this too: `C:x` is one component on Linux but
+/// drive-relative on Windows, where `PathBuf::join` throws the base away.
+pub fn valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*'])
+        && !name.chars().any(char::is_control)
+}
+
+/// [`valid_file_name`] plus the length limit for components the launcher
+/// creates itself (instance names, version ids). Existing files and downloads
+/// keep their real names, which may legitimately be longer.
+pub fn valid_component(name: &str) -> bool {
+    name.len() <= 100 && valid_file_name(name)
+}
+
+/// [`valid_component`] plus the Windows file-name rules (device names,
+/// trailing dots and spaces) so a data directory copied between platforms
+/// keeps working.
+pub fn portable_file_name(name: &str) -> bool {
+    if !valid_component(name) {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim().to_ascii_uppercase();
+    !name.ends_with('.') && !name.ends_with(' ') && !DEVICE_NAMES.contains(&stem.as_str())
+}
+
+/// Top-level game folders a pack must never write into. `saves` holds the
+/// player's worlds; a pack repair that replaces `level.dat` corrupts them.
+pub fn is_protected_game_path(relative: &Path) -> bool {
+    let Some(first) = relative.components().next() else {
+        return false;
+    };
+    let Component::Normal(name) = first else {
+        return true;
+    };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    // Windows folds trailing dots and spaces onto the bare name.
+    let name = name.trim_end_matches(['.', ' ']);
+    matches!(name, "saves")
+}
+
+/// Remove a directory only when it resolves inside `base`. A `versions` or
+/// `saves` folder that is a junction to another disk would otherwise make
+/// `remove_dir_all` delete files outside the data directory.
+pub fn remove_dir_within(base: &Path, target: &Path) -> io::Result<()> {
+    let resolve = |path: &Path| {
+        path.canonicalize()
+            .map(|resolved| simplify_path(&resolved))
+            .unwrap_or_else(|_| simplify_path(path))
+    };
+    let base = resolve(base);
+    let target = resolve(target);
+    if !target.starts_with(&base) || target == base {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is outside {}", target.display(), base.display()),
+        ));
+    }
+    match fs::remove_dir_all(&target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Reject absolute paths, `..`, prefixes and drive letters.
@@ -598,17 +725,18 @@ mod tests {
 
     #[test]
     fn recognises_and_purges_our_backups() {
-        assert!(is_backup_name("a.jar.bak"));
+        assert!(!is_backup_name("a.jar.bak"));
         assert!(is_backup_name("a.jar.bak-1700000000"));
         assert!(is_backup_name("a.jar.bak-1700000000-2"));
         assert!(is_backup_name("launcher.broken-1700000000"));
         assert!(!is_backup_name("a.jar"));
         assert!(!is_backup_name("a.baker"));
+        assert!(!is_backup_name("a.jar.bak-20240101"));
         let dir = std::env::temp_dir().join(format!("tntl-backups-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("instances/x")).unwrap();
         fs::write(dir.join("instances/x/options.txt"), b"keep").unwrap();
-        for stamp in 1..=3 {
+        for stamp in [1_700_000_000_u64, 1_700_000_100, 1_700_000_200] {
             fs::write(dir.join(format!("instances/x/options.txt.bak-{stamp}")), b"old").unwrap();
         }
         let report = purge_backups(&dir, 1, std::time::Duration::ZERO).unwrap();

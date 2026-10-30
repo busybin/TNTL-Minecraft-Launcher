@@ -17,6 +17,7 @@ const fr: Record<string, string> = {
   'firstRun.existing': 'Ce dossier contient déjà {count} instance(s).',
   'firstRun.empty': 'Un dossier du lanceur sera créé ici.',
   'firstRun.gameDir': "C'est un dossier de jeu : choisissez d'abord un dossier de données, puis utilisez Importer.",
+  'firstRun.chooseDataDir': 'Choisir le dossier de données',
   'firstRun.unwritable': "Ce dossier n'est pas accessible en écriture.",
   'firstRun.migrate': 'Reprendre les anciennes données et nettoyer ses réglages',
   'firstRun.migrateBody': "Une ancienne version stockait ses données dans {path}. La reprise sauvegarde les réglages, conserve toutes les instances et place les dossiers de jeu dans la liste d'importation.",

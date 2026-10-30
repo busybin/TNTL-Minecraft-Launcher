@@ -19,7 +19,26 @@ use zip::write::SimpleFileOptions;
 
 use crate::{INSTANCE_FILE, Instance};
 
-const SKIP: &[&str] = &["natives", "logs", "crash-reports", "backups"];
+/// Regenerable data and another launcher's private metadata. A shared zip of
+/// an imported `.minecraft` used to carry the vanilla launcher's account and
+/// profile files.
+const SKIP: &[&str] = &[
+    "natives",
+    "logs",
+    "crash-reports",
+    "backups",
+    "launcher_accounts.json",
+    "launcher_profiles.json",
+    "launcher_profiles_microsoft_store.json",
+    "realms_persistence.json",
+    "usercache.json",
+    "accounts.json",
+    "launcher.json",
+    "hidden.json",
+    "options.txt.tntl-bak",
+    ".tntl-skin.sha1",
+    "tntl-skin.zip",
+];
 const GAME_PREFIX: &str = "minecraft";
 
 #[derive(Debug, Error)]
@@ -216,6 +235,11 @@ pub fn export(instance_dir: &Path, target: &Path) -> Result<ArchiveReport, Archi
     add_tree(&mut zip, instance_dir, "", skip, options, &mut files, &mut bytes)?;
     if game_dir != instance_dir && game_dir.is_dir() {
         add_tree(&mut zip, &game_dir, GAME_PREFIX, None, options, &mut files, &mut bytes)?;
+        // A version-isolated import keeps mods and saves in
+        // `<root>/versions/<id>`; the version JSONs live next to it in the
+        // shared root. Without them the restored copy looks for a version it
+        // cannot find and refuses to start.
+        add_version_chain(&mut zip, &game_dir, options, &mut files, &mut bytes)?;
     }
     zip.finish().map_err(|error| ArchiveError::Zip(error.to_string()))?;
     fs::rename(&temporary, target).map_err(|error| io_err(target, error))?;
@@ -224,6 +248,48 @@ pub fn export(instance_dir: &Path, target: &Path) -> Result<ArchiveReport, Archi
         files,
         bytes,
     })
+}
+
+/// Copy the `inheritsFrom` chain of an isolated game directory into the
+/// archive under `minecraft/versions/`. `import` then points the instance at
+/// its own `minecraft/` and the normal installer fills in libraries/assets.
+fn add_version_chain(
+    zip: &mut zip::ZipWriter<BufWriter<File>>,
+    game_dir: &Path,
+    options: SimpleFileOptions,
+    files: &mut usize,
+    bytes: &mut u64,
+) -> Result<(), ArchiveError> {
+    let Some(versions) = game_dir
+        .parent()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "versions"))
+        .and_then(|dir| dir.parent())
+        .map(|root| root.join("versions"))
+    else {
+        return Ok(());
+    };
+    let mut current = game_dir.file_name().map(|name| name.to_string_lossy().to_string());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = current {
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        let json = versions.join(&id).join(format!("{id}.json"));
+        let Ok(bytes_read) = fs::read(&json) else {
+            break;
+        };
+        let name = format!("{GAME_PREFIX}/versions/{id}/{id}.json");
+        zip.start_file(name, options)
+            .map_err(|error| ArchiveError::Zip(error.to_string()))?;
+        zip.write_all(&bytes_read).map_err(|error| io_err(&json, error))?;
+        *files += 1;
+        *bytes += bytes_read.len() as u64;
+        current = serde_json::from_slice::<serde_json::Value>(&bytes_read)
+            .ok()
+            .and_then(|value| value.get("inheritsFrom")?.as_str().map(str::to_string))
+            .filter(|parent| !parent.is_empty());
+    }
+    Ok(())
 }
 
 /// Extract an archive into `instances_dir/name` and return the new directory.

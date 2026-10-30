@@ -3974,6 +3974,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tntl-source",
+ "tntl-store",
 ]
 
 [[package]]

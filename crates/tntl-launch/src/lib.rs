@@ -323,25 +323,55 @@ fn pump<R: Read + Send + 'static>(
     sink: Option<LineSink>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        /// A mod that prints without a newline must not grow this process's
+        /// heap until it is killed; keep the start of the line and discard the
+        /// rest.
+        const MAX_LINE: usize = 64 * 1024;
+        /// The game log is rewritten from the start once it reaches this size;
+        /// crash diagnostics only need the tail.
+        const MAX_LOG: u64 = 64 * 1024 * 1024;
         let mut reader = BufReader::new(reader);
         let mut buffer = Vec::new();
+        let mut discard = Vec::new();
         loop {
             buffer.clear();
-            match reader.read_until(b'\n', &mut buffer) {
+            let mut truncated = false;
+            match reader.by_ref().take(MAX_LINE as u64).read_until(b'\n', &mut buffer) {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
+            }
+            if buffer.last() != Some(&b'\n') && buffer.len() >= MAX_LINE {
+                truncated = true;
+                // Drain the rest of this oversized line without keeping it.
+                loop {
+                    discard.clear();
+                    match reader.read_until(b'\n', &mut discard) {
+                        Ok(0) => break,
+                        Ok(_) if discard.last() == Some(&b'\n') => break,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
             }
             while matches!(buffer.last(), Some(b'\n' | b'\r')) {
                 buffer.pop();
             }
             // The JVM on Windows writes the console code page, not UTF-8; a
             // single invalid line must not stop the log pump.
-            let line = String::from_utf8_lossy(&buffer);
+            let mut line = String::from_utf8_lossy(&buffer).into_owned();
+            if truncated {
+                line.push_str(" …[line truncated]");
+            }
             {
                 let mut file = log.lock().unwrap_or_else(|poison| poison.into_inner());
                 let _ = writeln!(file, "{line}");
+                if file.metadata().map(|meta| meta.len() > MAX_LOG).unwrap_or(false) {
+                    let _ = file.set_len(0);
+                    let _ = file.seek(SeekFrom::Start(0));
+                }
             }
             if let Some(sink) = &sink {
                 sink(&line);

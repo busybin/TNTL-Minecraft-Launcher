@@ -71,7 +71,7 @@ pub fn list(game_dir: &Path) -> Result<Vec<CrashReport>, CrashError> {
 
 /// Read one report. Only a file name is accepted, never a path.
 pub fn read(game_dir: &Path, file: &str) -> Result<String, CrashError> {
-    if file.is_empty() || file.contains('/') || file.contains('\\') || file == ".." {
+    if !tntl_store::valid_file_name(file) {
         return Err(CrashError::Invalid(file.to_string()));
     }
     let path = reports_dir(game_dir).join(file);
@@ -92,7 +92,7 @@ pub fn read(game_dir: &Path, file: &str) -> Result<String, CrashError> {
 
 /// Delete one report.
 pub fn delete(game_dir: &Path, file: &str) -> Result<(), CrashError> {
-    if file.is_empty() || file.contains('/') || file.contains('\\') || file == ".." {
+    if !tntl_store::valid_file_name(file) {
         return Err(CrashError::Invalid(file.to_string()));
     }
     let path = reports_dir(game_dir).join(file);

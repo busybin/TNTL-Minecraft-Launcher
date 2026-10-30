@@ -17,6 +17,7 @@ const ja: Record<string, string> = {
   'firstRun.existing': 'このフォルダーには既に {count} 個のインスタンスがあります。',
   'firstRun.empty': 'ここにランチャーのフォルダーを作成します。',
   'firstRun.gameDir': 'ゲームのフォルダーです。先にデータフォルダーを選び、その後「インポート」で追加してください。',
+  'firstRun.chooseDataDir': 'データフォルダーを選ぶ',
   'firstRun.unwritable': 'このフォルダーには書き込めません。',
   'firstRun.migrate': '古いデータを引き継いで設定を整理する',
   'firstRun.migrateBody': '以前のバージョンは {path} にデータを保存していました。引き継ぐと設定をバックアップし、すべてのインスタンスを残したまま、ゲームのフォルダーをインポート一覧に移します。',

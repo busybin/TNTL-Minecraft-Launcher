@@ -286,6 +286,14 @@ impl Ftb {
                                 Some(FtbError::Invalid(format!("unsafe file path: {}", file.path)));
                             break;
                         };
+                        // A pack file list must not replace the player's
+                        // worlds; overrides are filtered the same way.
+                        if tntl_store::is_protected_game_path(&relative) {
+                            *failure.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(FtbError::Invalid(
+                                format!("pack file points into saves/: {}", file.path),
+                            ));
+                            break;
+                        }
                         let dest = tntl_store::target_respecting_disabled(&game_dir.join(&relative));
                         if !dest.starts_with(game_dir) {
                             *failure.lock().unwrap_or_else(|poison| poison.into_inner()) =

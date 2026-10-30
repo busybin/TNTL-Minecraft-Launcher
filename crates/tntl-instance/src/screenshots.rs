@@ -69,7 +69,7 @@ pub fn list(game_dir: &Path) -> Result<Vec<Screenshot>, ScreenshotError> {
 }
 
 fn checked_path(game_dir: &Path, file: &str) -> Result<PathBuf, ScreenshotError> {
-    if file.is_empty() || file.contains('/') || file.contains('\\') || file == ".." {
+    if !tntl_store::valid_file_name(file) {
         return Err(ScreenshotError::Invalid(file.to_string()));
     }
     Ok(screenshots_dir(game_dir).join(file))

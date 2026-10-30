@@ -122,6 +122,15 @@ function finish() {
         >
           {{ t("firstRun.use") }}
         </button>
+        <button
+          v-else-if="gamePath"
+          class="primary"
+          type="button"
+          :disabled="busy"
+          @click="pick"
+        >
+          {{ t("firstRun.chooseDataDir") }}
+        </button>
 
         <div v-if="props.legacy" class="legacy">
           <p class="muted">{{ t("firstRun.migrateBody", { path: props.legacy }) }}</p>

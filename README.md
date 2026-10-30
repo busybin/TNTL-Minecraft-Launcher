@@ -147,12 +147,11 @@ server where the other players also use default skins.
 The interface ships in English, Chinese, Spanish, French, Arabic (right to
 left), Portuguese, Russian and Japanese; pick one under Settings.
 
-The data directory defaults to the platform data dir (`~/.local/share/tntl`
-on Linux, `%APPDATA%\tntl` on Windows). Override it with `--root` or
-`TNTL_ROOT`. `tntl import <path-to-.minecraft>` registers an existing installation
-instead of downloading. Pointing `tntl import` at a Prism Launcher or MultiMC
-instance folder copies its game directory and installs the version and loader
-from `mmc-pack.json`.
+The first start asks where the data directory should live and writes nothing
+before you pick one; `--root` or `TNTL_ROOT` preselects a path. `tntl import
+<path-to-.minecraft>` registers an existing installation instead of downloading.
+Pointing `tntl import` at a Prism Launcher or MultiMC instance folder copies its
+game directory and installs the version and loader from `mmc-pack.json`.
 
 ## License
 

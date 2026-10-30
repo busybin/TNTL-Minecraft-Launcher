@@ -275,7 +275,7 @@ pub fn delete(game_dir: &Path, world: &str) -> Result<(), WorldError> {
             "{world} has no level.dat, so it is not a world"
         )));
     }
-    fs::remove_dir_all(&path).map_err(|error| io_err(&path, error))
+    tntl_store::remove_dir_within(game_dir, &path).map_err(|error| io_err(&path, error))
 }
 
 /// Delete one world backup archive.
@@ -402,7 +402,7 @@ fn world_path(game_dir: &Path, world: &str) -> Result<PathBuf, WorldError> {
 }
 
 fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
+    tntl_store::valid_file_name(name)
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<(), WorldError> {

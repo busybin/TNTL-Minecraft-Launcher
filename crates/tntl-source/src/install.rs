@@ -277,20 +277,16 @@ impl<'a> Installer<'a> {
         })?;
         // Keep a hand-fixed or other-launcher JSON instead of overwriting it.
         // Copy rather than rename: if the write below fails, the original must
-        // still be at the path the launcher reads.
+        // still be at the path the launcher reads. The backup uses the
+        // `*.bak-<unix>` shape so the startup purge recognises it as its own.
         let target = self.roots.version_json(&summary.id);
-        if target.is_file() {
-            let mut backup = target.as_os_str().to_os_string();
-            backup.push(".bak");
-            let backup = std::path::PathBuf::from(backup);
-            if !backup.exists()
-                && let Err(error) = std::fs::copy(&target, &backup)
-            {
-                return Err(SourceError::Io {
-                    path: backup,
-                    source: error,
-                });
-            }
+        if target.is_file()
+            && let Err(error) = tntl_store::backup_copy(&target)
+        {
+            return Err(SourceError::Io {
+                path: target,
+                source: error,
+            });
         }
         tntl_store::atomic_write(&self.roots.version_json(&summary.id), &body)?;
         Ok(json)

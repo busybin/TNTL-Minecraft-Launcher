@@ -17,6 +17,7 @@ const zh: Record<string, string> = {
   'firstRun.existing': '这个文件夹里已有 {count} 个实例。',
   'firstRun.empty': '将在这里创建启动器目录。',
   'firstRun.gameDir': '这是游戏目录：请先选一个数据目录，再用「导入」把它加进来。',
+  'firstRun.chooseDataDir': '选择数据目录',
   'firstRun.unwritable': '这个文件夹不可写。',
   'firstRun.migrate': '接管旧数据并清理旧设置',
   'firstRun.migrateBody': '旧版本的数据在 {path}。接管会先备份设置、保留所有实例，并把游戏目录移到待导入列表。',

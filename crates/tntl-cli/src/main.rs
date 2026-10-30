@@ -1823,7 +1823,14 @@ fn cmd_launch(
     let log_path = instance_dir.join("logs").join(format!("{}.log", timestamp()));
     let mut options = LaunchOptions::new(&log_path);
     options.echo = echo;
-    let process = tntl_launch::launch(&plan, &options)?;
+    launcher.claim_running(name, std::process::id())?;
+    let process = match tntl_launch::launch(&plan, &options) {
+        Ok(process) => process,
+        Err(error) => {
+            launcher.clear_running(name);
+            return Err(error.into());
+        }
+    };
     launcher.mark_running(name, process.id())?;
     println!("launched {} (pid {})", instance.version_id, process.id());
     println!("log: {}", log_path.display());

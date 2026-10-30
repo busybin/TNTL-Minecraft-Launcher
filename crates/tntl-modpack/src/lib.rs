@@ -187,6 +187,14 @@ fn download_files(
     for (files_done, file) in files.iter().enumerate() {
         let relative = safe_relative(&file.path)
             .ok_or_else(|| ModpackError::Invalid(format!("unsafe file path: {}", file.path)))?;
+        // The override extractor already skips `saves/`; the index file list
+        // must reject it too, or a repair overwrites the player's worlds.
+        if tntl_store::is_protected_game_path(&relative) {
+            return Err(ModpackError::Invalid(format!(
+                "pack file points into saves/: {}",
+                file.path
+            )));
+        }
         let dest = tntl_store::target_respecting_disabled(&game_dir.join(&relative));
         if !dest.starts_with(game_dir) {
             return Err(ModpackError::Invalid(format!("unsafe file path: {}", file.path)));
@@ -318,6 +326,18 @@ const EXPORT_SKIP: &[&str] = &[
     "libraries",
     "assets",
     ".mixin.out",
+    // Another launcher's account/profile metadata and our own sidecars.
+    "launcher_accounts.json",
+    "launcher_profiles.json",
+    "launcher_profiles_microsoft_store.json",
+    "realms_persistence.json",
+    "accounts.json",
+    "launcher.json",
+    "hidden.json",
+    "servers.dat_old",
+    "options.txt.tntl-bak",
+    ".tntl-skin.sha1",
+    "tntl-skin.zip",
 ];
 
 /// Write an instance's game directory as a `.mrpack`.
@@ -530,11 +550,7 @@ impl Modpack {
                 }
                 // Worlds are the player's, not the pack's: an override that
                 // ships `saves/...` would replace an existing world.
-                let first = relative
-                    .components()
-                    .next()
-                    .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase());
-                if first.as_deref() == Some("saves") {
+                if tntl_store::is_protected_game_path(&relative) {
                     eprintln!("skipping pack override into saves/: {name}");
                     continue;
                 }

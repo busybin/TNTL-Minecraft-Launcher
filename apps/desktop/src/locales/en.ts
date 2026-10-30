@@ -17,6 +17,7 @@ const en: Record<string, string> = {
   'firstRun.existing': 'This folder already holds {count} instance(s).',
   'firstRun.empty': 'A launcher directory will be created here.',
   'firstRun.gameDir': 'This is a game directory: pick a data directory first, then use Import to add it.',
+  'firstRun.chooseDataDir': 'Choose the data directory',
   'firstRun.unwritable': 'This folder is not writable.',
   'firstRun.migrate': 'Take over the old data and clean up its settings',
   'firstRun.migrateBody': 'An older build kept its data in {path}. Taking it over backs up the settings, keeps every instance and moves game directories to the import list.',

@@ -12,7 +12,7 @@ import {
 import Icon from "../components/Icon.vue";
 import { t } from "../i18n";
 
-const emit = defineEmits<{ close: []; imported: [names: string[]] }>();
+const emit = defineEmits<{ close: []; imported: [names: string[], failures?: string[]] }>();
 const props = defineProps<{ initialPath?: string }>();
 
 const path = ref(props.initialPath ?? "");
@@ -115,9 +115,9 @@ async function run() {
     // A Prism/MultiMC instance, or a game directory with several versions:
     // register everything the user ticked, each as its own instance.
     if (isPrism.value || selected.value.length > 1) {
-      const names = await api.importAddedPath(target, isPrism.value ? [] : selected.value);
-      if (!names.length) throw new Error(t("import.nothingAdded"));
-      emit("imported", names);
+      const report = await api.importAddedPath(target, isPrism.value ? [] : selected.value);
+      if (!report.added.length) throw new Error(report.failures.join("; ") || t("import.nothingAdded"));
+      emit("imported", report.added, report.failures);
       return;
     }
     const single = selected.value[0] ?? version.value.trim() ?? null;

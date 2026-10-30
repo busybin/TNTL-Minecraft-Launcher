@@ -425,11 +425,14 @@ function openImport(initial = "") {
   importOpen.value = true;
 }
 
-function onImported(names: string[]) {
+function onImported(names: string[], failures: string[] = []) {
   importOpen.value = false;
-  notify(names.length === 1
+  const message = names.length === 1
     ? t("app.imported", { name: names[0] })
-    : t("app.importedMany", { count: names.length }));
+    : t("app.importedMany", { count: names.length });
+  // Versions that were ticked but could not be registered must be visible;
+  // the old code only wrote them to the terminal.
+  notify(failures.length ? `${message} — ${failures.join("; ")}` : message);
   refresh();
 }
 
@@ -700,7 +703,10 @@ onMounted(async () => {
   }
   applyTheme(settings.value.theme);
   followSystemTheme();
-  onboardingOpen.value = !settings.value.onboarded;
+  // The wizard is a first-run thing. `bootstrap.onboarded` survives a data
+  // directory switch, while a brand-new root has no `launcher.json` yet (its
+  // default would show the wizard again on the second start).
+  onboardingOpen.value = !(session.value?.onboarded || settings.value.onboarded);
   for (const listen of [
     () => events.onGameLine((line) => pushLine(line)),
     () =>

@@ -776,7 +776,7 @@ export const api = {
   chooseDataRoot: (path: string) => invoke<PathInfo>("choose_data_root", { path }),
   migrateLegacy: () => invoke<MigrationReport>("migrate_legacy"),
   importAddedPath: (path: string, versions: string[]) =>
-    invoke<string[]>("import_added_path", { path, versions }),
+    invoke<{ added: string[]; failures: string[] }>("import_added_path", { path, versions }),
   updateCheck: () => invoke<UpdateStatus>("update_check"),
   updateDownload: (asset: UpdateAsset) => invoke<string>("update_download", { asset }),
   updateApply: (path: string) => invoke<string>("update_apply", { path }),

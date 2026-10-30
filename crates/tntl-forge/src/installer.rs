@@ -729,7 +729,18 @@ fn run_java(java: &Path, classpath: &[PathBuf], main: &str, args: &[String], cwd
     let log = File::create(&log_path).map_err(|source| io(&log_path, source))?;
     let errors = log.try_clone().map_err(|source| io(&log_path, source))?;
     let mut command = Command::new(java);
+    // Processors print mod names and paths; a non-UTF-8 console codepage on
+    // Windows (or a locale-specific default on Linux) turned those into
+    // mojibake in the error tail. Java 18+ reads the two `stdout`/`stderr`
+    // properties, older builds the `sun.*` pair.
     command
+        .args([
+            "-Dfile.encoding=UTF-8",
+            "-Dsun.stdout.encoding=UTF-8",
+            "-Dsun.stderr.encoding=UTF-8",
+            "-Dstdout.encoding=UTF-8",
+            "-Dstderr.encoding=UTF-8",
+        ])
         .arg("-cp")
         .arg(joined)
         .arg(main)

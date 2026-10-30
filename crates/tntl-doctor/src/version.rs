@@ -66,7 +66,7 @@ pub fn any_matches_series(version: &str, ranges: &[String]) -> Option<bool> {
     if ranges.is_empty() {
         return Some(true);
     }
-    let series = series_of(version)?;
+    let series = series_of(version);
     let mut understood = false;
     for range in ranges {
         let range = range.trim();
@@ -78,11 +78,69 @@ pub fn any_matches_series(version: &str, ranges: &[String]) -> Option<bool> {
             return Some(true);
         }
         understood = true;
-        if series_in(series, range) {
-            return Some(true);
+        if is_series_idiom(range) {
+            if series.is_some_and(|series| series_in(series, range)) {
+                return Some(true);
+            }
+            continue;
+        }
+        // Any other range is a normal Maven range: `[1.21.1,1.21.2)` means
+        // exactly 1.21.1, not "every 1.21.x". A bound that cannot be parsed is
+        // unknown, and unknown never blocks.
+        match matches(version, range) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => return Some(true),
         }
     }
     understood.then_some(false)
+}
+
+/// `[1.21,1.21.1)` (and `[1.21,1.21)`) is how Forge-family metadata spells
+/// "1.21.x": the lower bound is a series with no patch and the upper bound is
+/// that same series with at most a patch of 1. Only this exact shape gets the
+/// series-lenient comparison.
+fn is_series_idiom(range: &str) -> bool {
+    let Some(body) = range.get(1..range.len().saturating_sub(1)) else {
+        return false;
+    };
+    let Some((lower, upper)) = body.split_once(',') else {
+        return false;
+    };
+    let Some((low, low_patch)) = series_and_patch(lower.trim()) else {
+        return false;
+    };
+    let Some((high, high_patch)) = series_and_patch(upper.trim()) else {
+        return false;
+    };
+    low == high && low_patch.unwrap_or(0) == 0 && high_patch.is_none_or(|patch| patch <= 1)
+}
+
+fn series_and_patch(text: &str) -> Option<((u64, u64), Option<u64>)> {
+    let text = text.trim().trim_start_matches('v');
+    let mut parts = text.split(['.', '-', '+', '_']);
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor_text = parts.next()?;
+    // `1.21z` is how some Forge mods spell "any 1.21 build": the letters are a
+    // build marker, not another minor.
+    let digits: String = minor_text.chars().take_while(char::is_ascii_digit).collect();
+    let minor = digits.parse::<u64>().ok()?;
+    let tail = &minor_text[digits.len()..];
+    if !tail.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    let patch = match parts.next() {
+        Some(text) => {
+            let digits: String = text.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() {
+                None
+            } else {
+                Some(digits.parse::<u64>().ok()?)
+            }
+        }
+        None => None,
+    };
+    Some(((major, minor), patch))
 }
 
 fn series_of(text: &str) -> Option<(u64, u64)> {
@@ -130,10 +188,11 @@ fn maven_range(version: &str, range: &str) -> Option<bool> {
     if range.len() < 2 {
         return None;
     }
-    let bytes = range.as_bytes();
-    let lower_inclusive = *bytes.first()? == b'[';
-    let upper_inclusive = *bytes.last()? == b']';
-    let body = &range[1..range.len() - 1];
+    let lower_inclusive = range.starts_with('[');
+    let upper_inclusive = range.ends_with(']');
+    // `get` returns `None` instead of panicking when the last character is not
+    // ASCII (a malformed range such as `[1.21é`).
+    let body = range.get(1..range.len().saturating_sub(1))?;
     let version = Version::parse(version)?;
     if !body.contains(',') {
         // `[1.20.1]` pins one version.
@@ -238,6 +297,9 @@ struct Version {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Part {
     Number(u64),
+    /// A letter glued to a number (`1.1.25a`): a build of the same release,
+    /// not a pre-release.
+    Suffix(String),
     Text(String),
 }
 
@@ -269,7 +331,7 @@ impl Version {
                     parts.push(Part::Number(number));
                     let rest: String = chunk[digits.len()..].to_ascii_lowercase();
                     if !rest.is_empty() {
-                        parts.push(Part::Text(rest));
+                        parts.push(Part::Suffix(rest));
                     }
                 }
                 _ => parts.push(Part::Text(chunk.to_ascii_lowercase())),
@@ -295,6 +357,17 @@ impl Version {
                     Ordering::Equal => {}
                     ordering => return ordering,
                 },
+                (Some(Part::Suffix(left)), Some(Part::Suffix(right))) => match left.cmp(right) {
+                    Ordering::Equal => {}
+                    ordering => return ordering,
+                },
+                // A build letter is invisible to version bounds: `1.1.25a`
+                // satisfies `[1.1.25,)` and `[1.1.25,1.2)`.
+                (Some(Part::Suffix(_)), None) | (None, Some(Part::Suffix(_))) => {}
+                (Some(Part::Suffix(_)), Some(Part::Text(_))) => return Ordering::Greater,
+                (Some(Part::Text(_)), Some(Part::Suffix(_))) => return Ordering::Less,
+                (Some(Part::Suffix(_)), Some(Part::Number(_))) => return Ordering::Less,
+                (Some(Part::Number(_)), Some(Part::Suffix(_))) => return Ordering::Greater,
                 // A release is newer than its pre-release (`1.20` > `1.20-pre1`).
                 (Some(Part::Number(_)), Some(Part::Text(_))) => return Ordering::Greater,
                 (Some(Part::Text(_)), Some(Part::Number(_))) => return Ordering::Less,
@@ -321,7 +394,7 @@ impl Version {
             .iter()
             .map_while(|part| match part {
                 Part::Number(number) => Some(*number),
-                Part::Text(_) => None,
+                Part::Suffix(_) | Part::Text(_) => None,
             })
             .collect()
     }
@@ -414,7 +487,7 @@ mod tests {
         yes("1.1.25a", ">=1.1.20");
         no("1.1.19a", ">=1.1.20");
         yes("2.0.0b", ">=1.9.9");
-        no("1.1.25a", "[1.1.25,)");
+        yes("1.1.25a", "[1.1.25,)");
         yes("1.1.25a", "[1.1.25a,)");
         // A dotted pre-release keeps sorting below the release itself.
         no("1.20-pre1", ">=1.20");
@@ -450,6 +523,7 @@ mod tests {
         yes_series("1.21.1", "[1.21,1.21z)");
         yes_series("1.21.1", "1.21");
         yes_series("1.21.1", "[1.21.1,1.21.2)");
+        no_series("1.21.4", "[1.21.1,1.21.2)");
         yes_series("1.21.1", "[1.20.5,)");
         no_series("1.21.1", "[1.20.1]");
         no_series("1.21.1", "[1.22,)");

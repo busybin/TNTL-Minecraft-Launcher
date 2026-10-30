@@ -52,21 +52,23 @@ pub fn save_bootstrap(bootstrap: &Bootstrap) -> Result<(), String> {
     tntl_store::atomic_write_json(&path, bootstrap).map_err(|error| error.to_string())
 }
 
-/// The directory the user picked, if it still exists.
+/// The directory the user picked, if it still exists and still looks like a
+/// data directory. A stale pointer at `$HOME` must not make the launcher think
+/// it is configured: the next start would write into it.
 pub fn configured_root() -> Option<PathBuf> {
-    load_bootstrap()
-        .root
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .map(|path| tntl_store::simplify_path(&path))
+    let path = load_bootstrap().root.map(PathBuf::from)?;
+    let path = tntl_store::simplify_path(&path);
+    let ours = path.join(tntl_app::ROOT_MARKER).is_file()
+        || path.join("launcher.json").is_file()
+        || path.join("hidden.json").is_file()
+        || count_instances(&path) > 0;
+    (path.is_dir() && ours).then_some(path)
 }
 
 /// Placeholder used while no data directory is chosen. Nothing is written there
 /// unless a command slips past the first-run guide.
 pub fn unconfigured_root() -> PathBuf {
-    bootstrap_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("unconfigured")
+    bootstrap_dir().unwrap_or_else(std::env::temp_dir).join("unconfigured")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,21 +174,19 @@ pub fn classify(path: &Path) -> PathInfo {
     }
     info.instances = count_instances(&path);
     let has = |name: &str| path.join(name).exists();
+    // Prism/MultiMC use `accounts.json` too, so it is not proof that this is
+    // ours; check their layout first.
+    if has("mmc-pack.json") || has_prism_instances(&path) {
+        info.kind = "prism".to_string();
+        return info;
+    }
     // Our own files settle it, even when every instance was removed: a data
     // directory keeps shared `versions/`, which would otherwise look like a
     // game directory.
-    let ours = has(tntl_app::ROOT_MARKER)
-        || info.instances > 0
-        || has("launcher.json")
-        || has("accounts.json")
-        || has("hidden.json");
+    let ours = has(tntl_app::ROOT_MARKER) || info.instances > 0 || has("launcher.json") || has("hidden.json");
     if ours {
         info.kind = "data".to_string();
         info.writable = writable(&path);
-        return info;
-    }
-    if has("mmc-pack.json") || has_prism_instances(&path) {
-        info.kind = "prism".to_string();
         return info;
     }
     if has("versions") {
@@ -298,14 +298,12 @@ pub fn legacy_root() -> Option<PathBuf> {
     if let Some(dir) = dirs::data_local_dir() {
         candidates.push(dir.join("tntl"));
     }
-    candidates
-        .into_iter()
-        .find(|path| {
-            path.is_dir()
-                && (path.join("launcher.json").is_file()
-                    || path.join("instances").is_dir()
-                    || path.join(tntl_app::ROOT_MARKER).is_file())
-        })
+    candidates.into_iter().find(|path| {
+        path.is_dir()
+            && (path.join("launcher.json").is_file()
+                || path.join("instances").is_dir()
+                || path.join(tntl_app::ROOT_MARKER).is_file())
+    })
 }
 
 /// One-time clean-up of the settings older builds left behind. Instances are

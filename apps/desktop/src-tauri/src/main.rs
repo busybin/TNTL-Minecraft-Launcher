@@ -25,6 +25,9 @@ struct AppState {
     game: Mutex<Option<RunningGame>>,
     /// One launch at a time: two Play clicks used to spawn two games.
     launching: std::sync::atomic::AtomicBool,
+    /// Set by the frontend once it has mounted. The watchdog uses it to tell a
+    /// slow first paint from a dead WebView.
+    frontend_ready: std::sync::atomic::AtomicBool,
 }
 
 struct RunningGame {
@@ -129,8 +132,12 @@ fn roots(state: State<'_, AppState>) -> RootsResponse {
 /// so the frontend can route a game directory to the import dialog instead of
 /// switching to it.
 #[tauri::command]
-fn path_info(path: String) -> store::PathInfo {
-    store::classify(Path::new(&path))
+async fn path_info(path: String) -> store::PathInfo {
+    // `canonicalize`/`read_dir` on a sleeping UNC path blocks for the network
+    // timeout; never do that on the UI thread.
+    tauri::async_runtime::spawn_blocking(move || store::classify(Path::new(&path)))
+        .await
+        .unwrap_or_else(|_| store::classify(Path::new("")))
 }
 
 #[derive(Serialize)]
@@ -146,131 +153,162 @@ struct Session {
 }
 
 #[tauri::command]
-fn session(state: State<'_, AppState>) -> Session {
-    let configured = state
-        .configured
-        .load(std::sync::atomic::Ordering::Relaxed);
+async fn session(state: State<'_, AppState>) -> Result<Session, String> {
+    let configured = state.configured.load(std::sync::atomic::Ordering::Relaxed);
     let root = state
         .root
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .display()
         .to_string();
-    let bootstrap = store::load_bootstrap();
-    let missing = store::load_roots()
-        .roots
-        .into_iter()
-        .filter(|entry| !Path::new(entry).is_dir())
-        .collect();
-    Session {
+    let threaded_root = root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bootstrap = store::load_bootstrap();
+        let missing = store::load_roots()
+            .roots
+            .into_iter()
+            .filter(|entry| !Path::new(entry).is_dir())
+            .collect();
+        Ok(Session {
+            configured,
+            root: threaded_root,
+            onboarded: bootstrap.onboarded,
+            legacy: store::legacy_root().map(|path| path.display().to_string()),
+            missing,
+        })
+    })
+    .await
+    .unwrap_or(Ok(Session {
         configured,
         root,
-        onboarded: bootstrap.onboarded,
-        legacy: store::legacy_root().map(|path| path.display().to_string()),
-        missing,
-    }
+        onboarded: true,
+        legacy: None,
+        missing: Vec::new(),
+    }))
 }
 
 /// Adopt a directory as the data directory. Refuses another launcher's game
 /// directory; those have to go through Import.
 #[tauri::command]
-fn choose_data_root(state: State<'_, AppState>, path: String) -> Result<store::PathInfo, String> {
+async fn choose_data_root(state: State<'_, AppState>, path: String) -> Result<store::PathInfo, String> {
     if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
         return Err("close the running game before switching directories".to_string());
     }
-    let canonical = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path));
-    let path = tntl_store::simplify_path(&canonical);
-    if !path.exists() {
-        std::fs::create_dir_all(&path)
-            .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-    }
-    if is_network_path(&path) {
-        return Err(format!(
-            "{} is a network path; the data directory (and the account file in it) must be local",
-            path.display()
-        ));
-    }
-    let info = store::classify(&path);
-    match info.kind.as_str() {
-        "data" | "empty" => {}
-        "foreign" => {
+    let (path, info) = tauri::async_runtime::spawn_blocking(move || -> Result<(PathBuf, store::PathInfo), String> {
+        let canonical = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path));
+        let path = tntl_store::simplify_path(&canonical);
+        // Check the protocol *before* touching the path: `create_dir_all` on a
+        // dead UNC share blocks the caller and creates the front-run delay
+        // this command is supposed to avoid.
+        if is_network_path(&path) {
             return Err(format!(
-                "{} is not empty and is not a launcher directory; pick an empty folder or use Import",
-                info.path
+                "{} is a network path; the data directory (and the account file in it) must be local",
+                path.display()
             ));
         }
-        _ => {
-            return Err(format!(
-                "{} is a game directory, not a data directory; use Import to add it",
-                info.path
-            ));
+        if !path.exists() {
+            std::fs::create_dir_all(&path).map_err(|error| format!("cannot create {}: {error}", path.display()))?;
         }
-    }
-    if !info.writable {
-        return Err(format!("{} is not writable", info.path));
-    }
+        let info = store::classify(&path);
+        match info.kind.as_str() {
+            "data" | "empty" => {}
+            "foreign" => {
+                return Err(format!(
+                    "{} is not empty and is not a launcher directory; pick an empty folder or use Import",
+                    info.path
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "{} is a game directory, not a data directory; use Import to add it",
+                    info.path
+                ));
+            }
+        }
+        if !info.writable {
+            return Err(format!("{} is not writable", info.path));
+        }
+        Ok((path, info))
+    })
+    .await
+    .map_err(message)??;
     let launcher = Launcher::from_root(Some(path.clone()));
     launcher
-        .mark_root()
+        .claim_root()
         .map_err(|error| format!("cannot prepare {}: {error:#}", path.display()))?;
-    store::remember_root(&path)?;
-    let mut bootstrap = store::load_bootstrap();
-    bootstrap.schema = 2;
-    bootstrap.root = Some(info.path.clone());
-    bootstrap.onboarded = true;
-    store::save_bootstrap(&bootstrap)?;
+    let info_for_store = info.clone();
+    let path_for_store = path.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        store::remember_root(&path_for_store)?;
+        let mut bootstrap = store::load_bootstrap();
+        bootstrap.schema = 2;
+        bootstrap.root = Some(info_for_store.path.clone());
+        bootstrap.onboarded = true;
+        store::save_bootstrap(&bootstrap)
+    })
+    .await
+    .map_err(message)??;
     *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
-    state
-        .configured
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.configured.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(info)
 }
 
 #[tauri::command]
-fn set_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, String> {
+async fn set_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, String> {
     if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
         return Err("close the running game before switching directories".to_string());
     }
-    let canonical = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path));
-    let path = tntl_store::simplify_path(&canonical);
-    if !path.is_dir() {
-        return Err(format!("{} is not a directory", path.display()));
-    }
-    if is_network_path(&path) {
-        return Err(format!("{} is a network path; pick a local directory", path.display()));
-    }
-    let info = store::classify(&path);
-    if info.kind != "data" && info.kind != "empty" {
-        return Err(format!("{} is not a launcher data directory", info.path));
-    }
+    let (path, info) = tauri::async_runtime::spawn_blocking(move || -> Result<(PathBuf, store::PathInfo), String> {
+        let canonical = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path));
+        let path = tntl_store::simplify_path(&canonical);
+        if !path.is_dir() {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        if is_network_path(&path) {
+            return Err(format!("{} is a network path; pick a local directory", path.display()));
+        }
+        let info = store::classify(&path);
+        if info.kind != "data" && info.kind != "empty" {
+            return Err(format!("{} is not a launcher data directory", info.path));
+        }
+        Ok((path, info))
+    })
+    .await
+    .map_err(message)??;
     let launcher = Launcher::from_root(Some(path.clone()));
     launcher
-        .mark_root()
+        .claim_root()
         .map_err(|error| format!("cannot prepare {}: {error:#}", path.display()))?;
-    store::remember_root(&path)?;
-    let mut bootstrap = store::load_bootstrap();
-    bootstrap.root = Some(info.path.clone());
-    store::save_bootstrap(&bootstrap)?;
+    let info_for_store = info.clone();
+    let path_for_store = path.clone();
+    let roots = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
+        store::remember_root(&path_for_store)?;
+        let mut bootstrap = store::load_bootstrap();
+        bootstrap.root = Some(info_for_store.path.clone());
+        store::save_bootstrap(&bootstrap)?;
+        Ok(store::load_roots().roots)
+    })
+    .await
+    .map_err(message)??;
     *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
-    state
-        .configured
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.configured.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(RootsResponse {
         current: info.path,
-        roots: store::load_roots().roots,
+        roots,
     })
 }
 
 /// Remove a directory from the list. The directory itself is never touched.
 #[tauri::command]
-fn forget_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, String> {
+async fn forget_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, String> {
     if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
         return Err("close the running game before changing directories".to_string());
     }
-    let config = store::forget_root(&path)?;
-    let configured = state
-        .configured
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let path_for_store = path.clone();
+    let config = tauri::async_runtime::spawn_blocking(move || store::forget_root(&path_for_store))
+        .await
+        .map_err(message)??;
+    let configured = state.configured.load(std::sync::atomic::Ordering::Relaxed);
     let mut current = state
         .root
         .lock()
@@ -279,12 +317,7 @@ fn forget_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse
         .to_string();
     if !configured || current == tntl_store::simplify_path(Path::new(&path)).display().to_string() {
         // Do not silently move the user somewhere else: the guide asks again.
-        if let Some(next) = config
-            .roots
-            .iter()
-            .find(|entry| Path::new(entry).is_dir())
-            .cloned()
-        {
+        if let Some(next) = config.roots.iter().find(|entry| Path::new(entry).is_dir()).cloned() {
             // Remember the directory we hand over to, or the next start would
             // read the pointer we just removed and go back there.
             let next_path = PathBuf::from(&next);
@@ -294,12 +327,11 @@ fn forget_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse
             bootstrap.root = Some(next.clone());
             let _ = store::save_bootstrap(&bootstrap);
             *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = next_path;
+            state.configured.store(true, std::sync::atomic::Ordering::Relaxed);
             current = next;
         } else {
             *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = store::unconfigured_root();
-            state
-                .configured
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            state.configured.store(false, std::sync::atomic::Ordering::Relaxed);
             let mut bootstrap = store::load_bootstrap();
             bootstrap.root = None;
             bootstrap.onboarded = false;
@@ -327,10 +359,17 @@ async fn migrate_legacy(state: State<'_, AppState>) -> Result<store::MigrationRe
         .map_err(|error| error.to_string())??;
     let path = PathBuf::from(&report.root);
     *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
-    state
-        .configured
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.configured.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(report)
+}
+
+/// Result of registering several versions at once: `failures` names the ones
+/// that were ticked but not added, so the UI cannot report "imported N" while
+/// silently dropping some.
+#[derive(Serialize)]
+struct ImportReport {
+    added: Vec<String>,
+    failures: Vec<String>,
 }
 
 /// Register versions from an existing game directory, all at once. Nothing is
@@ -341,7 +380,7 @@ async fn import_added_path(
     state: State<'_, AppState>,
     path: String,
     versions: Vec<String>,
-) -> Result<Vec<String>, String> {
+) -> Result<ImportReport, String> {
     if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
         return Err("close the running game before adding instances".to_string());
     }
@@ -355,7 +394,10 @@ async fn import_added_path(
             let instance = launcher
                 .import_prism_instance(&path, None, &progress)
                 .map_err(message)?;
-            return Ok(vec![instance.name]);
+            return Ok(ImportReport {
+                added: vec![instance.name],
+                failures: Vec::new(),
+            });
         }
         let scan = launcher.import_candidates(&path).map_err(message)?;
         // Pointing at `versions/<id>` means that one version, not all of them.
@@ -382,10 +424,7 @@ async fn import_added_path(
         if added.is_empty() && !failures.is_empty() {
             return Err(failures.join("; "));
         }
-        if !failures.is_empty() {
-            eprintln!("partly imported: {}", failures.join("; "));
-        }
-        Ok(added)
+        Ok(ImportReport { added, failures })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1278,8 +1317,24 @@ async fn launch_instance(app: tauri::AppHandle, state: State<'_, AppState>, name
                     let _ = sink_app.emit("game-line", line.to_string());
                 }));
             }
-            let process = start_game(&plan, &options).map_err(message)?;
-            launcher.mark_running(&name, process.id()).map_err(message)?;
+            // Claim the instance with our own pid *before* spawning: another
+            // launcher process or the CLI does the same check, and without
+            // this both could pass `ensure_not_running` and start two games.
+            launcher.claim_running(&name, std::process::id()).map_err(message)?;
+            let process = match start_game(&plan, &options) {
+                Ok(process) => process,
+                Err(error) => {
+                    launcher.clear_running(&name);
+                    return Err(message(error));
+                }
+            };
+            if let Err(error) = launcher.mark_running(&name, process.id()) {
+                // Without a marker a second launch would start a second game;
+                // stop this one instead of running unprotected.
+                process.handle().kill();
+                launcher.clear_running(&name);
+                return Err(message(error));
+            }
             let game_dir = launcher
                 .instance_dir(&name)
                 .map(|dir| instance.game_dir(&dir))
@@ -1351,20 +1406,36 @@ fn start_game(plan: &tntl_resolve::LaunchPlan, options: &LaunchOptions) -> anyho
 
 #[tauri::command]
 fn stop_game(state: State<'_, AppState>) -> Result<bool, String> {
-    let running = state.game.lock().unwrap_or_else(|poison| poison.into_inner());
-    match running.as_ref() {
-        Some(game) => {
+    {
+        let running = state.game.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(game) = running.as_ref() {
             game.handle.kill();
-            Ok(true)
+            return Ok(true);
         }
-        None => Ok(false),
     }
+    // The launcher may have been restarted while the game kept running: the
+    // marker is then the only handle, and without it "Stop" did nothing.
+    let launcher = state_launcher(&state);
+    if let Some((name, _)) = launcher.running_instances().into_iter().next() {
+        launcher.stop_running(&name);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[tauri::command]
 fn running_instance(state: State<'_, AppState>) -> Option<String> {
-    let running = state.game.lock().unwrap_or_else(|poison| poison.into_inner());
-    running.as_ref().map(|game| game.name.clone())
+    {
+        let running = state.game.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(game) = running.as_ref() {
+            return Some(game.name.clone());
+        }
+    }
+    state_launcher(&state)
+        .running_instances()
+        .into_iter()
+        .next()
+        .map(|(name, _)| name)
 }
 
 #[tauri::command]
@@ -2276,7 +2347,8 @@ fn message(error: impl std::fmt::Display) -> String {
 /// The frontend calls this once its views are mounted: the last startup stage
 /// in `launcher.log`. A window that opens but never logs this stays blank.
 #[tauri::command]
-fn frontend_ready() {
+fn frontend_ready(state: State<'_, AppState>) {
+    state.frontend_ready.store(true, std::sync::atomic::Ordering::Relaxed);
     append_log("frontend", "the interface finished mounting");
 }
 
@@ -2318,8 +2390,9 @@ fn env_root() -> Option<PathBuf> {
                 .filter(|arg| !arg.starts_with('-'))
                 .map(PathBuf::from)
         })
-        .filter(|path| path.is_absolute() && path.is_dir())
+        .filter(|path| path.is_absolute())
         .map(|path| tntl_store::simplify_path(&path))
+        .filter(|path| !is_network_path(path))
 }
 
 /// Network shares are refused for the data directory: the account file holds
@@ -2331,11 +2404,14 @@ fn is_network_path(path: &Path) -> bool {
 
 fn initial_root() -> PathBuf {
     if let Some(path) = env_root() {
-        // The user named this directory explicitly, so it may be a data
-        // directory without a marker (older installs and `--root`-style
-        // usage). A game directory must still go through Import: marking it
-        // would write `tntl.json` into someone else's `.minecraft`.
-        if Launcher::from_root(Some(path.clone())).claim_root().is_ok() {
+        // `TNTL_ROOT` may name a directory that does not exist yet (the docs
+        // use `~/tntl`). Create it, then validate *without* writing a marker:
+        // a populated unrelated directory or another launcher's game root must
+        // fall through to the first-run guide, not be claimed at startup.
+        if !path.exists() {
+            let _ = std::fs::create_dir_all(&path);
+        }
+        if Launcher::from_root(Some(path.clone())).check_root().is_ok() {
             return path;
         }
     }
@@ -2406,7 +2482,9 @@ fn startup_notes(root: &Path) -> String {
 }
 
 fn writable(dir: &Path) -> bool {
-    if std::fs::create_dir_all(dir).is_err() {
+    // A diagnostic must not create the data directory before the first-run
+    // guide; checking the existing path is enough.
+    if !dir.is_dir() {
         return false;
     }
     let probe = dir.join("startup-probe");
@@ -2566,11 +2644,7 @@ async fn update_download(
 /// Swap the executable (or start the installer) and exit; on Linux deb the file
 /// is only returned so the user can install it themselves.
 #[tauri::command]
-fn update_apply(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<String, String> {
+fn update_apply(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> Result<String, String> {
     if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
         return Err("close the running game before installing an update".to_string());
     }
@@ -2662,7 +2736,19 @@ fn main() {
     install_panic_hook();
     let root = initial_root();
     append_log("start", &startup_notes(&root));
-    let configured = store::configured_root().is_some() || env_root().is_some();
+    // `TNTL_ROOT` pointing at a refused directory used to leave `configured`
+    // true while the app ran from `unconfigured/`: installs landed in a folder
+    // the user never chose. Only the root actually in use may count.
+    let env_root = env_root().filter(|path| path == &root);
+    let configured = store::configured_root().is_some() || env_root.is_some();
+    if let Some(path) = &env_root {
+        let _ = store::remember_root(path);
+        let mut bootstrap = store::load_bootstrap();
+        bootstrap.schema = 2;
+        bootstrap.root = Some(path.display().to_string());
+        bootstrap.onboarded = true;
+        let _ = store::save_bootstrap(&bootstrap);
+    }
     // Backups pile up next to every file we had to overwrite. Drop the old
     // ones in the background; only files this project named `*.bak*` are
     // candidates, and the newest few of each file stay.
@@ -2706,6 +2792,33 @@ fn main() {
                     let _ = window.center();
                 }
             }
+            // A missing/broken WebView2 runtime on Windows leaves an empty
+            // window with no error: the process is alive, the frontend never
+            // mounts, and the user has nothing to act on. Give it 20 seconds,
+            // then say what to install.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                let ready = handle
+                    .try_state::<AppState>()
+                    .is_some_and(|state| state.frontend_ready.load(std::sync::atomic::Ordering::Relaxed));
+                if ready {
+                    return;
+                }
+                append_log(
+                    "frontend",
+                    "no interface after 20 s; WebView runtime missing or the frontend failed to load",
+                );
+                #[cfg(windows)]
+                let _ = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("TNTL")
+                    .set_description(
+                        "The launcher window stayed empty.\n\nInstall or repair the Microsoft Edge WebView2 Runtime, then start TNTL again. The launcher log has the details.",
+                    )
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+            });
             Ok(())
         })
         .manage(AppState {
@@ -2713,6 +2826,7 @@ fn main() {
             configured: std::sync::atomic::AtomicBool::new(configured),
             game: Mutex::new(None),
             launching: std::sync::atomic::AtomicBool::new(false),
+            frontend_ready: std::sync::atomic::AtomicBool::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             roots,
