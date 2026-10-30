@@ -169,6 +169,8 @@ Mojang Studios or Microsoft.
   when the installer starts. The portable executable and the installer have
   been tested on Windows; the launcher is cross-compiled from Linux.
 - Microsoft sign-in needs a client id from your own Entra app registration.
-- Self-update from GitHub Releases is not implemented.
+- Updates are checked on request from the GitHub release feed. A Windows portable
+  build and a Linux AppImage replace themselves; a copy installed by a package
+  manager is downloaded as the `.deb` and left for the package manager.
 - Technic and ATLauncher packs are not supported.
 - OptiFine can only be dropped in by hand; only its shader switch is managed.

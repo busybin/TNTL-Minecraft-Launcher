@@ -24,8 +24,8 @@ instances.
   format where practical).
 - Diagnostics: structured logs, crash classification, missing-file report.
 - Content updates: mods, resource packs, shaders and modpacks can be checked and
-  updated. The launcher itself has no self-update yet; new builds come from the
-  release page.
+  updated. Updates for the launcher itself are checked on request from the GitHub
+  release feed; nothing is installed silently.
 
 ## Out of scope
 
