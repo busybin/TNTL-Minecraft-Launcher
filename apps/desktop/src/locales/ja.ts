@@ -37,6 +37,8 @@ const ja: Record<string, string> = {
   "update.package": "{file} をダウンロードしました。このコピーはシステムにインストールされているため、パッケージマネージャーでインストールしてください。",
   'update.failed': 'アップデートに失敗しました',
   "app.removedKept": '「{name}」を一覧から削除しました。ファイルは変更していません：',
+  "app.removedConfigIn": 'ランチャーの項目（設定のみ）：{path}',
+  "app.openConfigFolder": 'ランチャーのフォルダー',
   "app.removeConfirm": '「{name}」を一覧から削除しますか？ファイルは残ります。',
   "app.librarySubtitle": "あなたのワールドへ、ワンクリックで",
   "app.install": "インストール",

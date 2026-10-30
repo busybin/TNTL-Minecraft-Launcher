@@ -10,6 +10,7 @@ import {
   type InstanceView,
   imageUrl,
   type LauncherSettings,
+  type InstanceLocation,
   type RemovedInstance,
   type RootsState,
   type SessionState,
@@ -46,8 +47,9 @@ let closeArmed = false;
 const busy = ref<string | null>(null);
 const error = ref<string | null>(null);
 const toast = ref<string | null>(null);
+let toastTimer: number | null = null;
 /** Instance just removed from the list; files stay until the user deletes them. */
-const removedFolder = ref<{ name: string; dir: string } | null>(null);
+const removedFolder = ref<InstanceLocation | null>(null);
 
 const consoleOpen = ref(false);
 const consoleTitle = ref("");
@@ -174,9 +176,23 @@ async function refresh() {
 
 function notify(message: string) {
   toast.value = message;
-  window.setTimeout(() => {
-    if (toast.value === message) toast.value = null;
+  armToast();
+}
+
+/** Auto-hide the toast, but only while the pointer is not resting on it. */
+function armToast() {
+  if (toastTimer !== null) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toast.value = null;
+    toastTimer = null;
   }, 3200);
+}
+
+function holdToast() {
+  if (toastTimer !== null) {
+    window.clearTimeout(toastTimer);
+    toastTimer = null;
+  }
 }
 
 function pushLine(line: string) {
@@ -302,10 +318,12 @@ function closeDetail() {
 async function remove(name: string) {
   if (!window.confirm(t("app.removeConfirm", { name }))) return;
   try {
-    // Only the list entry goes away; nothing on disk is touched.
-    const dir = await api.deleteInstance(name);
+    // Only the list entry goes away; nothing on disk is touched. The backend
+    // resolves the folder to open: an imported instance's game directory is
+    // outside the launcher entry.
+    const location = await api.deleteInstance(name);
     if (detailInstance.value === name) detailInstance.value = null;
-    removedFolder.value = { name, dir };
+    removedFolder.value = location;
     await refresh();
   } catch (cause) {
     error.value = String(cause);
@@ -321,7 +339,14 @@ async function forgetDir(name: string) {
   if (!window.confirm(t("instances.forgetBrokenConfirm", { name }))) return;
   try {
     const dir = await api.forgetInstanceDir(name);
-    removedFolder.value = { name, dir };
+    removedFolder.value = {
+      name,
+      dir,
+      game_dir: dir,
+      shared_root: root.value,
+      external_game_dir: false,
+      files_dir: dir,
+    };
     await refresh();
   } catch (cause) {
     error.value = String(cause);
@@ -361,6 +386,17 @@ async function undoRemove() {
 }
 
 async function openRemovedFolder() {
+  const target = removedFolder.value;
+  if (!target) return;
+  try {
+    await api.openPath(target.files_dir);
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+/** Library entry of a removed imported instance: configuration and logs only. */
+async function openRemovedConfigFolder() {
   const target = removedFolder.value;
   if (!target) return;
   try {
@@ -420,6 +456,7 @@ async function applyRoot(path: string) {
   try {
     rootsState.value = await api.setRoot(path);
     detailInstance.value = null;
+    removedFolder.value = null;
     // Settings live inside the data directory: the old object belongs to the
     // previous root and saving it here would copy its keys over.
     settings.value = await api.launcherSettings().catch(() => settings.value);
@@ -440,9 +477,13 @@ async function forgetRoot(path: string) {
       firstRun.value = true;
       bootstrap.value = null;
       instances.value = [];
+      removedFolder.value = null;
       return;
     }
     detailInstance.value = null;
+    removedFolder.value = null;
+    settings.value = await api.launcherSettings().catch(() => settings.value);
+    applyTheme(settings.value.theme);
     await refresh();
   } catch (cause) {
     error.value = String(cause);
@@ -460,6 +501,13 @@ async function chooseRoot() {
     } else if (info.kind === "empty") {
       if (window.confirm(t("app.createRootConfirm", { path: info.path }))) {
         await api.chooseDataRoot(info.path);
+        // Settings and theme live inside the data directory; the previous
+        // root's object must not leak into the new one.
+        rootsState.value = await api.roots().catch(() => rootsState.value);
+        settings.value = await api.launcherSettings().catch(() => settings.value);
+        applyTheme(settings.value.theme);
+        detailInstance.value = null;
+        removedFolder.value = null;
         await refresh();
       }
     } else {
@@ -628,6 +676,7 @@ const unlisteners: UnlistenFn[] = [];
 
 async function onFirstRunDone(games: string | null) {
   firstRun.value = false;
+  removedFolder.value = null;
   session.value = await api.session().catch(() => null);
   settings.value = await api.launcherSettings().catch(() => settings.value);
   applyTheme(settings.value.theme);
@@ -749,7 +798,10 @@ onUnmounted(() => {
     </aside>
 
     <main>
-      <p v-if="error" class="error" @click="error = null">{{ error }}</p>
+      <div v-if="error" class="error error-banner">
+        <span class="error-text">{{ error }}</span>
+        <button class="ghost error-close" type="button" :title="t('action.close')" @click="error = null">✕</button>
+      </div>
 
       <InstanceDetail
         v-if="detailInstance"
@@ -963,13 +1015,33 @@ onUnmounted(() => {
     />
 
     <Transition name="toast">
-      <div v-if="toast" class="toast">{{ toast }}</div>
+      <div
+        v-if="toast"
+        class="toast"
+        @mouseenter="holdToast"
+        @mouseleave="armToast"
+        @focusin="holdToast"
+        @focusout="armToast"
+      >{{ toast }}</div>
       <div v-if="removedFolder" class="removed-banner">
-        <span>{{ t("app.removedKept", { name: removedFolder.name }) }}</span>
-        <code :title="removedFolder.dir">{{ removedFolder.dir }}</code>
-        <button class="ghost" type="button" @click="openRemovedFolder">{{ t("app.openFolder") }}</button>
-        <button class="ghost" type="button" @click="undoRemove">{{ t("app.undoRemove") }}</button>
-        <button class="ghost" type="button" @click="closeRemovedFolder">{{ t("action.close") }}</button>
+        <div class="removed-text">
+          <span>{{ t("app.removedKept", { name: removedFolder.name }) }}</span>
+          <code :title="removedFolder.files_dir">{{ removedFolder.files_dir }}</code>
+          <small v-if="removedFolder.external_game_dir" class="removed-hint">
+            {{ t("app.removedConfigIn", { path: removedFolder.dir }) }}
+          </small>
+        </div>
+        <div class="removed-actions">
+          <button class="ghost" type="button" @click="openRemovedFolder">{{ t("app.openFolder") }}</button>
+          <button
+            v-if="removedFolder.external_game_dir"
+            class="ghost"
+            type="button"
+            @click="openRemovedConfigFolder"
+          >{{ t("app.openConfigFolder") }}</button>
+          <button class="ghost" type="button" @click="undoRemove">{{ t("app.undoRemove") }}</button>
+          <button class="ghost" type="button" @click="closeRemovedFolder">{{ t("action.close") }}</button>
+        </div>
       </div>
     </Transition>
   </div>
@@ -984,7 +1056,7 @@ onUnmounted(() => {
   z-index: 30;
   display: flex;
   gap: 10px;
-  align-items: center;
+  align-items: flex-start;
   flex-wrap: wrap;
   padding: 12px 14px;
   border-radius: 14px;
@@ -994,12 +1066,39 @@ onUnmounted(() => {
   font-size: 12.5px;
 }
 
+.removed-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
 .removed-banner code {
-  flex: 1 1 240px;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--muted);
+  /* Windows paths are left-to-right even in an RTL interface. */
+  direction: ltr;
+  text-align: start;
+  unicode-bidi: plaintext;
+}
+
+.removed-hint {
+  color: var(--muted-2);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.removed-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
 }
 
 .wallpaper {
@@ -1302,6 +1401,9 @@ h1 {
   color: var(--text);
   padding: 9px 16px;
   font-size: 12.5px;
+  max-width: min(760px, calc(100vw - 48px));
+  white-space: pre-wrap;
+  user-select: text;
   box-shadow: inset 2px 2px 0 var(--bevel-hi), inset -2px -2px 0 var(--bevel-lo), var(--shadow);
   z-index: 30;
 }

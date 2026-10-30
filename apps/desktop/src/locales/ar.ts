@@ -37,6 +37,8 @@ const ar: Record<string, string> = {
   "update.package": "تم تنزيل {file}. هذه النسخة مثبّتة على مستوى النظام، لذا ثبّت الحزمة بمدير الحزم.",
   'update.failed': 'فشل التحديث',
   "app.removedKept": 'أُزيل {name} من القائمة. لم تُمس الملفات:',
+  "app.removedConfigIn": 'مدخل المشغّل (إعدادات فقط): {path}',
+  "app.openConfigFolder": 'مجلد المشغّل',
   "app.removeConfirm": 'إزالة {name} من القائمة؟ ستبقى الملفات.',
   "app.librarySubtitle": "عوالمك على بعد نقرة واحدة",
   "app.install": "التثبيت",

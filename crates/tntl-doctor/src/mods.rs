@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tntl_instance::mods::{ModInfo, ModLoader};
 
-use crate::version::any_matches;
+use crate::version::{any_matches, any_matches_series};
 use crate::{Finding, Severity, tidy};
 
 /// Facts about the instance the mods are checked against.
@@ -154,7 +154,14 @@ pub fn check(mods: &[ModInfo], context: &ModContext<'_>) -> Vec<Finding> {
             );
             continue;
         }
-        if any_matches(context.game_version, &module.game_versions) == Some(false) {
+        let forge_family = matches!(instance_loader, ModLoader::Forge | ModLoader::NeoForge);
+        let fabric_module = matches!(module.loader, ModLoader::Fabric | ModLoader::Quilt);
+        let game_check = if forge_family && !fabric_module {
+            any_matches_series(context.game_version, &module.game_versions)
+        } else {
+            any_matches(context.game_version, &module.game_versions)
+        };
+        if game_check == Some(false) {
             findings.push(
                 Finding::new(Severity::Error, "game_version_mismatch")
                     .subject(&module.name)
@@ -182,7 +189,7 @@ pub fn check(mods: &[ModInfo], context: &ModContext<'_>) -> Vec<Finding> {
         if let Some(loader_version) = context.loader_version
             && let Some(actual) =
                 effective_loader_version(instance_loader, module.loader, loader_version, context.game_version)
-            && any_matches(&actual, &module.loader_versions) == Some(false)
+            && any_matches(&actual, &enforced_ranges(instance_loader, &module.loader_versions)) == Some(false)
         {
             findings.push(
                 Finding::new(Severity::Error, "loader_version_mismatch")
@@ -556,6 +563,22 @@ mod tests {
         example.game_versions = vec!["[1.20.1,1.21)".to_string()];
         example.loader_versions = vec!["[47,)".to_string()];
         assert!(codes(&[example], &ctx).is_empty());
+    }
+
+    #[test]
+    fn sloppy_neoforge_metadata_is_not_reported() {
+        // 1.21.1 packs ship JEI with `[1.21, 1.21.1)` and mods that name a
+        // bare loader build (`21.1.215`); both run, the loader only enforces
+        // bracketed ranges.
+        let mut game = module("jei", "JEI", "19.64.0.454", ModLoader::NeoForge);
+        game.game_versions = vec!["[1.21, 1.21.1)".to_string()];
+        game.loader_versions = vec!["[21.1.238,)".to_string()];
+        let mut loader = module("constructionwand", "Construction Wands", "4.2.2", ModLoader::NeoForge);
+        loader.game_versions = vec!["1.21.1".to_string()];
+        loader.loader_versions = vec!["21.1.215".to_string()];
+        let mut ctx = context();
+        ctx.loader_version = Some("21.1.248");
+        assert!(codes(&[game, loader], &ctx).is_empty());
     }
 
     #[test]

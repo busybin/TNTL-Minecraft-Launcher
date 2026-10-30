@@ -687,6 +687,7 @@ fn parse_mods_toml(bytes: &[u8], loader: ModLoader) -> Metadata {
             "modId" => metadata.id = Some(value),
             "displayName" => metadata.name = Some(value),
             "version" => metadata.version = Some(value),
+            "provides" => metadata.provides = toml_array(&value),
             _ => {}
         }
     }
@@ -696,6 +697,8 @@ fn parse_mods_toml(bytes: &[u8], loader: ModLoader) -> Metadata {
     metadata.recognized = saw_mods && metadata.id.is_some();
     metadata.depends.sort();
     metadata.depends.dedup();
+    metadata.provides.sort();
+    metadata.provides.dedup();
     metadata
 }
 
@@ -761,6 +764,20 @@ fn toml_value(value: &str) -> String {
         _ => value,
     };
     unquoted.trim_matches('"').trim().to_string()
+}
+
+/// `provides = ["fabric", "fabric-api"]` inside `[[mods]]`. Forge and NeoForge
+/// use this to publish alias ids; without it a port such as Forgified Fabric
+/// API looks like it does not satisfy a mod that depends on `fabric-api`.
+fn toml_array(value: &str) -> Vec<String> {
+    let body = value.trim();
+    let body = body.strip_prefix('[').unwrap_or(body);
+    let body = body.strip_suffix(']').unwrap_or(body);
+    body.split(',')
+        .map(str::trim)
+        .map(toml_value)
+        .filter(|item| sane_id(item))
+        .collect()
 }
 
 /// A dependency id that a loader can ever resolve: letters, digits and the
@@ -840,6 +857,26 @@ mod tests {
         let fabric = scan_for_loader(&dir.join("mods"), Some(ModLoader::Fabric)).unwrap();
         assert_eq!(fabric[0].dependency, vec!["fabric"]);
         assert_eq!(fabric[0].missing_dependencies, vec!["fabric"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn neoforge_provides_ids_are_read_from_mods_toml() {
+        // Forgified Fabric API declares `modId = "fabric_api"` plus
+        // `provides = ["fabric", "fabric-api"]`; without the aliases a Fabric
+        // mod running on NeoForge reports `fabric-api` as missing.
+        let dir = temp_dir("provides");
+        write_zip(
+            &dir.join("mods/fapi.jar"),
+            &[(
+                "META-INF/neoforge.mods.toml",
+                "modLoader=\"javafml\"\n[[mods]]\nmodId=\"fabric_api\"\nversion=\"0.116.7\"\nprovides=[\"fabric\", \"fabric-api\"]\n",
+            )],
+        );
+        let mods = scan_for_loader(&dir.join("mods"), Some(ModLoader::NeoForge)).unwrap();
+        assert_eq!(mods[0].id, "fabric_api");
+        assert!(mods[0].provides.contains(&"fabric-api".to_string()));
+        assert!(mods[0].provides.contains(&"fabric".to_string()));
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -37,6 +37,8 @@ const es: Record<string, string> = {
   "update.package": "Descargado {file}. Esta copia se instaló en el sistema; instala el paquete con tu gestor de paquetes.",
   'update.failed': 'La actualización falló',
   "app.removedKept": 'Se quitó {name} de la lista. No se tocaron los archivos:',
+  "app.removedConfigIn": 'Entrada del lanzador (solo configuración): {path}',
+  "app.openConfigFolder": 'Carpeta del lanzador',
   "app.removeConfirm": '¿Quitar {name} de la lista? Los archivos se conservan.',
   "app.librarySubtitle": "Tus mundos, a un clic",
   "app.install": "Instalar",

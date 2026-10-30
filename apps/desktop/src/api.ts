@@ -176,11 +176,23 @@ export interface BrokenInstance {
   error: string;
 }
 
-/** An instance the user removed from the library; its files are untouched. */
-export interface RemovedInstance {
+/** Resolved disk locations of one instance. */
+export interface InstanceLocation {
   name: string;
+  /** Library entry: `<data root>/instances/<name>`, launcher-owned config. */
   dir: string;
+  /** Where the game keeps mods, saves and configuration. */
+  game_dir: string;
+  /** Root that holds versions, libraries and assets. */
+  shared_root: string;
+  /** True when the game directory is outside the library entry. */
+  external_game_dir: boolean;
+  /** Folder to open when the user wants to delete the files. */
+  files_dir: string;
 }
+
+/** An instance the user removed from the library; its files are untouched. */
+export type RemovedInstance = InstanceLocation;
 
 export interface CapeView {
   id: string;
@@ -751,7 +763,7 @@ export const api = {
   saveInstance: (instance: InstanceConfig) => invoke<void>("save_instance", { instance }),
   clearInstanceJava: (name: string) => invoke<void>("clear_instance_java", { name }),
   // Removal only hides the entry; the files stay where they are.
-  deleteInstance: (name: string) => invoke<string>("delete_instance", { name }),
+  deleteInstance: (name: string) => invoke<InstanceLocation>("delete_instance", { name }),
   restoreInstance: (name: string) => invoke<void>("restore_instance", { name }),
   brokenInstances: () => invoke<BrokenInstance[]>("broken_instances"),
   removedInstances: () => invoke<RemovedInstance[]>("removed_instances"),
@@ -810,6 +822,8 @@ export const api = {
   diskUsage: (name: string) => invoke<DiskUsage>("disk_usage", { name }),
   cleanupInstance: (name: string) => invoke<CleanupReport>("cleanup_instance", { name }),
   openPath: (path: string) => invoke<void>("open_path", { path }),
+  openInstanceFolder: (name: string, relative?: string) =>
+    invoke<void>("open_instance_folder", { name, relative: relative ?? null }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   listWorlds: (name: string) => invoke<WorldInfo[]>("list_worlds", { name }),
   listDatapacks: (name: string, world: string) =>

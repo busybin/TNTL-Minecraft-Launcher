@@ -714,13 +714,10 @@ fn load_instance(state: State<'_, AppState>, name: String) -> Result<Instance, S
 }
 
 #[tauri::command]
-fn delete_instance(state: State<'_, AppState>, name: String) -> Result<String, String> {
+fn delete_instance(state: State<'_, AppState>, name: String) -> Result<tntl_app::InstanceLocation, String> {
     // Removal from the library only: no file is moved, renamed or deleted.
     ensure_stopped(&state, &name)?;
-    state_launcher(&state)
-        .unregister(&name)
-        .map(|dir| dir.display().to_string())
-        .map_err(message)
+    state_launcher(&state).unregister(&name).map_err(message)
 }
 
 #[tauri::command]
@@ -1237,9 +1234,9 @@ async fn launch_instance(app: tauri::AppHandle, state: State<'_, AppState>, name
             let plan = launcher
                 .plan_instance(&instance, None, VerifyMode::Exists)
                 .map_err(message)?;
-            if !plan.missing.is_empty() {
-                let java_missing = plan.missing.iter().any(|missing| missing.kind == MissingKind::Java);
-                if java_missing {
+            let blocking: Vec<_> = plan.blocking_missing().collect();
+            if !blocking.is_empty() {
+                if blocking.iter().any(|missing| missing.kind == MissingKind::Java) {
                     let layout = instance.layout(&launcher.root);
                     let required = launcher
                         .load_chain(&layout, &instance.version_id)
@@ -1249,8 +1246,18 @@ async fn launch_instance(app: tauri::AppHandle, state: State<'_, AppState>, name
                         "no usable Java runtime found; this instance needs Java {required}"
                     ));
                 }
+                let mut listed: Vec<String> = blocking
+                    .iter()
+                    .take(6)
+                    .map(|missing| missing.path.display().to_string())
+                    .collect();
+                if blocking.len() > listed.len() {
+                    listed.push(format!("(+{} more)", blocking.len() - listed.len()));
+                }
                 return Err(format!(
-                    "instance {name} is incomplete; install {} again",
+                    "instance {name} is incomplete: {} required file(s) missing\n{}\ninstall {} again",
+                    blocking.len(),
+                    listed.join("\n"),
                     instance.version_id
                 ));
             }
@@ -2212,6 +2219,24 @@ fn open_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_instance_folder(state: State<'_, AppState>, name: String, relative: Option<String>) -> Result<(), String> {
+    let launcher = state_launcher(&state);
+    let mut target = launcher.instance_location(&name).map_err(message)?.game_dir;
+    if let Some(relative) = relative.filter(|value| !value.trim().is_empty()) {
+        let relative = Path::new(relative.trim());
+        let safe = !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !safe {
+            return Err(format!("{relative:?} is not a subfolder of the instance"));
+        }
+        target.push(relative);
+    }
+    open_path(target.display().to_string())
+}
+
+#[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     let url = url.trim();
     if !url.starts_with("https://") && !url.starts_with("http://") {
@@ -2306,10 +2331,13 @@ fn is_network_path(path: &Path) -> bool {
 
 fn initial_root() -> PathBuf {
     if let Some(path) = env_root() {
-        // The user named this directory explicitly, so it is a data directory
-        // even without a marker (older installs and `--root`-style usage).
-        let _ = Launcher::from_root(Some(path.clone())).mark_root();
-        return path;
+        // The user named this directory explicitly, so it may be a data
+        // directory without a marker (older installs and `--root`-style
+        // usage). A game directory must still go through Import: marking it
+        // would write `tntl.json` into someone else's `.minecraft`.
+        if Launcher::from_root(Some(path.clone())).claim_root().is_ok() {
+            return path;
+        }
     }
     if let Some(root) = store::configured_root() {
         return root;
@@ -2796,6 +2824,7 @@ fn main() {
             is_directory,
             pick_save_file,
             open_path,
+            open_instance_folder,
             open_url,
             frontend_ready,
             app_version,

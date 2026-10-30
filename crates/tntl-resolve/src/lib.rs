@@ -99,6 +99,16 @@ pub enum MissingKind {
     Java,
 }
 
+impl MissingKind {
+    /// Some files are nice to have but never stop the game. A missing log4j
+    /// config is one: the game keeps its built-in logging defaults, and other
+    /// launchers (HMCL, Prism) do not download it either, so blocking the
+    /// launch on it makes their instances look broken.
+    pub fn is_optional(self) -> bool {
+        matches!(self, MissingKind::LoggingConfig)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissingObject {
     pub kind: MissingKind,
@@ -188,14 +198,18 @@ impl LaunchPlan {
         plan
     }
 
+    /// What actually keeps the game from starting.
+    pub fn blocking_missing(&self) -> impl Iterator<Item = &MissingObject> {
+        self.missing.iter().filter(|entry| !entry.kind.is_optional())
+    }
+
     pub fn is_ready(&self) -> bool {
-        self.missing.is_empty()
+        self.blocking_missing().next().is_none()
     }
 
     pub fn executable(&self) -> bool {
         !self
-            .missing
-            .iter()
+            .blocking_missing()
             .any(|missing| matches!(missing.kind, MissingKind::Java))
     }
 }
@@ -585,11 +599,14 @@ pub fn plan(input: &ResolveInput) -> Result<LaunchPlan, ResolveError> {
     if let Some(logging) = client_logging
         && let Some((_id, path, sha1, size, url)) = logging_config(input, &logging)
     {
-        if !planner.probe(&path, sha1.as_deref(), size) {
+        if planner.probe(&path, sha1.as_deref(), size) {
+            if let Some(argument) = &logging.argument {
+                logging_arg = Some((argument.clone(), path));
+            }
+        } else {
+            // Never hand the JVM a `-Dlog4j.configurationFile` that points at
+            // a file we do not have; log4j would report a broken configuration.
             planner.missing(MissingKind::LoggingConfig, path.clone(), sha1, size, url);
-        }
-        if let Some(argument) = &logging.argument {
-            logging_arg = Some((argument.clone(), path));
         }
     }
 
@@ -910,6 +927,34 @@ mod tests {
 
         let plain = super::plan(&input(OsName::Linux)).unwrap();
         assert!(!plain.game_args.iter().any(|arg| arg == "--width"));
+    }
+
+    #[test]
+    fn a_missing_log_config_does_not_block_the_launch() {
+        // HMCL and Prism never fetch assets/log_configs, so their instances
+        // used to be refused with "instance ... is incomplete". The game runs
+        // on its built-in logging defaults without that file.
+        let mut plan = super::plan(&input(OsName::Linux)).unwrap();
+        plan.missing.clear();
+        plan.missing.push(MissingObject {
+            kind: MissingKind::LoggingConfig,
+            path: PathBuf::from("assets/log_configs/client-1.12.xml"),
+            sha1: None,
+            size: None,
+            url: None,
+        });
+        assert!(plan.is_ready());
+        assert!(plan.executable());
+        assert!(!plan.missing.is_empty());
+        // A real file still blocks.
+        plan.missing.push(MissingObject {
+            kind: MissingKind::Library,
+            path: PathBuf::from("libraries/a.jar"),
+            sha1: None,
+            size: None,
+            url: None,
+        });
+        assert!(!plan.is_ready());
     }
 
     #[test]

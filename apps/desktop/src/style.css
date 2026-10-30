@@ -420,6 +420,26 @@ code,
   box-shadow: inset 2px 2px 0 rgba(255, 255, 255, 0.08), inset -2px -2px 0 rgba(0, 0, 0, 0.35);
 }
 
+/* Errors are read and copied, so they close from a button, never from a click
+   on the text itself. */
+.error-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.error-text {
+  flex: 1;
+  min-width: 0;
+  user-select: text;
+}
+
+.error-close {
+  flex: 0 0 auto;
+  padding: 0 8px;
+  line-height: 18px;
+}
+
 .muted {
   color: var(--muted);
 }

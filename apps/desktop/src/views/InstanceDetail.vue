@@ -899,10 +899,9 @@ async function deleteDatapack(pack: DatapackInfo) {
 }
 
 function openInGameDir(relative = "") {
-  const dir = gameDir.value ?? config.value?.game_dir;
-  if (!dir) return;
-  const target = relative ? `${dir}/${relative}` : dir;
-  api.openPath(target).catch((cause) => (error.value = String(cause)));
+  api
+    .openInstanceFolder(props.name, relative || undefined)
+    .catch((cause) => (error.value = String(cause)));
 }
 
 function openDatapacks() {
@@ -1622,7 +1621,10 @@ async function save() {
       </nav>
 
       <div class="panel scroll">
-        <p v-if="error" class="error" @click="error = null">{{ error }}</p>
+        <div v-if="error" class="error error-banner">
+          <span class="error-text">{{ error }}</span>
+          <button class="ghost error-close" type="button" :title="t('action.close')" @click="error = null">✕</button>
+        </div>
         <p v-if="running" class="warn-note"><Icon name="alert" :size="15" />{{ t("editor.runningLocked") }}</p>
 
         <div v-if="config" class="pane-body">
@@ -1739,10 +1741,10 @@ async function save() {
           </div>
         </div>
 
-        <div v-if="tab === 'overview' && config.game_dir" class="group">
+        <div v-if="tab === 'overview' && gameDir" class="group">
           <h3>{{ t("detail.gameDir") }}</h3>
           <div class="field-row">
-            <span class="path mono">{{ config.game_dir }}</span>
+            <span class="path mono">{{ gameDir }}</span>
             <button class="ghost small" @click="openGameDir">
               <Icon name="folder" :size="13" /> {{ t("editor.openFolder") }}
             </button>

@@ -237,7 +237,10 @@ onUnmounted(stopLogin);
       </div>
     </div>
 
-    <p v-if="error" class="error" @click="error = null">{{ error }}</p>
+    <div v-if="error" class="error error-banner">
+      <span class="error-text">{{ error }}</span>
+      <button class="ghost error-close" type="button" :title="t('action.close')" @click="error = null">✕</button>
+    </div>
 
     <div v-if="!accounts.accounts.length" class="accounts-empty">
       <h3>{{ t("accounts.empty") }}</h3>

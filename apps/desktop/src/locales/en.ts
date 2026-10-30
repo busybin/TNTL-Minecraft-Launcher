@@ -37,6 +37,8 @@ const en: Record<string, string> = {
   "update.package": "Downloaded {file}. This copy was installed system-wide, so install the package with your package manager.",
   'update.failed': 'Update failed',
   "app.removedKept": 'Removed {name} from the list. Files were not touched:',
+  "app.removedConfigIn": 'Launcher entry (configuration only): {path}',
+  "app.openConfigFolder": 'Launcher folder',
   "app.removeConfirm": 'Remove {name} from the list? Its files are kept.',
   "app.librarySubtitle": "Your worlds, one click away",
   "app.install": "Install",

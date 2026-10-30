@@ -182,13 +182,27 @@ impl Instance {
             path: path.clone(),
             source: error,
         })?;
-        let instance: Self = serde_json::from_slice(&bytes).map_err(|source| InstanceError::Json {
+        let mut instance: Self = serde_json::from_slice(&bytes).map_err(|source| InstanceError::Json {
             path: path.clone(),
             source,
         })?;
         if instance.version_id.is_empty() {
             return Err(InstanceError::Invalid("version_id is empty".to_string()));
         }
+        // Both paths are resolved against the process working directory
+        // otherwise, which silently changes when the launcher is started from
+        // another folder. They are always written absolute.
+        for (label, path) in [("root", &instance.root), ("game_dir", &instance.game_dir)] {
+            if let Some(path) = path
+                && !path.is_absolute()
+            {
+                return Err(InstanceError::Invalid(format!("{label} must be an absolute path")));
+            }
+        }
+        // Older builds stored Windows verbatim paths (`\\?\D:\...`). They work
+        // for IO but leak into the UI and break string comparisons.
+        instance.root = instance.root.as_deref().map(tntl_store::simplify_path);
+        instance.game_dir = instance.game_dir.as_deref().map(tntl_store::simplify_path);
         // Every consumer derives the instance directory from `name`, so a
         // hand-edited name must not be able to point anywhere else.
         if !valid_instance_name(&instance.name) {

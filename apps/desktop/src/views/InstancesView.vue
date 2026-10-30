@@ -321,7 +321,7 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
       <div v-for="entry in brokenDirs" :key="`broken-${entry.name}`" class="maint-row">
         <div class="maint-text">
           <strong>{{ entry.name }}</strong>
-          <small class="mono">{{ entry.dir }}</small>
+          <small class="mono" :title="entry.dir">{{ entry.dir }}</small>
           <small class="maint-error" :title="entry.error">{{ entry.error }}</small>
         </div>
         <button class="ghost small" @click="$emit('openPath', entry.dir)">
@@ -334,9 +334,20 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
       <div v-for="entry in removedEntries" :key="`removed-${entry.name}`" class="maint-row">
         <div class="maint-text">
           <strong>{{ entry.name }}</strong>
-          <small class="mono">{{ entry.dir }}</small>
+          <small class="mono" :title="entry.files_dir">{{ entry.files_dir }}</small>
+          <small v-if="entry.external_game_dir" class="maint-note">
+            {{ t("app.removedConfigIn", { path: entry.dir }) }}
+          </small>
           <small class="maint-note">{{ t("instances.removedNote") }}</small>
         </div>
+        <button class="ghost small" @click="$emit('openPath', entry.files_dir)">
+          <Icon name="folder" :size="13" />{{ t("instances.openFolder") }}
+        </button>
+        <button
+          v-if="entry.external_game_dir"
+          class="ghost small"
+          @click="$emit('openPath', entry.dir)"
+        >{{ t("app.openConfigFolder") }}</button>
         <button class="ghost small" @click="$emit('restore', entry.name)">
           <Icon name="refresh" :size="13" />{{ t("instances.restore") }}
         </button>

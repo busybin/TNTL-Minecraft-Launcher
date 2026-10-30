@@ -555,6 +555,52 @@ pub struct InstanceView {
     pub last_played: Option<i64>,
 }
 
+/// Everything a caller needs to open an instance on disk. The library entry
+/// (`dir`) is always launcher-owned; `game_dir` can point into another
+/// launcher's game directory, which is where the files worth deleting are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceLocation {
+    pub name: String,
+    pub dir: PathBuf,
+    pub game_dir: PathBuf,
+    /// Root that holds `versions/`, `libraries/` and `assets/`.
+    pub shared_root: PathBuf,
+    /// True when the game directory is outside the library entry.
+    pub external_game_dir: bool,
+    /// Folder to open when the user wants to delete the files: the library
+    /// entry when the game directory lives inside it, the game directory
+    /// otherwise.
+    pub files_dir: PathBuf,
+}
+
+impl InstanceLocation {
+    fn new(name: &str, dir: &Path, instance: Option<&Instance>, launcher_root: &Path) -> Self {
+        let game_dir = instance
+            .map(|instance| instance.game_dir(dir))
+            .unwrap_or_else(|| dir.to_path_buf());
+        let shared_root = instance
+            .map(|instance| instance.shared_root(launcher_root))
+            .unwrap_or_else(|| launcher_root.to_path_buf());
+        // A duplicate copies the game data into `<instance>/minecraft`, so the
+        // library entry is still the folder the user should delete.
+        let inside = game_dir.starts_with(dir);
+        let external_game_dir = !inside;
+        let files_dir = if external_game_dir {
+            game_dir.clone()
+        } else {
+            dir.to_path_buf()
+        };
+        Self {
+            name: name.to_string(),
+            dir: dir.to_path_buf(),
+            game_dir,
+            shared_root,
+            external_game_dir,
+            files_dir,
+        }
+    }
+}
+
 /// Version entry for the install picker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionView {
@@ -799,6 +845,9 @@ pub fn modpack_info(archive: &Path) -> Result<ModpackInfo> {
 impl Launcher {
     pub fn from_root(root: Option<PathBuf>) -> Self {
         let root = root.unwrap_or_else(|| dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("tntl"));
+        // Windows callers may hand over a `\\?\` verbatim path; stored paths
+        // and the UI always use the plain form.
+        let root = tntl_store::simplify_path(&root);
         let launcher = Self { root };
         launcher.apply_network();
         launcher
@@ -1954,6 +2003,22 @@ impl Launcher {
         has("versions") || has("mmc-pack.json") || (has("libraries") && has("assets")) || (has("mods") && has("saves"))
     }
 
+    /// Files only this launcher writes. A data directory created by an older
+    /// build has no marker yet, but still carries these.
+    fn has_library_entries(&self) -> bool {
+        let has = |name: &str| self.root.join(name).exists();
+        if has("launcher.json") || has("accounts.json") || has("hidden.json") {
+            return true;
+        }
+        fs::read_dir(self.instances_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.path().join(tntl_instance::INSTANCE_FILE).is_file())
+            })
+            .unwrap_or(false)
+    }
+
     /// Mark a directory as a data directory. A directory that carries our own
     /// files is claimed silently (that is the upgrade path from older builds);
     /// another launcher's game directory is refused outright.
@@ -1961,7 +2026,9 @@ impl Launcher {
         if self.is_owned_root() {
             return Ok(());
         }
-        if self.is_foreign_game_dir() {
+        // Check our own files before `versions/`: a data directory has one too,
+        // and `is_foreign_game_dir` cannot tell the two apart.
+        if !self.has_library_entries() && self.is_foreign_game_dir() {
             bail!(
                 "{} is a game directory, not a launcher data directory; use Import instead",
                 self.root.display()
@@ -2012,21 +2079,23 @@ impl Launcher {
     }
 
     /// Remove an instance from the library **without touching a single file**.
-    /// Returns the instance directory so the caller can offer to open it.
-    pub fn unregister_instance(&self, name: &str) -> Result<PathBuf> {
+    /// Returns where its files actually live so the caller can offer to open
+    /// that folder.
+    pub fn unregister_instance(&self, name: &str) -> Result<InstanceLocation> {
         validate_name(name)?;
         let dir = self.instance_dir(name)?;
         if !dir.join(tntl_instance::INSTANCE_FILE).exists() {
             bail!("instance {name} does not exist");
         }
         self.ensure_not_running(name)?;
+        let location = self.instance_location(name)?;
         let mut hidden = self.hidden();
         if !hidden.hides_instance(name) {
             hidden.instances.push(name.to_string());
             hidden.instances.sort();
         }
         self.save_hidden(&hidden)?;
-        Ok(dir)
+        Ok(location)
     }
 
     pub fn restore_instance(&self, name: &str) -> Result<()> {
@@ -2063,7 +2132,9 @@ impl Launcher {
         let dir = self.instance_dir(name)?;
         let mut instance =
             Instance::load(&dir).with_context(|| format!("cannot load instance {name} at {}", dir.display()))?;
-        if self.adopt_renamed_version(&mut instance) {
+        let mut dirty = self.adopt_renamed_version(&mut instance);
+        dirty |= adopt_isolated_game_dir(&mut instance, &dir);
+        if dirty {
             instance.save(&dir)?;
         }
         Ok(instance)
@@ -2241,13 +2312,16 @@ impl Launcher {
         let mut instance = Instance::load(&new_dir)?;
         instance.name = new.to_string();
         instance.save(&new_dir)?;
+        // The new name may belong to an entry removed earlier; the folder is
+        // this instance's now, so it must be visible.
+        let _ = self.restore_instance(new);
         Ok(new_dir)
     }
 
     /// Remove an instance from the library. **Nothing on disk changes**: the
     /// name goes into `hidden.json` and the caller offers to open the folder so
     /// the user can delete files by hand if they want to.
-    pub fn unregister(&self, name: &str) -> Result<PathBuf> {
+    pub fn unregister(&self, name: &str) -> Result<InstanceLocation> {
         self.unregister_instance(name)
     }
 
@@ -2326,7 +2400,8 @@ impl Launcher {
     }
 
     /// Instance directories the user removed from the library. The files are
-    /// still there, so the entries can be put back.
+    /// still there, so the entries can be put back; `files_dir` points at the
+    /// imported game directory when there is one.
     pub fn removed_instances(&self) -> Vec<RemovedInstance> {
         let hidden = self.hidden();
         let mut removed = Vec::new();
@@ -2334,9 +2409,16 @@ impl Launcher {
             let Ok(dir) = self.instance_dir(&name) else {
                 continue;
             };
-            if dir.is_dir() {
-                removed.push(RemovedInstance { name, dir });
+            if !dir.is_dir() {
+                continue;
             }
+            // A broken `instance.json` cannot name a game directory; the
+            // library entry is the only thing known to exist.
+            let mut instance = Instance::load(&dir).ok();
+            if let Some(instance) = instance.as_mut() {
+                adopt_isolated_game_dir(instance, &dir);
+            }
+            removed.push(InstanceLocation::new(&name, &dir, instance.as_ref(), &self.root));
         }
         removed.sort_by(|left, right| left.name.cmp(&right.name));
         removed
@@ -2401,6 +2483,16 @@ impl Launcher {
     pub fn game_dir(&self, name: &str) -> Result<PathBuf> {
         let instance = self.load_instance(name)?;
         Ok(instance.game_dir(&self.instance_dir(name)?))
+    }
+
+    /// Resolved disk locations of one instance. This is the only place that
+    /// decides which folder an "open folder" action should land in. It is
+    /// read-only: removal must not rewrite `instance.json`.
+    pub fn instance_location(&self, name: &str) -> Result<InstanceLocation> {
+        let dir = self.instance_dir(name)?;
+        let mut instance = Instance::load(&dir)?;
+        adopt_isolated_game_dir(&mut instance, &dir);
+        Ok(InstanceLocation::new(name, &dir, Some(&instance), &self.root))
     }
 
     /// Launcher-wide settings; missing or broken files fall back to defaults.
@@ -2524,6 +2616,7 @@ impl Launcher {
             instance.game_dir = Some(minecraft);
         }
         instance.save(&dir)?;
+        let _ = self.restore_instance(name);
         Ok(instance)
     }
 
@@ -2609,6 +2702,8 @@ impl Launcher {
 
     /// Versions inside an existing game root, for the import dialog.
     pub fn import_candidates(&self, path: &Path) -> Result<ImportScan> {
+        let path = tntl_store::simplify_path(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        let path = path.as_path();
         if !path.is_dir() {
             bail!("{} is not a directory", path.display());
         }
@@ -2628,6 +2723,8 @@ impl Launcher {
         version: Option<&str>,
         progress: &(dyn Fn(InstallEvent) + Send + Sync),
     ) -> Result<Instance> {
+        let path = tntl_store::simplify_path(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        let path = path.as_path();
         if !path.is_dir() {
             bail!("{} is not a directory", path.display());
         }
@@ -2671,6 +2768,8 @@ impl Launcher {
         instance.game_dir = Some(game_dir_for(&root, &chosen.id));
         instance.root = Some(root.clone());
         instance.save(&dir)?;
+        // A name the user removed earlier is free now that the folder is new.
+        let _ = self.restore_instance(&instance_name);
         Ok(instance)
     }
 
@@ -2713,6 +2812,7 @@ impl Launcher {
         instance.game_dir = Some(path.to_path_buf());
         instance.group = Some("Imported".to_string());
         instance.save(&dir)?;
+        let _ = self.restore_instance(&instance_name);
 
         let http = Http::new()?;
         let options = InstallOptions {
@@ -2749,7 +2849,8 @@ impl Launcher {
         name: Option<&str>,
         progress: &(dyn Fn(InstallEvent) + Send + Sync),
     ) -> Result<Instance> {
-        let source = prism_instance_dir(path)?;
+        let path = tntl_store::simplify_path(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        let source = prism_instance_dir(&path)?;
         let bytes = fs::read(source.join("mmc-pack.json"))
             .with_context(|| format!("cannot read {}", source.join("mmc-pack.json").display()))?;
         let pack: MmcPack =
@@ -4044,7 +4145,7 @@ impl Launcher {
                         let missing: Vec<&MissingObject> = plan
                             .missing
                             .iter()
-                            .filter(|object| object.kind != MissingKind::Java)
+                            .filter(|object| object.kind != MissingKind::Java && !object.kind.is_optional())
                             .collect();
                         if !missing.is_empty() {
                             findings.push(
@@ -5607,6 +5708,7 @@ impl Launcher {
             instance.root = source_instance.root.clone();
         }
         instance.save(&target)?;
+        let _ = self.restore_instance(new_name);
         Ok(target)
     }
 
@@ -6387,24 +6489,37 @@ fn mark_blocked(mods: &mut [tntl_instance::mods::ModInfo], status: &LoaderStatus
     let build =
         tntl_doctor::mods::loader_build_number(status.version.as_deref().unwrap_or_default(), &status.game_version);
     for module in mods {
-        module.blocked =
-            if forge_family && tntl_doctor::version::any_matches(build, &module.loader_versions) == Some(false) {
-                Some(tntl_instance::mods::BlockedReason {
-                    kind: "loader".to_string(),
-                    loader: label.to_string(),
-                    required: module.loader_versions.clone(),
-                    actual: build.to_string(),
-                })
-            } else if tntl_doctor::version::any_matches(&status.game_version, &module.game_versions) == Some(false) {
-                Some(tntl_instance::mods::BlockedReason {
-                    kind: "game".to_string(),
-                    loader: "Minecraft".to_string(),
-                    required: module.game_versions.clone(),
-                    actual: status.game_version.clone(),
-                })
-            } else {
-                None
-            };
+        // Forge and NeoForge treat a bare version (`21.1.215`) as a
+        // recommendation, so only bracketed ranges can rule a jar out.
+        let enforced = if forge_family {
+            tntl_doctor::mods::enforced_ranges(ModLoader::Forge, &module.loader_versions)
+        } else {
+            module.loader_versions.clone()
+        };
+        // Fabric metadata states the game version precisely; Forge metadata is
+        // sloppy (`[1.21,1.21.1)` for "1.21.x"), so compare the series there.
+        let game_mismatch = if forge_family && !matches!(module.loader, ModLoader::Fabric | ModLoader::Quilt) {
+            tntl_doctor::version::any_matches_series(&status.game_version, &module.game_versions)
+        } else {
+            tntl_doctor::version::any_matches(&status.game_version, &module.game_versions)
+        } == Some(false);
+        module.blocked = if forge_family && tntl_doctor::version::any_matches(build, &enforced) == Some(false) {
+            Some(tntl_instance::mods::BlockedReason {
+                kind: "loader".to_string(),
+                loader: label.to_string(),
+                required: module.loader_versions.clone(),
+                actual: build.to_string(),
+            })
+        } else if game_mismatch {
+            Some(tntl_instance::mods::BlockedReason {
+                kind: "game".to_string(),
+                loader: "Minecraft".to_string(),
+                required: module.game_versions.clone(),
+                actual: status.game_version.clone(),
+            })
+        } else {
+            None
+        };
     }
 }
 
@@ -6905,6 +7020,7 @@ pub fn list_instances(launcher: &Launcher) -> Result<Vec<Instance>> {
                 // folder renamed in Explorer must report its own name or the
                 // row cannot be opened, saved or removed.
                 instance.name = name;
+                adopt_isolated_game_dir(&mut instance, &entry.path());
                 instances.push(instance)
             }
             // One broken `instance.json` must not blank the whole library, but
@@ -6966,6 +7082,31 @@ fn game_dir_for(root: &Path, version_id: &str) -> PathBuf {
     } else {
         root.to_path_buf()
     }
+}
+
+/// Early V6 imports stored the shared `.minecraft` root as the game directory
+/// even when the version was isolated (`versions/<id>/mods|saves|config`), so
+/// the instance showed no mods, resource packs or shaders at all. Point it at
+/// the isolated directory; `game_dir_for` leaves a normal install alone.
+///
+/// An instance with its own `minecraft/` folder (a duplicate) or an explicit
+/// different game directory is left untouched.
+fn adopt_isolated_game_dir(instance: &mut Instance, instance_dir: &Path) -> bool {
+    let Some(root) = instance.root.clone() else {
+        return false;
+    };
+    if instance.game_dir.as_ref().is_some_and(|dir| dir != &root) {
+        return false;
+    }
+    if instance.game_dir.is_none() && instance_dir.join("minecraft").is_dir() {
+        return false;
+    }
+    let detected = game_dir_for(&root, &instance.version_id);
+    if instance.game_dir.as_ref() == Some(&detected) {
+        return false;
+    }
+    instance.game_dir = Some(detected);
+    true
 }
 
 /// Newest file in `<instance>/logs`, so the UI can offer "last log".
@@ -7031,11 +7172,8 @@ pub struct BrokenInstance {
 }
 
 /// An instance the user removed from the library; its files are untouched.
-#[derive(Debug, Clone, Serialize)]
-pub struct RemovedInstance {
-    pub name: String,
-    pub dir: PathBuf,
-}
+/// Same fields as [`InstanceLocation`], kept as an alias for the public API.
+pub type RemovedInstance = InstanceLocation;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CleanupReport {
@@ -7115,6 +7253,67 @@ impl LauncherSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_mod(id: &str, loader: ModLoader) -> tntl_instance::mods::ModInfo {
+        tntl_instance::mods::ModInfo {
+            file: format!("{id}.jar"),
+            id: id.to_string(),
+            name: id.to_string(),
+            version: "1.0".to_string(),
+            loader,
+            enabled: true,
+            size: 1,
+            modified: 0,
+            missing_dependencies: Vec::new(),
+            disabled_dependencies: Vec::new(),
+            dependency: Vec::new(),
+            duplicate: false,
+            recognized: true,
+            provides: Vec::new(),
+            nested: Vec::new(),
+            game_versions: Vec::new(),
+            loader_versions: Vec::new(),
+            java_versions: Vec::new(),
+            breaks: Vec::new(),
+            dependency_ranges: std::collections::BTreeMap::new(),
+            fabric_dependency: Vec::new(),
+            fabric_dependency_ranges: std::collections::BTreeMap::new(),
+            blocked: None,
+        }
+    }
+
+    #[test]
+    fn blocked_mods_ignore_sloppy_forge_ranges() {
+        // Real 1.21.1 NeoForge packs: JEI ships `[1.21, 1.21.1)` and other
+        // mods name a bare loader build. Both run, so neither may be blocked.
+        let status = LoaderStatus {
+            game_version: "1.21.1".to_string(),
+            kind: Some("neoforge".to_string()),
+            version: Some("21.1.248".to_string()),
+            version_id: "pack".to_string(),
+        };
+        let mut sloppy_game = test_mod("jei", ModLoader::NeoForge);
+        sloppy_game.game_versions = vec!["[1.21, 1.21.1)".to_string()];
+        let mut soft_loader = test_mod("wand", ModLoader::NeoForge);
+        soft_loader.game_versions = vec!["1.21.1".to_string()];
+        soft_loader.loader_versions = vec!["21.1.215".to_string()];
+        let mut new_loader = test_mod("future", ModLoader::NeoForge);
+        new_loader.loader_versions = vec!["[21.2,)".to_string()];
+        let mut old_game = test_mod("oldgame", ModLoader::NeoForge);
+        old_game.game_versions = vec!["[1.20.1,1.21)".to_string()];
+        let mut mods = vec![sloppy_game, soft_loader, new_loader, old_game];
+        mark_blocked(&mut mods, &status);
+        assert!(mods[0].blocked.is_none(), "sloppy game range must not block");
+        assert!(mods[1].blocked.is_none(), "bare loader build must not block");
+        assert_eq!(
+            mods[2].blocked.as_ref().map(|blocked| blocked.kind.as_str()),
+            Some("loader")
+        );
+        assert_eq!(
+            mods[3].blocked.as_ref().map(|blocked| blocked.kind.as_str()),
+            Some("game")
+        );
+    }
 
     #[test]
     fn instance_names_reject_windows_aliases() {
@@ -7588,9 +7787,13 @@ mod tests {
         assert!(launcher.installed_version_details()[0].instances.is_empty());
 
         // Unregistering the imported instance must not touch any file, in the
-        // launcher root or in the other launcher's directory.
+        // launcher root or in the other launcher's directory. The removal
+        // banner opens the game directory, not the launcher entry that only
+        // holds `instance.json`.
         let unregistered = launcher.unregister("imported").unwrap();
-        assert!(unregistered.join(tntl_instance::INSTANCE_FILE).is_file());
+        assert!(unregistered.dir.join(tntl_instance::INSTANCE_FILE).is_file());
+        assert_eq!(unregistered.files_dir, game);
+        assert!(unregistered.external_game_dir);
         assert!(launcher.version_installed("1.20.1"));
         assert!(external_json.is_file());
         // It keeps its versions in the other root, so our own copy is unused.
@@ -7649,6 +7852,102 @@ mod tests {
         assert_eq!(restored.root.as_deref(), Some(dir.join("minecraft").as_path()));
         assert!(restored.layout(&root).version_json("1.20.1").is_file());
         assert!(dir.join("minecraft/mods/a.jar").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removed_imported_instance_points_at_the_game_directory() {
+        let root = std::env::temp_dir().join(format!("tntl-removed-location-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let game = root.join("external-game");
+        fs::create_dir_all(game.join("mods")).unwrap();
+        fs::write(game.join("mods/a.jar"), b"jar").unwrap();
+
+        let dir = launcher.instance_dir("pack").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let mut instance = Instance::new("pack", "1.20.1");
+        instance.root = Some(game.clone());
+        instance.game_dir = Some(game.clone());
+        instance.save(&dir).unwrap();
+
+        let removed = launcher.unregister("pack").unwrap();
+        assert_eq!(removed.files_dir, game);
+        assert!(removed.external_game_dir);
+        assert_eq!(removed.dir, dir);
+        // The maintenance list must agree with the banner.
+        let listed = launcher.removed_instances();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].files_dir, game);
+        // Nothing on disk was touched.
+        assert!(dir.join(tntl_instance::INSTANCE_FILE).is_file());
+        assert!(game.join("mods/a.jar").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removed_regular_instance_points_at_the_library_entry() {
+        let root = std::env::temp_dir().join(format!("tntl-removed-regular-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        launcher.create_instance(&Instance::new("local", "1.20.1")).unwrap();
+        let dir = launcher.instance_dir("local").unwrap();
+        let removed = launcher.unregister("local").unwrap();
+        assert_eq!(removed.files_dir, dir);
+        assert!(!removed.external_game_dir);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_older_data_directory_is_claimed_by_its_own_files() {
+        let root = std::env::temp_dir().join(format!("tntl-claim-old-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // V5 layout: no `tntl.json` yet, but every file a data directory owns.
+        // `versions/` also appears in a foreign game directory, so the marker
+        // must be decided by our own files first.
+        fs::create_dir_all(root.join("versions/1.20.1")).unwrap();
+        fs::create_dir_all(root.join("instances/one")).unwrap();
+        fs::write(root.join("launcher.json"), b"{}").unwrap();
+        let launcher = Launcher::from_root(Some(root.clone()));
+        assert!(!launcher.is_owned_root());
+        launcher.claim_root().unwrap();
+        assert!(launcher.is_owned_root());
+
+        let foreign = std::env::temp_dir().join(format!("tntl-claim-foreign-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&foreign);
+        fs::create_dir_all(foreign.join("versions/1.20.1")).unwrap();
+        fs::create_dir_all(foreign.join("mods")).unwrap();
+        fs::create_dir_all(foreign.join("saves")).unwrap();
+        let other = Launcher::from_root(Some(foreign.clone()));
+        assert!(other.claim_root().is_err());
+        assert!(!other.is_owned_root());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&foreign);
+    }
+
+    #[test]
+    fn a_duplicate_keeps_its_own_minecraft_folder() {
+        let root = std::env::temp_dir().join(format!("tntl-dup-location-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let game = root.join("external-game");
+        fs::create_dir_all(game.join("versions/1.20.1")).unwrap();
+        fs::write(game.join("versions/1.20.1/1.20.1.json"), r#"{"id":"1.20.1"}"#).unwrap();
+
+        let dir = launcher.instance_dir("copy").unwrap();
+        fs::create_dir_all(dir.join("minecraft/mods")).unwrap();
+        let mut instance = Instance::new("copy", "1.20.1");
+        instance.root = Some(game.clone());
+        instance.game_dir = None;
+        instance.save(&dir).unwrap();
+
+        // A duplicate has its own `minecraft/`; adopting the shared game
+        // directory here would point it at the original's mods and saves.
+        let loaded = launcher.load_instance("copy").unwrap();
+        assert_eq!(loaded.game_dir(&dir), dir.join("minecraft"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -7713,6 +8012,45 @@ mod tests {
         assert_eq!(loaded.version_id, "1.21.1-Neoforge");
         // Persisted, so the next read does not have to repair again.
         assert_eq!(Instance::load(&dir).unwrap().version_id, "1.21.1-Neoforge");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_isolated_import_stops_using_the_shared_root_as_game_dir() {
+        // Instances imported before `game_dir_for` existed pointed at the
+        // shared `.minecraft`, so HMCL's isolated version directory
+        // (versions/<id>/mods|saves|config) was never scanned: no mods, no
+        // resource packs, no shaders.
+        let root = std::env::temp_dir().join(format!("tntl-isolated-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let game = root.join("game");
+        let isolated = game.join("versions/1.21.1-NeoForge");
+        let json = isolated.join("1.21.1-NeoForge.json");
+        fs::create_dir_all(&isolated).unwrap();
+        fs::write(&json, r#"{"id":"1.21.1-NeoForge"}"#).unwrap();
+        fs::create_dir_all(isolated.join("mods")).unwrap();
+        fs::write(isolated.join("mods/a.jar"), b"jar").unwrap();
+        let dir = launcher.instance_dir("old").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let mut instance = Instance::new("old", "1.21.1-NeoForge");
+        instance.root = Some(game.clone());
+        instance.game_dir = Some(game.clone());
+        instance.save(&dir).unwrap();
+
+        let loaded = launcher.load_instance("old").unwrap();
+        assert_eq!(loaded.game_dir(&dir), isolated);
+        // Persisted, so the library view and the editor agree on one path.
+        assert_eq!(Instance::load(&dir).unwrap().game_dir(&dir), isolated);
+        let view = launcher
+            .instance_views()
+            .unwrap()
+            .into_iter()
+            .find(|view| view.name == "old")
+            .unwrap();
+        assert_eq!(view.game_dir, isolated);
+        assert_eq!(launcher.mods("old").unwrap().len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 

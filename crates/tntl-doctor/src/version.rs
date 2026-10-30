@@ -57,6 +57,75 @@ pub fn any_matches(version: &str, ranges: &[String]) -> Option<bool> {
     understood.then_some(false)
 }
 
+/// Forge-family metadata writes the Minecraft requirement as a Maven range and
+/// is routinely sloppy: `[1.21,1.21.1)` means "the 1.21 series", and a bare
+/// version is a recommendation rather than a hard requirement. Patch releases
+/// keep the same modding API, so compare `major.minor` and only report a
+/// mismatch when the series itself is outside the declared range.
+pub fn any_matches_series(version: &str, ranges: &[String]) -> Option<bool> {
+    if ranges.is_empty() {
+        return Some(true);
+    }
+    let series = series_of(version)?;
+    let mut understood = false;
+    for range in ranges {
+        let range = range.trim();
+        if range.is_empty() || range == "*" || range == "x" {
+            return Some(true);
+        }
+        if !range.starts_with('[') && !range.starts_with('(') {
+            // A bare version is a recommendation for Forge-style metadata.
+            return Some(true);
+        }
+        understood = true;
+        if series_in(series, range) {
+            return Some(true);
+        }
+    }
+    understood.then_some(false)
+}
+
+fn series_of(text: &str) -> Option<(u64, u64)> {
+    let text = text.trim().trim_start_matches('v');
+    let mut parts = text.split(['.', '-', '+', '_']);
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    Some((major, minor))
+}
+
+/// Patch-level bounds are compared by series, but a range that spans series
+/// (`[1.20.1,1.21)`) still has to exclude them.
+fn series_in(series: (u64, u64), range: &str) -> bool {
+    let Some(body) = range.get(1..range.len().saturating_sub(1)) else {
+        return true;
+    };
+    if !body.contains(',') {
+        return series_of(body).is_none_or(|bound| bound == series);
+    }
+    let lower_inclusive = range.starts_with('[');
+    let upper_inclusive = range.ends_with(']');
+    let (lower, upper) = body.split_once(',').unwrap_or(("", ""));
+    let lower = series_of(lower);
+    let upper = series_of(upper);
+    if let (Some(low), Some(high)) = (lower, upper)
+        && low == high
+    {
+        // `[1.21,1.21.1)`: one series with a patch-level upper bound.
+        return series == low;
+    }
+    if let Some(low) = lower
+        && (series < low || (series == low && !lower_inclusive))
+    {
+        return false;
+    }
+    if let Some(high) = upper
+        && (series > high || (series == high && !upper_inclusive))
+    {
+        return false;
+    }
+    true
+}
+
 fn maven_range(version: &str, range: &str) -> Option<bool> {
     if range.len() < 2 {
         return None;
@@ -356,6 +425,36 @@ mod tests {
         yes("1.20.1", "1.20.1 || 1.19.4");
         yes("1.19.4", "1.20.1 || 1.19.4");
         no("1.18.2", "1.20.1 || 1.19.4");
+    }
+
+    #[test]
+    fn forge_game_ranges_are_series_lenient() {
+        // Real NeoForge metadata: JEI declares `[1.21, 1.21.1)` for 1.21.1 and
+        // a bare version is a recommendation, not a requirement.
+        let yes_series = |version: &str, range: &str| {
+            assert_eq!(
+                any_matches_series(version, &[range.to_string()]),
+                Some(true),
+                "{version} should match {range}"
+            );
+        };
+        let no_series = |version: &str, range: &str| {
+            assert_eq!(
+                any_matches_series(version, &[range.to_string()]),
+                Some(false),
+                "{version} should not match {range}"
+            );
+        };
+        yes_series("1.21.1", "[1.21,1.21.1)");
+        yes_series("1.21.1", "[1.21, 1.21.1)");
+        yes_series("1.21.1", "[1.21,1.21z)");
+        yes_series("1.21.1", "1.21");
+        yes_series("1.21.1", "[1.21.1,1.21.2)");
+        yes_series("1.21.1", "[1.20.5,)");
+        no_series("1.21.1", "[1.20.1]");
+        no_series("1.21.1", "[1.22,)");
+        no_series("1.21.1", "[1.18,1.19]");
+        no_series("1.21.1", "[1.20.1,1.21)");
     }
 
     #[test]

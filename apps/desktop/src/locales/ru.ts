@@ -37,6 +37,8 @@ const ru: Record<string, string> = {
   "update.package": "{file} загружен. Эта копия установлена в систему — установите пакет через менеджер пакетов.",
   'update.failed': 'Не удалось обновить',
   "app.removedKept": '{name} убран из списка. Файлы не тронуты:',
+  "app.removedConfigIn": 'Запись лаунчера (только настройки): {path}',
+  "app.openConfigFolder": 'Папка лаунчера',
   "app.removeConfirm": 'Убрать {name} из списка? Файлы останутся.',
   "app.librarySubtitle": "Ваши миры в один клик",
   "app.install": "Установка",

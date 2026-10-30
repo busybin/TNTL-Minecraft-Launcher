@@ -1599,8 +1599,14 @@ fn cmd_delete(launcher: &Launcher, name: &str, yes: bool, cleanup: bool) -> Resu
         return Ok(0);
     }
     // Unregistering never touches the disk; the user deletes files by hand.
-    let dir = launcher.unregister(name)?;
-    println!("removed {name} from the library; files kept in {}", dir.display());
+    let location = launcher.unregister(name)?;
+    println!(
+        "removed {name} from the library; files kept in {}",
+        location.files_dir.display()
+    );
+    if location.external_game_dir {
+        println!("  launcher entry (configuration only): {}", location.dir.display());
+    }
     if cleanup {
         let (removed, bytes) = launcher.delete_unused_versions()?;
         for id in removed {
@@ -1794,19 +1800,21 @@ fn cmd_launch(
         print_plan(&plan.redacted());
         return Ok(0);
     }
-    if !plan.missing.is_empty() {
+    let blocking: Vec<_> = plan.blocking_missing().collect();
+    if !blocking.is_empty() {
         print_missing(&plan);
-        if plan.missing.iter().any(|missing| missing.kind == MissingKind::Java) {
+        if blocking.iter().any(|missing| missing.kind == MissingKind::Java) {
             bail!("no usable Java found; run `tntl java` to see what is installed");
         }
         let environment = launcher.environment(name)?;
+        let count = blocking.len();
         match environment.loader.as_deref() {
             Some(loader) => bail!(
-                "instance {name} is incomplete; run `tntl install {} --loader {loader}`",
+                "instance {name} is incomplete: {count} required file(s) missing; run `tntl install {} --loader {loader}`",
                 environment.game_version
             ),
             None => bail!(
-                "instance {name} is incomplete; run `tntl install {}`",
+                "instance {name} is incomplete: {count} required file(s) missing; run `tntl install {}`",
                 environment.game_version
             ),
         }

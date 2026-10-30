@@ -37,6 +37,8 @@ const pt: Record<string, string> = {
   "update.package": "Baixado {file}. Esta cópia foi instalada no sistema; instale o pacote com o gerenciador de pacotes.",
   'update.failed': 'A atualização falhou',
   "app.removedKept": '{name} foi removido da lista. Os arquivos não foram alterados:',
+  "app.removedConfigIn": 'Entrada do iniciador (somente configuração): {path}',
+  "app.openConfigFolder": 'Pasta do iniciador',
   "app.removeConfirm": 'Remover {name} da lista? Os arquivos são mantidos.',
   "app.librarySubtitle": "Seus mundos a um clique de distância",
   "app.install": "Instalar",

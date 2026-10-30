@@ -37,6 +37,8 @@ const zh: Record<string, string> = {
   "update.package": "已下载 {file}。这一份是系统安装的，请用包管理器安装它。",
   'update.failed': '更新失败',
   "app.removedKept": '已从列表移除 {name}，文件没有动：',
+  "app.removedConfigIn": '启动器条目（仅配置）：{path}',
+  "app.openConfigFolder": '配置目录',
   "app.removeConfirm": '把 {name} 从列表移除？文件会保留。',
   "app.librarySubtitle": "一键进入你的世界",
   "app.install": "安装",
