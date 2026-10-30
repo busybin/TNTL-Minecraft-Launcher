@@ -23,6 +23,7 @@ tntl-instance = { path = "../../../crates/tntl-instance" }
 tntl-launch = { path = "../../../crates/tntl-launch" }
 tntl-resolve = { path = "../../../crates/tntl-resolve" }
 tntl-source = { path = "../../../crates/tntl-source" }
+tntl-store = { path = "../../../crates/tntl-store" }
 tntl-status = { path = "../../../crates/tntl-status" }
 anyhow = "1"
 dirs = "6"

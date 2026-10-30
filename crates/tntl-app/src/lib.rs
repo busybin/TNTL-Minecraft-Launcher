@@ -43,6 +43,7 @@ pub use tntl_source::Http;
 
 /// System total memory read on Linux; the desktop shell overrides Windows.
 pub mod memory;
+pub mod update;
 
 /// Launchable band sizes the memory slider is drawn from.
 pub use memory::{MemoryAdvice, advice, advice_from_total, clamp_mb, system_memory_mb};

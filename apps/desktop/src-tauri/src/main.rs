@@ -6,6 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+mod store;
+mod update_apply;
+
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 use tntl_app::{InstalledMod, InstalledVersion, InstanceView, JavaView, Launcher, ModSearchPage, VersionView};
@@ -17,6 +20,8 @@ use tntl_source::InstallEvent;
 struct AppState {
     /// The launcher data directory; the header lets the user switch it.
     root: Mutex<PathBuf>,
+    /// False until the user picked a data directory in the first-run guide.
+    configured: std::sync::atomic::AtomicBool,
     game: Mutex<Option<RunningGame>>,
     /// One launch at a time: two Play clicks used to spawn two games.
     launching: std::sync::atomic::AtomicBool,
@@ -113,14 +118,105 @@ fn roots(state: State<'_, AppState>) -> RootsResponse {
         .unwrap_or_else(|poison| poison.into_inner())
         .display()
         .to_string();
-    let mut config = load_root_config();
-    if !config.roots.contains(&current) {
-        config.roots.push(current.clone());
-    }
+    let config = store::load_roots();
     RootsResponse {
         roots: config.roots,
         current,
     }
+}
+
+/// A data directory the user picked or created. Returns what the directory is
+/// so the frontend can route a game directory to the import dialog instead of
+/// switching to it.
+#[tauri::command]
+fn path_info(path: String) -> store::PathInfo {
+    store::classify(Path::new(&path))
+}
+
+#[derive(Serialize)]
+struct Session {
+    /// False until a data directory is chosen.
+    configured: bool,
+    root: String,
+    onboarded: bool,
+    /// Old data directory from an earlier build, offered by the guide.
+    legacy: Option<String>,
+    /// Roots that no longer exist, so the UI can say so.
+    missing: Vec<String>,
+}
+
+#[tauri::command]
+fn session(state: State<'_, AppState>) -> Session {
+    let configured = state
+        .configured
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let root = state
+        .root
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .display()
+        .to_string();
+    let bootstrap = store::load_bootstrap();
+    let missing = store::load_roots()
+        .roots
+        .into_iter()
+        .filter(|entry| !Path::new(entry).is_dir())
+        .collect();
+    Session {
+        configured,
+        root,
+        onboarded: bootstrap.onboarded,
+        legacy: store::legacy_root().map(|path| path.display().to_string()),
+        missing,
+    }
+}
+
+/// Adopt a directory as the data directory. Refuses another launcher's game
+/// directory; those have to go through Import.
+#[tauri::command]
+fn choose_data_root(state: State<'_, AppState>, path: String) -> Result<store::PathInfo, String> {
+    if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
+        return Err("close the running game before switching directories".to_string());
+    }
+    let mut path = tntl_store::simplify_path(Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path)));
+    if !path.exists() {
+        std::fs::create_dir_all(&path)
+            .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    }
+    let info = store::classify(&path);
+    match info.kind.as_str() {
+        "data" | "empty" => {}
+        "foreign" => {
+            return Err(format!(
+                "{} is not empty and is not a launcher directory; pick an empty folder or use Import",
+                info.path
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "{} is a game directory, not a data directory; use Import to add it",
+                info.path
+            ));
+        }
+    }
+    if !info.writable {
+        return Err(format!("{} is not writable", info.path));
+    }
+    let launcher = Launcher::from_root(Some(path.clone()));
+    launcher
+        .mark_root()
+        .map_err(|error| format!("cannot prepare {}: {error:#}", path.display()))?;
+    store::remember_root(&path)?;
+    let mut bootstrap = store::load_bootstrap();
+    bootstrap.schema = 2;
+    bootstrap.root = Some(info.path.clone());
+    bootstrap.onboarded = true;
+    store::save_bootstrap(&bootstrap)?;
+    *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
+    state
+        .configured
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(info)
 }
 
 #[tauri::command]
@@ -128,61 +224,125 @@ fn set_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, S
     if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
         return Err("close the running game before switching directories".to_string());
     }
-    let path = PathBuf::from(path);
+    let path = tntl_store::simplify_path(Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path)));
     if !path.is_dir() {
         return Err(format!("{} is not a directory", path.display()));
     }
-    let path = std::fs::canonicalize(&path).unwrap_or(path);
-    let current = path.display().to_string();
-    let previous = state
+    let info = store::classify(&path);
+    if info.kind != "data" && info.kind != "empty" {
+        return Err(format!("{} is not a launcher data directory", info.path));
+    }
+    let launcher = Launcher::from_root(Some(path.clone()));
+    launcher
+        .mark_root()
+        .map_err(|error| format!("cannot prepare {}: {error:#}", path.display()))?;
+    store::remember_root(&path)?;
+    let mut bootstrap = store::load_bootstrap();
+    bootstrap.root = Some(info.path.clone());
+    store::save_bootstrap(&bootstrap)?;
+    *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
+    state
+        .configured
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(RootsResponse {
+        current: info.path,
+        roots: store::load_roots().roots,
+    })
+}
+
+/// Remove a directory from the list. The directory itself is never touched.
+#[tauri::command]
+fn forget_root(state: State<'_, AppState>, path: String) -> Result<RootsResponse, String> {
+    let config = store::forget_root(&path)?;
+    let configured = state
+        .configured
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut current = state
         .root
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .display()
         .to_string();
-    let mut config = load_root_config();
-    // Keep the directory we came from; otherwise the default root would
-    // vanish as soon as the first new directory is added.
-    if !config.roots.contains(&previous) {
-        config.roots.push(previous);
+    if !configured || current == tntl_store::simplify_path(Path::new(&path)).display().to_string() {
+        // Do not silently move the user somewhere else: the guide asks again.
+        if let Some(next) = config
+            .roots
+            .iter()
+            .find(|entry| Path::new(entry).is_dir())
+        {
+            *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = PathBuf::from(next);
+            current = next.clone();
+        } else {
+            *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = store::unconfigured_root();
+            state
+                .configured
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut bootstrap = store::load_bootstrap();
+            bootstrap.root = None;
+            bootstrap.onboarded = false;
+            let _ = store::save_bootstrap(&bootstrap);
+            current = store::unconfigured_root().display().to_string();
+        }
     }
-    if !config.roots.contains(&current) {
-        config.roots.push(current.clone());
-    }
-    *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
-    config.current = Some(current.clone());
-    save_root_config(&config);
     Ok(RootsResponse {
         roots: config.roots,
         current,
     })
 }
 
+/// One-time migration of the settings an older build wrote. Instances are kept.
 #[tauri::command]
-fn forget_root(state: State<'_, AppState>, path: String) -> RootsResponse {
-    let target = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
-    let target_text = target.display().to_string();
-    let mut config = load_root_config();
-    config.roots.retain(|entry| entry != &path && entry != &target_text);
-    let mut current = state.root.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
-    if current == target {
-        current = config
-            .roots
-            .first()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| Launcher::from_root(None).root);
-        let text = current.display().to_string();
-        if !config.roots.contains(&text) {
-            config.roots.push(text.clone());
+async fn migrate_legacy(state: State<'_, AppState>) -> Result<store::MigrationReport, String> {
+    if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
+        return Err("close the running game before migrating".to_string());
+    }
+    let Some(root) = store::legacy_root() else {
+        return Err("no old data directory found".to_string());
+    };
+    let report = tauri::async_runtime::spawn_blocking(move || store::migrate_legacy(&root))
+        .await
+        .map_err(|error| error.to_string())??;
+    let path = PathBuf::from(&report.root);
+    *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
+    state
+        .configured
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(report)
+}
+
+/// Register versions from an existing game directory, all at once. Nothing is
+/// copied and nothing is overwritten.
+#[tauri::command]
+async fn import_added_path(
+    state: State<'_, AppState>,
+    path: String,
+    versions: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
+        return Err("close the running game before adding instances".to_string());
+    }
+    let launcher = state_launcher(&state);
+    let path = PathBuf::from(path);
+    tauri::async_runtime::spawn_blocking(move || {
+        let scan = launcher.import_candidates(&path).map_err(message)?;
+        let picked: Vec<String> = if versions.is_empty() {
+            scan.versions.iter().map(|candidate| candidate.id.clone()).collect()
+        } else {
+            versions
+        };
+        let mut added = Vec::new();
+        for id in picked {
+            // Reuse the existing importer so the game-dir detection and the
+            // version-isolation rules stay in one place.
+            match launcher.import_instance(&path, None, Some(&id), &|_: InstallEvent| {}) {
+                Ok(instance) => added.push(instance.name),
+                Err(error) => eprintln!("cannot register {id}: {error:#}"),
+            }
         }
-        config.current = Some(text);
-        *state.root.lock().unwrap_or_else(|poison| poison.into_inner()) = current.clone();
-    }
-    save_root_config(&config);
-    RootsResponse {
-        current: current.display().to_string(),
-        roots: config.roots,
-    }
+        Ok(added)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2083,44 +2243,27 @@ struct RootConfig {
     current: Option<String>,
 }
 
-fn root_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("tntl").join("roots.json"))
-}
-
-fn load_root_config() -> RootConfig {
-    let Some(path) = root_config_path() else {
-        return RootConfig::default();
-    };
-    let Ok(bytes) = std::fs::read(path) else {
-        return RootConfig::default();
-    };
-    serde_json::from_slice(&bytes).unwrap_or_default()
-}
-
-fn save_root_config(config: &RootConfig) {
-    let Some(path) = root_config_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(body) = serde_json::to_vec_pretty(config) {
-        let _ = std::fs::write(path, body);
-    }
-}
-
 fn initial_root() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("TNTL_ROOT")
+    // An explicit override only counts when it is an absolute directory; a
+    // stray argument (a dropped file, an OS flag) must not become the data
+    // directory.
+    let explicit = std::env::var_os("TNTL_ROOT")
         .map(PathBuf::from)
-        .or_else(|| std::env::args().nth(1).map(PathBuf::from))
-    {
-        return explicit;
+        .or_else(|| {
+            std::env::args()
+                .nth(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .map(PathBuf::from)
+        })
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .map(|path| tntl_store::simplify_path(&path));
+    if let Some(path) = explicit {
+        return path;
     }
-    let config = load_root_config();
-    if let Some(current) = config.current.filter(|path| PathBuf::from(path).is_dir()) {
-        return PathBuf::from(current);
+    if let Some(root) = store::configured_root() {
+        return root;
     }
-    Launcher::from_root(None).root
+    store::unconfigured_root()
 }
 
 /// A GUI-subsystem binary dies without a word when startup fails or a thread
@@ -2128,9 +2271,8 @@ fn initial_root() -> PathBuf {
 /// file and show the reason in a dialog instead. Startup stages go here too, so
 /// a run that dies before the window opens shows how far it got.
 fn append_log(kind: &str, detail: &str) -> Option<PathBuf> {
-    let path = dirs::data_dir()
+    let path = store::bootstrap_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("tntl")
         .join("logs")
         .join("launcher.log");
     if let Some(parent) = path.parent() {
@@ -2262,6 +2404,63 @@ fn install_panic_hook() {
     }));
 }
 
+#[tauri::command]
+async fn update_check() -> Result<tntl_app::update::UpdateStatus, String> {
+    tauri::async_runtime::spawn_blocking(tntl_app::update::check)
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(message)
+}
+
+#[tauri::command]
+async fn update_download(
+    app: tauri::AppHandle,
+    asset: tntl_app::update::UpdateAsset,
+) -> Result<String, String> {
+    let dir = store::bootstrap_dir()
+        .ok_or_else(|| "no config directory available".to_string())?
+        .join("updates");
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut sent = 0u64;
+        let handle = app.clone();
+        let path = tntl_app::update::download(&asset, &dir, &mut |done| {
+            if done >= sent + 512 * 1024 {
+                sent = done;
+                let _ = handle.emit("update-progress", serde_json::json!({ "done": done }));
+            }
+        })
+        .map_err(message)?;
+        Ok(path.display().to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Swap the executable (or start the installer) and exit; on Linux deb the file
+/// is only returned so the user can install it themselves.
+#[tauri::command]
+fn update_apply(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    match update_apply::apply(&app, Path::new(&path)) {
+        Ok(action) => Ok(action),
+        Err(file) => Ok(format!("manual:{file}")),
+    }
+}
+
+#[tauri::command]
+fn unregister_version(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state_launcher(&state).unregister_version(&id).map_err(message)
+}
+
+#[tauri::command]
+fn restore_version(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state_launcher(&state).restore_version(&id).map_err(message)
+}
+
+#[tauri::command]
+fn restore_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    state_launcher(&state).restore_instance(&name).map_err(message)
+}
+
 fn main() {
     // Answer `--version` before the toolkit starts: the packaged shell has no
     // CLI binary, so this is how a terminal finds out what is installed.
@@ -2305,6 +2504,7 @@ fn main() {
         })
         .manage(AppState {
             root: Mutex::new(root),
+            configured: std::sync::atomic::AtomicBool::new(store::configured_root().is_some()),
             game: Mutex::new(None),
             launching: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2312,6 +2512,17 @@ fn main() {
             roots,
             set_root,
             forget_root,
+            session,
+            path_info,
+            choose_data_root,
+            migrate_legacy,
+            import_added_path,
+            unregister_version,
+            restore_version,
+            restore_instance,
+            update_check,
+            update_download,
+            update_apply,
             bootstrap,
             list_instances,
             list_versions,
