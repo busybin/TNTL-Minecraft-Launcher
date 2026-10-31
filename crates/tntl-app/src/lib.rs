@@ -7921,7 +7921,8 @@ mod tests {
             .import_instance(&version, Some("nested"), None, &|_: InstallEvent| {})
             .unwrap();
         assert_eq!(nested.version_id, "1.21.1-Neoforge");
-        assert_eq!(nested.root.as_deref(), Some(game.as_path()));
+        // The stored root is canonical; `temp_dir()` is a 8.3 short name on Windows.
+        assert!(nested.root.as_deref().is_some_and(|root| same_dir(root, &game)));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -8300,7 +8301,7 @@ mod tests {
         // holds `instance.json`.
         let unregistered = launcher.unregister("imported").unwrap();
         assert!(unregistered.dir.join(tntl_instance::INSTANCE_FILE).is_file());
-        assert_eq!(unregistered.files_dir, game);
+        assert!(same_dir(&unregistered.files_dir, &game));
         assert!(unregistered.external_game_dir);
         assert!(launcher.version_installed("1.20.1"));
         assert!(external_json.is_file());
@@ -8329,7 +8330,7 @@ mod tests {
         let instance = launcher.load_instance("copy").unwrap();
         // The shared root stays where it was, so the copy can resolve the
         // version without duplicating libraries and assets.
-        assert_eq!(instance.root.as_deref(), Some(game.as_path()));
+        assert!(instance.root.as_deref().is_some_and(|root| same_dir(root, &game)));
         assert_eq!(instance.game_dir(&copy), copy.join("minecraft"));
         assert!(copy.join("minecraft/mods/a.jar").is_file());
         assert!(!copy.join("minecraft/versions").exists());
