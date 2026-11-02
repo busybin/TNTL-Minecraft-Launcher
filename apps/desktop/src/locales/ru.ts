@@ -915,6 +915,7 @@ const ru: Record<string, string> = {
   "bisect.start": "Начать поиск",
   "bisect.starting": "Подготовка следующего запуска…",
   "bisect.testing": "Запуск {index}: {kind}",
+  "bisect.restoring": "Восстановление исходных переключателей модов…",
   "bisect.modsOn": "Включено {enabled} из {total} модов",
   "bisect.crashed": "Падение",
   "bisect.passed": "Меню достигнуто",

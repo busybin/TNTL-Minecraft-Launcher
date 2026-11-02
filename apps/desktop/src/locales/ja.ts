@@ -915,6 +915,7 @@ const ja: Record<string, string> = {
   "bisect.start": "二分探索を開始",
   "bisect.starting": "次の起動を準備中…",
   "bisect.testing": "起動 {index}: {kind}",
+  "bisect.restoring": "元のMODスイッチを復元しています…",
   "bisect.modsOn": "{total}個中{enabled}個のMODが有効",
   "bisect.crashed": "クラッシュ",
   "bisect.passed": "メニュー到達",

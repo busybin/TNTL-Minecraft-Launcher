@@ -915,6 +915,7 @@ const zh: Record<string, string> = {
   "bisect.start": "开始二分",
   "bisect.starting": "正在准备下一次启动…",
   "bisect.testing": "第 {index} 次启动：{kind}",
+  "bisect.restoring": "正在恢复原来的模组开关…",
   "bisect.modsOn": "已启用 {enabled}/{total} 个模组",
   "bisect.crashed": "崩溃",
   "bisect.passed": "进入主菜单",

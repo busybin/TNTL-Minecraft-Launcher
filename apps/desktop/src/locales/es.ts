@@ -915,6 +915,7 @@ const es: Record<string, string> = {
   "bisect.start": "Iniciar bisección",
   "bisect.starting": "Preparando el siguiente inicio…",
   "bisect.testing": "Inicio {index}: {kind}",
+  "bisect.restoring": "Restaurando los interruptores originales de los mods…",
   "bisect.modsOn": "{enabled} de {total} mods activos",
   "bisect.crashed": "Falló",
   "bisect.passed": "Llegó al menú",

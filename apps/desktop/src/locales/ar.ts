@@ -915,6 +915,7 @@ const ar: Record<string, string> = {
   "bisect.start": "ابدأ البحث الثنائي",
   "bisect.starting": "جارٍ تحضير التشغيل التالي…",
   "bisect.testing": "تشغيل {index}: {kind}",
+  "bisect.restoring": "جارٍ استعادة مفاتيح الإضافات الأصلية…",
   "bisect.modsOn": "{enabled} من {total} مود مفعّل",
   "bisect.crashed": "تعطّل",
   "bisect.passed": "وصل إلى القائمة",

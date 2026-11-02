@@ -915,6 +915,7 @@ const en: Record<string, string> = {
   "bisect.start": "Start bisect",
   "bisect.starting": "Preparing the next launch…",
   "bisect.testing": "Launch {index}: {kind}",
+  "bisect.restoring": "Restoring the original mod switches…",
   "bisect.modsOn": "{enabled} of {total} mods enabled",
   "bisect.crashed": "Crashed",
   "bisect.passed": "Reached the menu",
