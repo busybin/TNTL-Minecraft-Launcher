@@ -287,6 +287,11 @@ fn write_archive(source: &Path, world: &str, target: &Path) -> Result<(), WorldE
     Ok(())
 }
 
+/// Resolve and validate one world directory without changing it.
+pub fn dir(game_dir: &Path, world: &str) -> Result<std::path::PathBuf, WorldError> {
+    world_path(game_dir, world)
+}
+
 /// Delete a world directory. Refuses a directory that is a link (the target
 /// belongs to whoever it points at) and anything without `level.dat`, so a
 /// hand-made folder under `saves/` cannot be swept away by a typo.
@@ -301,6 +306,18 @@ pub fn delete(game_dir: &Path, world: &str) -> Result<(), WorldError> {
         )));
     }
     tntl_store::remove_dir_within(game_dir, &path).map_err(|error| io_err(&path, error))
+}
+
+/// Resolve one backup archive after the same name checks `delete_backup` uses.
+pub fn backup_path(backup_dir: &Path, file: &str) -> Result<std::path::PathBuf, WorldError> {
+    if !valid_name(file) || !file.ends_with(".zip") {
+        return Err(WorldError::Invalid(format!("invalid backup {file}")));
+    }
+    let path = backup_dir.join(file);
+    if !path.is_file() {
+        return Err(WorldError::Invalid(format!("backup {file} does not exist")));
+    }
+    Ok(path)
 }
 
 /// Delete one world backup archive.

@@ -23,6 +23,8 @@ use tntl_store::safe_relative;
 pub enum FtbError {
     #[error(transparent)]
     Source(#[from] SourceError),
+    #[error(transparent)]
+    Store(#[from] tntl_store::StoreError),
     #[error("{0}")]
     Invalid(String),
     #[error("io error at {path}: {source}")]
@@ -249,6 +251,7 @@ impl Ftb {
         version: &PackVersion,
         game_dir: &Path,
         concurrency: usize,
+        transaction: Option<&tntl_store::SharedTransaction>,
         progress: &(dyn Fn(PackEvent) + Send + Sync),
     ) -> Result<PackReport, FtbError> {
         fs::create_dir_all(game_dir).map_err(|source| FtbError::Io {
@@ -298,6 +301,12 @@ impl Ftb {
                         if !dest.starts_with(game_dir) {
                             *failure.lock().unwrap_or_else(|poison| poison.into_inner()) =
                                 Some(FtbError::Invalid(format!("unsafe file path: {}", file.path)));
+                            break;
+                        }
+                        if let Some(transaction) = transaction
+                            && let Err(error) = transaction.prepare(&dest)
+                        {
+                            *failure.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(error.into());
                             break;
                         }
                         let mut request = DownloadRequest::new(&file.url, &dest);

@@ -25,6 +25,13 @@ local builds but **not** for a public release.
 Generate a key once, offline:
 
 ```sh
+scripts/update-keygen.sh update-key.pem
+```
+
+It prints the value for `TNTL_UPDATE_PUBKEY` and refuses to overwrite an
+existing key. The underlying commands are:
+
+```sh
 openssl genpkey -algorithm ed25519 -out update-key.pem
 openssl pkey -in update-key.pem -pubout -outform DER | tail -c 32 | xxd -p -c 32
 ```

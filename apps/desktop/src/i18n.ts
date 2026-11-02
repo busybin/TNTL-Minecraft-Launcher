@@ -89,6 +89,11 @@ export function setLocale(next: LocaleChoice) {
   }
 }
 
+/** Whether a key is defined in the active locale or the English fallback. */
+export function has(key: string): boolean {
+  return tables[locale.value]?.[key] !== undefined || tables.en[key] !== undefined;
+}
+
 export function t(key: string, values?: Record<string, string | number>): string {
   let text = tables[locale.value]?.[key] ?? tables.en[key] ?? key;
   if (values) {

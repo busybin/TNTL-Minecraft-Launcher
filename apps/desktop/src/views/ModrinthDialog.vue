@@ -16,7 +16,7 @@ import {
 } from "../api";
 import Icon from "../components/Icon.vue";
 import TransferBar from "../components/TransferBar.vue";
-import { t } from "../i18n";
+import { has, locale, t } from "../i18n";
 import { useTransfer } from "../progress";
 
 const props = defineProps<{ instance: string; kind?: ProjectKind }>();
@@ -150,17 +150,30 @@ async function loadCategories() {
   }
 }
 
-const CATEGORY_KEYS: Record<string, string> = {
-  optimization: "optimization",
-  audio: "audio",
-  "game-mechanics": "gameMechanics",
-  gameplay: "gameplay",
-};
+/** Slug or display name -> the `category.*` key used by every locale. */
+function categoryKey(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
 
 function categoryLabel(entry: CategoryView): string {
-  const key = CATEGORY_KEYS[entry.slug.toLowerCase()] ?? CATEGORY_KEYS[entry.name.toLowerCase()];
-  return key ? t(`category.${key}`) : entry.name;
+  for (const raw of [entry.slug, entry.name]) {
+    if (!raw) continue;
+    const key = `category.${categoryKey(raw)}`;
+    if (has(key)) return t(key);
+  }
+  return entry.name;
 }
+
+/** Localized labels mean the dropdown has to be sorted per language. */
+const categoryOptions = computed(() =>
+  [...categories.value].sort((left, right) =>
+    categoryLabel(left).localeCompare(categoryLabel(right), locale.value),
+  ),
+);
 
 async function search(more: boolean) {
   if (more && (searching.value || loadingMore.value)) return;
@@ -464,7 +477,7 @@ function formatDownloads(value: number): string {
           @change="pickCategory(($event.target as HTMLSelectElement).value)"
         >
           <option value="">{{ t("modrinth.allCategories") }}</option>
-          <option v-for="entry in categories" :key="entry.key" :value="entry.key">
+          <option v-for="entry in categoryOptions" :key="entry.key" :value="entry.key">
             {{ categoryLabel(entry) }}
           </option>
         </select>

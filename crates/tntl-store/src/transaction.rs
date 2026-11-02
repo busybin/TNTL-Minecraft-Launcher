@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,13 @@ impl FileTransaction {
         });
         self.save_journal()?;
         Ok(true)
+    }
+
+    /// Back up an existing file and mark its replacement as new. Use this
+    /// before overwriting a file so a failed update restores the old bytes.
+    pub fn prepare(&mut self, path: &Path) -> Result<(), StoreError> {
+        self.trash(path)?;
+        self.track_created(path.to_path_buf())
     }
 
     /// Remember a file produced by the new state; rollback removes it.
@@ -143,6 +151,47 @@ impl FileTransaction {
                 committed: self.committed,
             },
         )
+    }
+}
+
+/// A `FileTransaction` shared with download workers. Every write goes through
+/// `prepare`, so the whole pack update can be rolled back as one unit.
+pub struct SharedTransaction {
+    inner: Mutex<FileTransaction>,
+}
+
+impl SharedTransaction {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Ok(Self {
+            inner: Mutex::new(FileTransaction::new(root)?),
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, FileTransaction> {
+        self.inner.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Back up the file at `path` and register its replacement.
+    pub fn prepare(&self, path: &Path) -> Result<(), StoreError> {
+        self.lock().prepare(path)
+    }
+
+    pub fn trash(&self, path: &Path) -> Result<bool, StoreError> {
+        self.lock().trash(path)
+    }
+
+    pub fn track_created(&self, path: impl Into<PathBuf>) -> Result<(), StoreError> {
+        self.lock().track_created(path)
+    }
+
+    pub fn commit(self) -> Result<(), StoreError> {
+        let transaction = self.inner.into_inner().unwrap_or_else(|poison| poison.into_inner());
+        transaction.commit()
+    }
+
+    pub fn rollback(self) -> Result<(), StoreError> {
+        let transaction = self.inner.into_inner().unwrap_or_else(|poison| poison.into_inner());
+        transaction.rollback()
     }
 }
 
@@ -246,6 +295,47 @@ mod tests {
         assert_eq!(fs::read(&old).unwrap(), b"old");
         assert!(!new.exists());
         assert!(!base.join("txn").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn prepare_restores_an_overwritten_file_on_rollback() {
+        let base = dir("prepare");
+        let path = base.join("config/a.txt");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"old").unwrap();
+        let transaction = SharedTransaction::new(base.join("txn")).unwrap();
+        transaction.prepare(&path).unwrap();
+        fs::write(&path, b"new").unwrap();
+        transaction.rollback().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert!(!base.join("txn").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn prepare_removes_a_new_file_on_rollback() {
+        let base = dir("prepare-new");
+        let path = base.join("mods/new.jar");
+        let transaction = SharedTransaction::new(base.join("txn")).unwrap();
+        transaction.prepare(&path).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"new").unwrap();
+        transaction.rollback().unwrap();
+        assert!(!path.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn prepare_keeps_the_new_file_on_commit() {
+        let base = dir("prepare-commit");
+        let path = base.join("a.txt");
+        fs::write(&path, b"old").unwrap();
+        let transaction = SharedTransaction::new(base.join("txn")).unwrap();
+        transaction.prepare(&path).unwrap();
+        fs::write(&path, b"new").unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
         fs::remove_dir_all(base).unwrap();
     }
 

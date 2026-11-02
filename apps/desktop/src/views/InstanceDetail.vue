@@ -5,6 +5,7 @@ import {
   events,
   formatBytes,
   formatDate,
+  formatDateTime,
   formatPlaytime,
   imageUrl,
   bytesImageUrl,
@@ -34,6 +35,7 @@ import {
   type ServerStatus,
   type UnlistenFn,
   jobTag,
+  type TrashEntry,
   type WorldBackup,
   type WorldInfo,
 } from "../api";
@@ -81,10 +83,13 @@ type Tab =
   | "datapacks"
   | "servers"
   | "logs"
+  | "trash"
   | "integrity"
   | "manage";
 
 const tab = ref<Tab>("overview");
+const trash = ref<TrashEntry[]>([]);
+const trashBusy = ref(false);
 const panelRef = ref<HTMLElement | null>(null);
 
 const TAB_GROUPS: { label: string; items: { id: Tab; label: string; icon: string }[] }[] = [
@@ -112,6 +117,7 @@ const TAB_GROUPS: { label: string; items: { id: Tab; label: string; icon: string
     items: [
       { id: "servers", label: "editor.servers", icon: "server" },
       { id: "logs", label: "detail.logsTab", icon: "terminal" },
+      { id: "trash", label: "detail.trashTab", icon: "trash" },
       { id: "integrity", label: "editor.integrity", icon: "check" },
     ],
   },
@@ -542,6 +548,7 @@ async function reloadLists() {
     reloadServers().then(pingAll),
     reloadMedia(),
     reloadLoader(),
+    loadTrash(),
   ]);
 }
 
@@ -570,6 +577,7 @@ watch(tab, (next) => {
   if (next === "logs" || next === "screenshots") {
     void reloadMedia();
   }
+  if (next === "trash") void loadTrash();
 });
 
 onBeforeUnmount(() => {
@@ -1118,6 +1126,59 @@ function parseEnv(text: string): Record<string, string> {
     env[trimmed.slice(0, index).trim()] = trimmed.slice(index + 1);
   }
   return env;
+}
+
+async function loadTrash() {
+  try {
+    trash.value = await api.trashEntries(config.value?.name ?? props.name);
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+async function refreshAfterRestore(kind: string) {
+  if (kind === "world" || kind === "backup") await reloadWorlds();
+  else if (kind === "mod") await reloadMods();
+  else if (kind === "resourcepack" || kind === "shader") await reloadContent();
+}
+
+async function restoreTrashEntry(entry: TrashEntry) {
+  if (trashBusy.value) return;
+  trashBusy.value = true;
+  try {
+    trash.value = await api.restoreTrash(config.value?.name ?? props.name, entry.id);
+    await refreshAfterRestore(entry.kind);
+  } catch (cause) {
+    error.value = String(cause);
+  } finally {
+    trashBusy.value = false;
+  }
+}
+
+async function deleteTrashEntry(entry: TrashEntry) {
+  if (trashBusy.value) return;
+  if (!window.confirm(t("detail.trashPurgeConfirm"))) return;
+  trashBusy.value = true;
+  try {
+    trash.value = await api.deleteTrash(config.value?.name ?? props.name, entry.id);
+  } catch (cause) {
+    error.value = String(cause);
+  } finally {
+    trashBusy.value = false;
+  }
+}
+
+async function emptyTrash() {
+  if (trashBusy.value || !trash.value.length) return;
+  if (!window.confirm(t("detail.trashEmptyConfirm"))) return;
+  trashBusy.value = true;
+  try {
+    trash.value = await api.emptyTrash(config.value?.name ?? props.name);
+  } catch (cause) {
+    error.value = String(cause);
+  } finally {
+    trashBusy.value = false;
+  }
 }
 
 async function reloadWorlds() {
@@ -1845,6 +1906,8 @@ function tabCount(id: Tab): number | null {
       return crashes.value.length || null;
     case "screenshots":
       return shots.value.length || null;
+    case "trash":
+      return trash.value.length || null;
     default:
       return null;
   }
@@ -2792,6 +2855,46 @@ async function openPath(path: string) {
             </div>
           </div>
           <pre v-if="crashText" class="crash-text scroll">{{ crashText }}</pre>
+        </div>
+
+        <div v-if="tab === 'trash'" class="group">
+          <div class="group-head">
+            <h3>
+              {{ t("detail.trashTab") }}
+              <span v-if="trash.length" class="count">{{ trash.length }}</span>
+            </h3>
+            <button class="ghost small danger-text" type="button" :disabled="trashBusy || !trash.length" @click="emptyTrash">
+              <Icon name="trash" :size="13" />{{ t("detail.trashEmpty") }}
+            </button>
+            <button class="ghost small" type="button" @click="loadTrash">
+              <Icon name="refresh" :size="13" />{{ t("editor.refreshMedia") }}
+            </button>
+          </div>
+          <p class="hint">{{ t("detail.trashHint") }}</p>
+          <p v-if="!trash.length" class="mods-empty">{{ t("detail.trashEmptyHint") }}</p>
+          <ul v-else class="mods">
+            <li v-for="entry in trash" :key="entry.id">
+              <div class="mod-text">
+                <strong>{{ entry.name }}</strong>
+                <small>
+                  {{ t(`detail.trashKind.${entry.kind}`) }} · {{ formatBytes(entry.bytes) }} ·
+                  {{ formatDateTime(entry.deleted_ms) }}
+                </small>
+              </div>
+              <button class="ghost small" type="button" :disabled="trashBusy" @click="restoreTrashEntry(entry)">
+                {{ t("detail.trashRestore") }}
+              </button>
+              <button
+                class="icon danger"
+                type="button"
+                :disabled="trashBusy"
+                :title="t('detail.trashPurge')"
+                @click="deleteTrashEntry(entry)"
+              >
+                <Icon name="trash" :size="14" />
+              </button>
+            </li>
+          </ul>
         </div>
 
         <div v-if="tab === 'screenshots'" class="group">

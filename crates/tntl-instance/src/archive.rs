@@ -27,6 +27,8 @@ const SKIP: &[&str] = &[
     "logs",
     "crash-reports",
     "backups",
+    ".trash",
+    ".txn",
     "launcher_accounts.json",
     "launcher_profiles.json",
     "launcher_profiles_microsoft_store.json",

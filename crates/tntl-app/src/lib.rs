@@ -1639,7 +1639,7 @@ impl Launcher {
         let result = (|| -> Result<ModpackReport> {
             let mut instance = self.load_instance(&name)?;
             let game_dir = instance.game_dir(&instance_dir);
-            let files = ftb.install(&version, &game_dir, self.settings().concurrency, pack_progress)?;
+            let files = ftb.install(&version, &game_dir, self.settings().concurrency, None, pack_progress)?;
             // Large FTB packs rarely fit in the 4 GiB default. An existing
             // choice always wins over the pack's suggestion.
             if let Some(recommended) = version.recommended_memory_mb {
@@ -1719,9 +1719,9 @@ impl Launcher {
             let instance = self.load_instance(&name)?;
             let game_dir = instance.game_dir(&instance_dir);
             let plans = self.curseforge_plan(&curseforge, &manifest)?;
-            let mut files = self.curseforge_download(&http, &game_dir, &plans, pack_progress)?;
+            let mut files = self.curseforge_download(&http, &game_dir, &plans, None, pack_progress)?;
             files.overrides =
-                tntl_curseforge::extract_overrides(&archive, &manifest, &game_dir, &mut |prefix, entries| {
+                tntl_curseforge::extract_overrides(&archive, &manifest, &game_dir, None, &mut |prefix, entries| {
                     pack_progress(PackEvent::Extracting {
                         prefix: prefix.to_string(),
                         entries,
@@ -1913,6 +1913,7 @@ impl Launcher {
         http: &Http,
         game_dir: &Path,
         plans: &[CursePackDownload],
+        transaction: Option<&tntl_store::SharedTransaction>,
         progress: &(dyn Fn(PackEvent) + Send + Sync),
     ) -> Result<PackReport> {
         fs::create_dir_all(game_dir)?;
@@ -1947,6 +1948,9 @@ impl Launcher {
                     bytes_total,
                 });
             };
+            if let Some(transaction) = transaction {
+                transaction.prepare(&dest)?;
+            }
             let outcome = http.download(&request, &mut sink)?;
             report.files += 1;
             bytes_done += plan.size;
@@ -2033,11 +2037,10 @@ impl Launcher {
         let dir = self.instance_dir(&instance.name)?;
         let game_dir = instance.game_dir(&dir);
         let plans = self.curseforge_plan(&curseforge, &manifest)?;
-        let mut files = self.curseforge_download(&http, &game_dir, &plans, pack_progress)?;
+        let transaction = tntl_store::SharedTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
+        let mut files = self.curseforge_download(&http, &game_dir, &plans, Some(&transaction), pack_progress)?;
         // Install first, then drop files the new build no longer ships.
         let keep: HashSet<&str> = plans.iter().map(|plan| plan.path.as_str()).collect();
-        let mut transaction =
-            tntl_store::FileTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
         let mut removed = 0;
         for entry in &source.files {
             if keep.contains(entry.path.as_str()) {
@@ -2062,13 +2065,18 @@ impl Launcher {
                 removed += 1;
             }
         }
-        files.overrides =
-            tntl_curseforge::extract_overrides(&archive, &manifest, &game_dir, &mut |prefix, entries| {
+        files.overrides = tntl_curseforge::extract_overrides(
+            &archive,
+            &manifest,
+            &game_dir,
+            Some(&transaction),
+            &mut |prefix, entries| {
                 pack_progress(PackEvent::Extracting {
                     prefix: prefix.to_string(),
                     entries,
                 })
-            })?;
+            },
+        )?;
         let updated = CursePackSource {
             project_id: source.project_id,
             pack_name: manifest.display_name(),
@@ -2081,7 +2089,9 @@ impl Launcher {
             loader_version: install.loader_version.clone(),
             files: plans.iter().map(curse_pack_entry).collect(),
         };
+        transaction.prepare(&dir.join(CURSEFORGE_PACK_FILE))?;
         tntl_store::atomic_write_json(&dir.join(CURSEFORGE_PACK_FILE), &updated)?;
+        transaction.prepare(&dir.join(tntl_instance::INSTANCE_FILE))?;
         self.set_instance_version(&instance.name, &report.version_id)?;
         transaction.commit()?;
 
@@ -3021,6 +3031,7 @@ impl Launcher {
             DiskEntry::new("game_files", "Game files", game_dir.clone()),
             DiskEntry::new("natives", "Natives", dir.join("natives")),
             DiskEntry::new("logs", "Logs", dir.join("logs")),
+            DiskEntry::new("trash", "Trash", dir.join(".trash")),
             DiskEntry::new("crash_reports", "Crash reports", game_dir.join("crash-reports")),
             DiskEntry::new("world_backups", "World backups", dir.join("backups")),
             DiskEntry::new("shared_assets", "Shared assets", self.root.join("assets")),
@@ -3944,7 +3955,7 @@ impl Launcher {
             let instance = self.load_instance(&name)?;
             let game_dir = instance.game_dir(&instance_dir);
             let http = Http::new()?;
-            let files = pack.install(&http, &game_dir, &mut |event| pack_progress(event))?;
+            let files = pack.install(&http, &game_dir, None, &mut |event| pack_progress(event))?;
             tntl_store::atomic_write_json(&instance_dir.join(PACK_FILE), &pack.index)?;
             self.identify_pack(&pack, archive, &http, &instance_dir);
             Ok(ModpackReport {
@@ -4132,11 +4143,13 @@ impl Launcher {
             let game_dir = instance.game_dir(&dir);
             // Install first, then drop files the new build no longer ships; a
             // failure halfway must not leave the instance without its mods.
-            let files = pack.install(&http, &game_dir, &mut |event| pack_progress(event))?;
-            let mut transaction =
-                tntl_store::FileTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
-            let removed = remove_stale_pack_files(&game_dir, &old_index, &pack.index, &mut transaction)?;
+            let transaction =
+                tntl_store::SharedTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
+            let files = pack.install(&http, &game_dir, Some(&transaction), &mut |event| pack_progress(event))?;
+            let removed = remove_stale_pack_files(&game_dir, &old_index, &pack.index, &transaction)?;
+            transaction.prepare(&dir.join(PACK_FILE))?;
             tntl_store::atomic_write_json(&dir.join(PACK_FILE), &pack.index)?;
+            transaction.prepare(&dir.join(PACK_SOURCE_FILE))?;
             tntl_store::atomic_write_json(
                 &dir.join(PACK_SOURCE_FILE),
                 &PackSource {
@@ -4144,6 +4157,7 @@ impl Launcher {
                     version_number: version.version_number.clone(),
                 },
             )?;
+            transaction.prepare(&dir.join(tntl_instance::INSTANCE_FILE))?;
             self.set_instance_version(name, &report.version_id)?;
             transaction.commit()?;
             Ok(PackUpdateReport {
@@ -4216,7 +4230,7 @@ impl Launcher {
         } else if let Some(source) = read_ftb_source(&dir) {
             let ftb = tntl_ftb::Ftb::new(&http);
             let version = ftb.version(source.pack_id, source.version_id)?;
-            let pack = ftb.install(&version, &game_dir, self.settings().concurrency, pack_progress)?;
+            let pack = ftb.install(&version, &game_dir, self.settings().concurrency, None, pack_progress)?;
             report.pack_downloaded = pack.downloaded;
             report.pack_skipped = pack.skipped;
             report.bytes += pack.bytes;
@@ -4224,7 +4238,7 @@ impl Launcher {
         } else if let Some(source) = read_curseforge_source(&dir) {
             let curseforge = self.curseforge(&http)?;
             let plans = self.curseforge_source_plan(&curseforge, &source)?;
-            let pack = self.curseforge_download(&http, &game_dir, &plans, pack_progress)?;
+            let pack = self.curseforge_download(&http, &game_dir, &plans, None, pack_progress)?;
             report.pack_downloaded = pack.downloaded;
             report.pack_skipped = pack.skipped;
             report.bytes += pack.bytes;
@@ -4306,12 +4320,17 @@ impl Launcher {
 
         let dir = self.instance_dir(&instance.name)?;
         let game_dir = instance.game_dir(&dir);
-        let files = ftb.install(&version, &game_dir, self.settings().concurrency, pack_progress)?;
+        let transaction = tntl_store::SharedTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
+        let files = ftb.install(
+            &version,
+            &game_dir,
+            self.settings().concurrency,
+            Some(&transaction),
+            pack_progress,
+        )?;
         // Install first, then drop files the new build no longer ships; a
         // failure halfway must not leave the instance without its mods.
         let keep: HashSet<&str> = version.client_files().map(|file| file.path.as_str()).collect();
-        let mut transaction =
-            tntl_store::FileTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
         let mut removed = 0;
         for file in &source.files {
             if keep.contains(file.path.as_str()) {
@@ -4353,7 +4372,9 @@ impl Launcher {
                 })
                 .collect(),
         };
+        transaction.prepare(&dir.join(FTB_FILE))?;
         tntl_store::atomic_write_json(&dir.join(FTB_FILE), &updated_source)?;
+        transaction.prepare(&dir.join(tntl_instance::INSTANCE_FILE))?;
         self.set_instance_version(&instance.name, &report.version_id)?;
         transaction.commit()?;
 
@@ -4812,20 +4833,15 @@ impl Launcher {
     pub fn remove_mod(&self, name: &str, file: &str) -> Result<Vec<tntl_instance::mods::ModInfo>> {
         self.ensure_not_running(name)?;
         let path = self.mod_path(name, file)?;
-        let mut transaction = tntl_store::FileTransaction::new(
-            self.instance_dir(name)?
-                .join(".txn")
-                .join(format!("remove-{}", unix_millis())),
-        )?;
-        transaction.trash(&path)?;
+        let trash = self.instance_trash(name)?;
+        let entry = trash.put(&path, "mod", file)?;
         let mut record = ModrinthContent::load(&self.modrinth_content_path(name)?);
         if record.remove(ProjectKind::Mod, file)
             && let Err(error) = record.save(&self.modrinth_content_path(name)?)
         {
-            let _ = transaction.rollback();
+            let _ = trash.restore(&entry.id, &self.restore_roots(name)?);
             return Err(error);
         }
-        transaction.commit()?;
         self.mods(name)
     }
 
@@ -6194,15 +6210,24 @@ impl Launcher {
         }
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
-        tntl_instance::content::remove(&game_dir.join(kind.dir()), file)?;
-        let mut sources = self.content_sources(name)?;
-        if sources.entries(kind).iter().any(|(entry, _)| entry == file) {
-            sources.remove(kind, file);
-            sources.save(&self.content_sources_path(name)?)?;
-        }
-        let mut record = ModrinthContent::load(&self.modrinth_content_path(name)?);
-        if record.remove(kind, file) {
-            record.save(&self.modrinth_content_path(name)?)?;
+        let path = tntl_instance::content::path(&game_dir.join(kind.dir()), file)?;
+        let trash = self.instance_trash(name)?;
+        let entry = trash.put(&path, kind.key(), file)?;
+        let result = (|| -> Result<()> {
+            let mut sources = self.content_sources(name)?;
+            if sources.entries(kind).iter().any(|(entry, _)| entry == file) {
+                sources.remove(kind, file);
+                sources.save(&self.content_sources_path(name)?)?;
+            }
+            let mut record = ModrinthContent::load(&self.modrinth_content_path(name)?);
+            if record.remove(kind, file) {
+                record.save(&self.modrinth_content_path(name)?)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = trash.restore(&entry.id, &self.restore_roots(name)?);
+            return Err(error);
         }
         self.content(name, kind)
     }
@@ -6266,15 +6291,57 @@ impl Launcher {
     /// Delete one archive under `<instance>/backups/worlds/`.
     pub fn delete_world_backup(&self, name: &str, file: &str) -> Result<Vec<WorldBackup>> {
         let dir = self.instance_dir(name)?.join("backups").join("worlds");
-        tntl_instance::worlds::delete_backup(&dir, file)?;
+        let path = tntl_instance::worlds::backup_path(&dir, file)?;
+        self.instance_trash(name)?.put(&path, "backup", file)?;
         self.world_backups(name)
+    }
+
+    /// Roots a recycled item may be restored into.
+    fn restore_roots(&self, name: &str) -> Result<Vec<PathBuf>> {
+        let dir = self.instance_dir(name)?;
+        let instance = self.load_instance(name)?;
+        let game_dir = instance.game_dir(&dir);
+        Ok(vec![dir, game_dir])
+    }
+
+    fn instance_trash(&self, name: &str) -> Result<tntl_store::Trash> {
+        Ok(tntl_store::Trash::new(self.instance_dir(name)?.join(".trash")))
+    }
+
+    /// Items deleted from this instance and not purged yet, newest first.
+    pub fn trash_entries(&self, name: &str) -> Result<Vec<tntl_store::TrashEntry>> {
+        Ok(self.instance_trash(name)?.list())
+    }
+
+    pub fn restore_trash(&self, name: &str, id: &str) -> Result<Vec<tntl_store::TrashEntry>> {
+        self.ensure_not_running(name)?;
+        let roots = self.restore_roots(name)?;
+        self.instance_trash(name)?.restore(id, &roots)?;
+        self.trash_entries(name)
+    }
+
+    pub fn delete_trash(&self, name: &str, id: &str) -> Result<Vec<tntl_store::TrashEntry>> {
+        self.instance_trash(name)?.purge(id)?;
+        self.trash_entries(name)
+    }
+
+    pub fn empty_trash(&self, name: &str) -> Result<Vec<tntl_store::TrashEntry>> {
+        self.instance_trash(name)?.empty()?;
+        Ok(Vec::new())
     }
 
     pub fn delete_world(&self, name: &str, world: &str) -> Result<()> {
         self.ensure_not_running(name)?;
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
-        tntl_instance::worlds::delete(&game_dir, world)?;
+        let path = tntl_instance::worlds::dir(&game_dir, world)?;
+        if tntl_store::is_link(&path) {
+            bail!("refusing to delete {world}: it is a link");
+        }
+        if !path.join("level.dat").is_file() {
+            bail!("{world} has no level.dat, so it is not a world");
+        }
+        self.instance_trash(name)?.put(&path, "world", world)?;
         tntl_instance::datapacks::remove_world(&game_dir, world)?;
         Ok(())
     }
@@ -6937,7 +7004,7 @@ fn remove_stale_pack_files(
     game_dir: &Path,
     old: &PackIndex,
     new: &PackIndex,
-    transaction: &mut tntl_store::FileTransaction,
+    transaction: &tntl_store::SharedTransaction,
 ) -> Result<usize> {
     let keep: HashSet<&str> = new
         .files
@@ -9081,6 +9148,51 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_world_moves_it_to_trash_and_restores_it() {
+        let root = std::env::temp_dir().join(format!("tntl-world-trash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        launcher.create_instance(&Instance::new("live", "1.20.1")).unwrap();
+        let game = launcher.game_dir("live").unwrap();
+        let world = game.join("saves/Survival");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(world.join("level.dat"), b"level").unwrap();
+
+        launcher.delete_world("live", "Survival").unwrap();
+        assert!(!world.exists());
+        let entries = launcher.trash_entries("live").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "world");
+        assert_eq!(entries[0].name, "Survival");
+
+        launcher.restore_trash("live", &entries[0].id).unwrap();
+        assert!(world.join("level.dat").is_file());
+        assert!(launcher.trash_entries("live").unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_a_mod_keeps_a_restorable_copy() {
+        let root = std::env::temp_dir().join(format!("tntl-mod-trash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        launcher.create_instance(&Instance::new("live", "1.20.1")).unwrap();
+        let mods = launcher.game_dir("live").unwrap().join("mods");
+        fs::create_dir_all(&mods).unwrap();
+        fs::write(mods.join("a.jar"), b"jar").unwrap();
+
+        launcher.remove_mod("live", "a.jar").unwrap();
+        assert!(!mods.join("a.jar").exists());
+        let entries = launcher.trash_entries("live").unwrap();
+        assert_eq!(entries.len(), 1);
+        launcher.restore_trash("live", &entries[0].id).unwrap();
+        assert!(mods.join("a.jar").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn import_candidates_preselect_the_clicked_version() {
         let root = std::env::temp_dir().join(format!("tntl-import-picked-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -9505,8 +9617,8 @@ mod tests {
             files: vec![pack_file("mods/keep.jar", "aa")],
             ..PackIndex::default()
         };
-        let mut transaction = tntl_store::FileTransaction::new(dir.join(".txn/pack-test")).unwrap();
-        assert_eq!(remove_stale_pack_files(&dir, &old, &new, &mut transaction).unwrap(), 2);
+        let transaction = tntl_store::SharedTransaction::new(dir.join(".txn/pack-test")).unwrap();
+        assert_eq!(remove_stale_pack_files(&dir, &old, &new, &transaction).unwrap(), 2);
         transaction.commit().unwrap();
         assert!(!dir.join("mods/old.jar").exists());
         assert!(dir.join("mods/edited.jar").exists());

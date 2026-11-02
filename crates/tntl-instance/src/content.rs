@@ -426,6 +426,20 @@ pub fn expected_pack_format(game_version: &str) -> Option<u32> {
     (!game_version.trim().is_empty()).then(|| pack_format(game_version))
 }
 
+/// Resolve one pack file or directory after the same name checks `remove` uses.
+pub fn path(dir: &Path, file: &str) -> Result<std::path::PathBuf, ContentError> {
+    if file.is_empty()
+        || file == "."
+        || file == ".."
+        || file.contains(['/', '\\', ':'])
+        || file.starts_with('.')
+        || file.chars().any(char::is_control)
+    {
+        return Err(ContentError::InvalidName(file.to_string()));
+    }
+    Ok(dir.join(file))
+}
+
 /// Delete one file or unzipped pack folder from a content directory.
 pub fn remove(dir: &Path, file: &str) -> Result<(), ContentError> {
     if file.is_empty()

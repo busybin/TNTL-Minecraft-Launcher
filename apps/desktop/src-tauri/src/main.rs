@@ -1769,6 +1769,53 @@ async fn delete_world_backup(
 }
 
 #[tauri::command]
+async fn trash_entries(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<tntl_store::TrashEntry>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.trash_entries(&name).map_err(message))
+        .await
+        .map_err(message)?
+}
+
+#[tauri::command]
+async fn restore_trash(
+    state: State<'_, AppState>,
+    name: String,
+    id: String,
+) -> Result<Vec<tntl_store::TrashEntry>, String> {
+    ensure_stopped(&state, &name)?;
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.restore_trash(&name, &id).map_err(message))
+        .await
+        .map_err(message)?
+}
+
+#[tauri::command]
+async fn delete_trash(
+    state: State<'_, AppState>,
+    name: String,
+    id: String,
+) -> Result<Vec<tntl_store::TrashEntry>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.delete_trash(&name, &id).map_err(message))
+        .await
+        .map_err(message)?
+}
+
+#[tauri::command]
+async fn empty_trash(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<tntl_store::TrashEntry>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.empty_trash(&name).map_err(message))
+        .await
+        .map_err(message)?
+}
+
+#[tauri::command]
 async fn import_world(
     state: State<'_, AppState>,
     name: String,
@@ -3216,6 +3263,10 @@ fn main() {
             backup_world,
             delete_world_backup,
             delete_world,
+            trash_entries,
+            restore_trash,
+            delete_trash,
+            empty_trash,
             import_world,
             add_local_mod,
             add_local_content,

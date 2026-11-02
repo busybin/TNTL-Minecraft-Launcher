@@ -698,6 +698,14 @@ export interface WorldInfo {
 }
 
 /** Mirrors `tntl_app::WorldBackup`. */
+export interface TrashEntry {
+  id: string;
+  kind: string;
+  name: string;
+  bytes: number;
+  deleted_ms: number;
+}
+
 export interface WorldBackup {
   file: string;
   path: string;
@@ -910,6 +918,10 @@ export const api = {
   deleteWorldBackup: (name: string, file: string) =>
     invoke<WorldBackup[]>("delete_world_backup", { name, file }),
   deleteWorld: (name: string, world: string) => invoke<void>("delete_world", { name, world }),
+  trashEntries: (name: string) => invoke<TrashEntry[]>("trash_entries", { name }),
+  restoreTrash: (name: string, id: string) => invoke<TrashEntry[]>("restore_trash", { name, id }),
+  deleteTrash: (name: string, id: string) => invoke<TrashEntry[]>("delete_trash", { name, id }),
+  emptyTrash: (name: string) => invoke<TrashEntry[]>("empty_trash", { name }),
   duplicateWorld: (name: string, world: string) => invoke<WorldInfo>("duplicate_world", { name, world }),
   importWorld: (name: string, path: string) => invoke<WorldInfo>("import_world", { name, path }),
   addLocalMod: (name: string, path: string) => invoke<ModInfo[]>("add_local_mod", { name, path }),

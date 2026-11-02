@@ -11,7 +11,9 @@ use sha2::Sha512;
 use thiserror::Error;
 
 pub mod transaction;
-pub use transaction::FileTransaction;
+pub mod trash;
+pub use transaction::{FileTransaction, SharedTransaction};
+pub use trash::{Trash, TrashEntry};
 
 #[derive(Debug, Error)]
 pub enum StoreError {

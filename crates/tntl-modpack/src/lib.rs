@@ -171,13 +171,14 @@ pub fn repair_index(
 ) -> Result<PackReport, ModpackError> {
     fs::create_dir_all(game_dir).map_err(|error| io_error(game_dir, error))?;
     let files: Vec<&PackFile> = index.files.iter().filter(|file| file.client_side()).collect();
-    download_files(http, game_dir, &files, progress)
+    download_files(http, game_dir, &files, None, progress)
 }
 
 fn download_files(
     http: &Http,
     game_dir: &Path,
     files: &[&PackFile],
+    transaction: Option<&tntl_store::SharedTransaction>,
     progress: &mut dyn FnMut(PackEvent),
 ) -> Result<PackReport, ModpackError> {
     let mut report = PackReport::default();
@@ -235,6 +236,9 @@ fn download_files(
                 bytes_total,
             });
         };
+        if let Some(transaction) = transaction {
+            transaction.prepare(&dest)?;
+        }
         let outcome = http.download(&request, &mut sink)?;
         report.files += 1;
         bytes_done += file.file_size;
@@ -522,17 +526,23 @@ impl Modpack {
         &self,
         http: &Http,
         game_dir: &Path,
+        transaction: Option<&tntl_store::SharedTransaction>,
         progress: &mut dyn FnMut(PackEvent),
     ) -> Result<PackReport, ModpackError> {
         fs::create_dir_all(game_dir).map_err(|error| io_error(game_dir, error))?;
         let files: Vec<&PackFile> = self.client_files().collect();
-        let mut report = download_files(http, game_dir, &files, &mut |event| progress(event))?;
-        report.overrides = self.extract_overrides(game_dir, progress)?;
+        let mut report = download_files(http, game_dir, &files, transaction, &mut |event| progress(event))?;
+        report.overrides = self.extract_overrides(game_dir, transaction, progress)?;
         Ok(report)
     }
 
     /// Copy `overrides/` and then `client-overrides/` into the game directory.
-    fn extract_overrides(&self, game_dir: &Path, progress: &mut dyn FnMut(PackEvent)) -> Result<usize, ModpackError> {
+    fn extract_overrides(
+        &self,
+        game_dir: &Path,
+        transaction: Option<&tntl_store::SharedTransaction>,
+        progress: &mut dyn FnMut(PackEvent),
+    ) -> Result<usize, ModpackError> {
         let file = File::open(&self.archive).map_err(|error| io_error(&self.archive, error))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|error| ModpackError::Zip(error.to_string()))?;
         let mut written = 0;
@@ -568,7 +578,9 @@ impl Modpack {
                 }
                 // Keep whatever is already there (configs the user edited,
                 // options.txt) instead of truncating it.
-                if let Err(error) = tntl_store::backup_existing(&target) {
+                if let Some(transaction) = transaction {
+                    transaction.prepare(&target)?;
+                } else if let Err(error) = tntl_store::backup_existing(&target) {
                     return Err(io_error(&target, error));
                 }
                 let mut out = File::create(&target).map_err(|error| io_error(&target, error))?;
@@ -746,7 +758,7 @@ mod tests {
         let http = Http::new().unwrap();
         let mut events = 0;
         let report = pack
-            .install(&http, &game_dir, &mut |_| {
+            .install(&http, &game_dir, None, &mut |_| {
                 events += 1;
             })
             .unwrap();
@@ -796,7 +808,7 @@ mod tests {
 
         let target = dir.join("restored");
         let http = Http::new().unwrap();
-        pack.install(&http, &target, &mut |_| {}).unwrap();
+        pack.install(&http, &target, None, &mut |_| {}).unwrap();
         assert_eq!(fs::read(target.join("mods/example.jar")).unwrap(), b"jar");
         assert!(target.join("config/options.txt").exists());
         assert!(!target.join("logs").exists());
@@ -836,7 +848,7 @@ mod tests {
         let game_dir = dir.join("game");
         let http = Http::new().unwrap();
         let mut seen = Vec::new();
-        pack.install(&http, &game_dir, &mut |event| seen.push(event)).unwrap();
+        pack.install(&http, &game_dir, None, &mut |event| seen.push(event)).unwrap();
         server.join().unwrap();
         let last = seen
             .iter()
@@ -901,7 +913,7 @@ mod tests {
         fs::create_dir_all(game_dir.join("mods")).unwrap();
         fs::write(game_dir.join("mods/a.jar.disabled"), b"old").unwrap();
         let http = Http::new().unwrap();
-        pack.install(&http, &game_dir, &mut |_| {}).unwrap();
+        pack.install(&http, &game_dir, None, &mut |_| {}).unwrap();
         server.join().unwrap();
         assert_eq!(fs::read(game_dir.join("mods/a.jar.disabled")).unwrap(), expected);
         assert!(!game_dir.join("mods/a.jar").exists());

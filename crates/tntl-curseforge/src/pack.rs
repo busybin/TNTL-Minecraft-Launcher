@@ -127,6 +127,7 @@ pub fn extract_overrides(
     archive: &Path,
     manifest: &PackManifest,
     game_dir: &Path,
+    transaction: Option<&tntl_store::SharedTransaction>,
     progress: &mut dyn FnMut(&str, usize),
 ) -> Result<usize, CurseForgeError> {
     let head = format!("{}/", manifest.overrides_dir());
@@ -171,7 +172,9 @@ pub fn extract_overrides(
             })?;
         }
         // Keep whatever is already there instead of truncating it.
-        if let Err(source) = tntl_store::backup_existing(&target) {
+        if let Some(transaction) = transaction {
+            transaction.prepare(&target)?;
+        } else if let Err(source) = tntl_store::backup_existing(&target) {
             return Err(CurseForgeError::Io { path: target, source });
         }
         let mut out = File::create(&target).map_err(|source| CurseForgeError::Io {
@@ -256,7 +259,7 @@ mod tests {
         let manifest = open_manifest(&path).unwrap();
         let game = dir.join("game");
         let mut seen = Vec::new();
-        let count = extract_overrides(&path, &manifest, &game, &mut |prefix, entries| {
+        let count = extract_overrides(&path, &manifest, &game, None, &mut |prefix, entries| {
             seen.push((prefix.to_string(), entries));
         })
         .unwrap();
