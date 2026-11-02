@@ -2,7 +2,7 @@
 //! of unlinking it, so a wrong click can be undone until the user empties it.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -124,10 +124,7 @@ impl Trash {
     pub fn restore(&self, id: &str, allowed: &[PathBuf]) -> Result<PathBuf, StoreError> {
         let (dir, record) = self.load(id)?;
         let original = record.original.clone();
-        if allowed
-            .iter()
-            .all(|root| !original.starts_with(root) || original == *root)
-        {
+        if !restore_allowed(&original, allowed) {
             return Err(StoreError::Io {
                 path: original,
                 source: std::io::Error::new(
@@ -221,6 +218,30 @@ fn size_of(path: &Path) -> std::io::Result<u64> {
         total += size_of(&entry?.path())?;
     }
     Ok(total)
+}
+
+/// A recorded path is only restorable when its parent resolves inside one of
+/// the allowed roots. A lexical check is not enough: `..` components and
+/// symlinked folders would otherwise let a tampered entry write outside the
+/// instance.
+fn restore_allowed(original: &Path, allowed: &[PathBuf]) -> bool {
+    if original
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return false;
+    }
+    let Some(parent) = original.parent() else {
+        return false;
+    };
+    let Ok(parent) = parent.canonicalize() else {
+        return false;
+    };
+    allowed.iter().any(|root| {
+        root.canonicalize()
+            .map(|root| parent.starts_with(root))
+            .unwrap_or(false)
+    })
 }
 
 fn move_path(from: &Path, to: &Path) -> Result<(), StoreError> {
@@ -335,6 +356,37 @@ mod tests {
         assert!(base.join(".trash").join(&entry.id).exists());
         fs::remove_dir_all(base).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn restore_refuses_parent_components() {
+        let base = dir("dotdot");
+        let victim = base
+            .parent()
+            .unwrap()
+            .join(format!("tntl-trash-victim-{}", unix_millis()));
+        fs::write(&victim, b"x").unwrap();
+        let trash = Trash::new(base.join(".trash"));
+        let recorded = base.join("..").join(victim.file_name().unwrap());
+        let entry = trash.put(&recorded, "world", "W").unwrap();
+        assert!(trash.restore(&entry.id, std::slice::from_ref(&base)).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_symlinked_parent() {
+        let base = dir("symlink");
+        let outside = dir("symlink-out");
+        std::os::unix::fs::symlink(&outside, base.join("link")).unwrap();
+        let file = base.join("link").join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        let trash = Trash::new(base.join(".trash"));
+        let entry = trash.put(&file, "world", "A").unwrap();
+        assert!(trash.restore(&entry.id, std::slice::from_ref(&base)).is_err());
+        assert!(!file.exists());
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
