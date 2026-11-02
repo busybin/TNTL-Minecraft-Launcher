@@ -13,7 +13,9 @@ export function findingDetail(finding: Finding): string {
 }
 
 export function findingHint(finding: Finding): string {
-  return t(`finding.${finding.code}.hint`);
+  // Hints carry the same named values as details: "at least {recommended} MB"
+  // was rendered literally until the params were passed here too.
+  return t(`finding.${finding.code}.hint`, finding.params);
 }
 
 export function severityLabel(severity: FindingSeverity): string {

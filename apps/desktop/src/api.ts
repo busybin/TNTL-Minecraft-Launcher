@@ -98,6 +98,8 @@ export interface ModInfo {
   /** Every mod id this jar requires, satisfied or not. */
   dependency: string[];
   duplicate: boolean;
+  /** False when the jar carries no readable metadata for its loader. */
+  recognized: boolean;
   /** Set when the instance's loader or game version cannot satisfy this jar. */
   blocked?: BlockedReason;
 }
@@ -816,9 +818,13 @@ export const api = {
     invoke<string>("read_crash_report", { name, file }),
   deleteCrashReport: (name: string, file: string) =>
     invoke<void>("delete_crash_report", { name, file }),
+  deleteCrashReports: (name: string, files: string[]) =>
+    invoke<CrashReport[]>("delete_crash_reports", { name, files }),
   listScreenshots: (name: string) => invoke<Screenshot[]>("list_screenshots", { name }),
   readScreenshot: (name: string, file: string) =>
     invoke<ArrayBuffer>("read_screenshot", { name, file }),
+  readScreenshotThumbnail: (name: string, file: string, width = 480) =>
+    invoke<ArrayBuffer>("read_screenshot_thumbnail", { name, file, width }),
   deleteScreenshot: (name: string, file: string) => invoke<void>("delete_screenshot", { name, file }),
   listServers: (name: string) => invoke<ServerEntry[]>("list_servers", { name }),
   saveServers: (name: string, servers: ServerEntry[]) =>
@@ -856,6 +862,10 @@ export const api = {
   listMods: (name: string) => invoke<ModInfo[]>("list_mods", { name }),
   diagnoseInstance: (name: string) => invoke<DiagnosticReport>("diagnose_instance", { name }),
   analyzeLog: (text: string) => invoke<LogAnalysis>("analyze_log", { text }),
+  modProblemIgnores: (name: string) =>
+    invoke<Record<string, string[]>>("mod_problem_ignores", { name }),
+  setModProblemIgnored: (name: string, id: string, kind: string, ignored: boolean) =>
+    invoke<Record<string, string[]>>("set_mod_problem_ignored", { name, id, kind, ignored }),
   setModEnabled: (name: string, file: string, enabled: boolean) =>
     invoke<ModInfo[]>("set_mod_enabled", { name, file, enabled }),
   removeMod: (name: string, file: string) => invoke<ModInfo[]>("remove_mod", { name, file }),
@@ -1051,6 +1061,15 @@ export function formatPlaytime(seconds: number): string {
 export function formatDate(timestamp: number | null): string {
   if (!timestamp) return "";
   return new Date(timestamp * 1000).toLocaleDateString();
+}
+
+/** Filesystem timestamps are already milliseconds. */
+export function formatDateTime(timestamp: number | null): string {
+  if (!timestamp) return "";
+  return new Date(timestamp).toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 export function formatDuration(ms: number): string {

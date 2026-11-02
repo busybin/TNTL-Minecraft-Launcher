@@ -99,6 +99,26 @@ pub fn delete(game_dir: &Path, file: &str) -> Result<(), CrashError> {
     fs::remove_file(&path).map_err(|error| CrashError::Io { path, source: error })
 }
 
+/// Delete several reports in one go. Every name is validated before anything
+/// is removed, so a bad entry cannot leave a half-deleted selection. A file
+/// that vanished meanwhile (the game may rotate crash reports) is not an error.
+pub fn delete_many(game_dir: &Path, files: &[String]) -> Result<(), CrashError> {
+    for file in files {
+        if !tntl_store::valid_file_name(file) {
+            return Err(CrashError::Invalid(file.clone()));
+        }
+    }
+    for file in files {
+        let path = reports_dir(game_dir).join(file);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(CrashError::Io { path, source: error }),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +136,25 @@ mod tests {
         assert!(read(&dir, "../instance.json").is_err());
         delete(&dir, &reports[0].file).unwrap();
         assert!(list(&dir).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deletes_a_selection_after_checking_every_name() {
+        let dir = std::env::temp_dir().join(format!("tntl-crash-many-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("crash-reports")).unwrap();
+        fs::write(dir.join("crash-reports/a.txt"), "a").unwrap();
+        fs::write(dir.join("crash-reports/b.txt"), "b").unwrap();
+        fs::write(dir.join("crash-reports/c.txt"), "c").unwrap();
+        let files = vec!["a.txt".to_string(), "b.txt".to_string()];
+        delete_many(&dir, &files).unwrap();
+        let left: Vec<String> = list(&dir).unwrap().into_iter().map(|r| r.file).collect();
+        assert_eq!(left, vec!["c.txt".to_string()]);
+        // A traversal attempt must not delete anything.
+        let bad = vec!["c.txt".to_string(), "../instance.json".to_string()];
+        assert!(delete_many(&dir, &bad).is_err());
+        assert_eq!(list(&dir).unwrap().len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -226,18 +226,17 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
             <span v-if="featured.imported" class="badge">{{ t("instances.importedBadge") }}</span>
             <span v-if="!featured.installed" class="badge warn">{{ t("instances.missing") }}</span>
             <span v-if="running === featured.name" class="badge ok">{{ t("instances.running") }}</span>
+            <button
+              v-if="externalDir(featured)"
+              type="button"
+              class="badge game-dir mono"
+              :title="`${t('editor.gameDir')}: ${externalDir(featured)}`"
+              @click="$emit('openPath', externalDir(featured)!)"
+            >
+              <Icon name="folder" :size="12" />
+              <span>{{ externalDir(featured) }}</span>
+            </button>
           </div>
-
-          <button
-            v-if="externalDir(featured)"
-            type="button"
-            class="game-dir mono"
-            :title="`${t('editor.gameDir')}: ${externalDir(featured)}`"
-            @click="$emit('openPath', externalDir(featured)!)"
-          >
-            <Icon name="folder" :size="11" />
-            <span>{{ externalDir(featured) }}</span>
-          </button>
 
           <div class="hero-actions">
             <button
@@ -400,6 +399,7 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
   display: flex;
   flex-direction: column;
   gap: 22px;
+  overflow-x: hidden;
 }
 
 /* Sections keep their height; the page scrolls instead of squeezing them. */
@@ -820,32 +820,61 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
   gap: 4px;
 }
 
-/* Game folder of an imported instance, shown because it lives elsewhere. */
+/* Game folder of an imported instance. Uses the same row treatment as the
+   instance editor so it reads as part of the card, not as loose text. */
 .game-dir {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
+  width: 100%;
   max-width: 100%;
-  margin-top: 3px;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--muted-2, var(--muted));
+  margin-top: 7px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--row-bg);
+  color: var(--muted);
   font-size: 10.5px;
+  line-height: 1.35;
   text-align: left;
   cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease;
 }
 
 .game-dir:hover {
-  color: var(--accent);
+  border-color: var(--gold);
+  color: var(--text);
+}
+
+.game-dir svg {
+  flex: none;
+  opacity: 0.75;
 }
 
 .game-dir span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   /* Keep the last segments of a long path visible. */
   direction: rtl;
+  text-align: left;
+}
+
+/* In the hero it joins the badge row instead of taking a line of its own. */
+.chips .game-dir {
+  width: auto;
+  margin-top: 0;
+  padding: 5px 7px;
+  border-width: 2px;
+  border-radius: 0;
+  background: var(--slot);
+  box-shadow: inset 1px 1px 0 var(--bevel-hi), inset -1px -1px 0 var(--bevel-lo);
+  font-size: 11px;
+}
+
+.chips .game-dir span {
+  max-width: 240px;
 }
 
 .tile-actions .icon {

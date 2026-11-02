@@ -646,6 +646,7 @@ header .icon {
   flex-direction: column;
   gap: 8px;
   overflow-y: auto;
+  overflow-x: hidden;
   padding-inline-end: 4px;
   scrollbar-gutter: stable;
 }
@@ -656,7 +657,7 @@ header .icon {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .hide-installed {
@@ -672,8 +673,8 @@ header .icon {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
-  padding: 10px;
+  gap: 10px;
+  padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--row-bg);
@@ -681,9 +682,11 @@ header .icon {
 
 .actions {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
   gap: 6px;
   flex: none;
+  margin-inline-start: auto;
 }
 
 .versions {
@@ -724,9 +727,9 @@ header .icon {
 .results img,
 .fallback {
   flex: none;
-  width: 40px;
-  height: 40px;
-  border-radius: 9px;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
   object-fit: cover;
   background: var(--surface-4);
 }
@@ -763,19 +766,19 @@ header .icon {
 }
 
 .text p {
-  margin: 3px 0 0;
-  font-size: 11.5px;
-  line-height: 1.45;
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
   color: var(--muted);
   display: -webkit-box;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 1;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
 
 .primary.small {
   flex: none;
-  padding: 6px 14px;
+  padding: 5px 12px;
   font-size: 11.5px;
 }
 

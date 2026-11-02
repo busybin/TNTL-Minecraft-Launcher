@@ -2922,12 +2922,32 @@ impl Launcher {
         Ok(tntl_instance::crashes::delete(&self.game_dir(name)?, file)?)
     }
 
+    /// Delete several crash reports and return the remaining list. Every name
+    /// is validated before the first file is removed.
+    pub fn delete_crash_reports(
+        &self,
+        name: &str,
+        files: &[String],
+    ) -> Result<Vec<tntl_instance::crashes::CrashReport>> {
+        let game_dir = self.game_dir(name)?;
+        tntl_instance::crashes::delete_many(&game_dir, files)?;
+        Ok(tntl_instance::crashes::list(&game_dir)?)
+    }
+
     pub fn screenshots(&self, name: &str) -> Result<Vec<tntl_instance::screenshots::Screenshot>> {
         Ok(tntl_instance::screenshots::list(&self.game_dir(name)?)?)
     }
 
     pub fn read_screenshot(&self, name: &str, file: &str) -> Result<Vec<u8>> {
         Ok(tntl_instance::screenshots::read(&self.game_dir(name)?, file)?)
+    }
+
+    pub fn read_screenshot_thumbnail(&self, name: &str, file: &str, width: u32) -> Result<Vec<u8>> {
+        Ok(tntl_instance::screenshots::thumbnail(
+            &self.game_dir(name)?,
+            file,
+            width,
+        )?)
     }
 
     pub fn delete_screenshot(&self, name: &str, file: &str) -> Result<()> {
@@ -4621,28 +4641,79 @@ impl Launcher {
     pub fn set_mod_enabled(&self, name: &str, file: &str, enabled: bool) -> Result<Vec<tntl_instance::mods::ModInfo>> {
         self.ensure_not_running(name)?;
         let path = self.mod_path(name, file)?;
-        if enabled {
+        let old_file = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // One scan serves both the "can this jar run at all" check and the list
+        // the frontend gets back; enabling used to scan everything twice.
+        let mut mods = self.mods(name)?;
+        if enabled
+            && let Some(module) = mods.iter().find(|module| module.file == old_file)
+            && let Some(blocked) = &module.blocked
+        {
             // Switching on a jar the loader can never satisfy only produces a
             // crash on the next launch, so refuse it here.
-            let target = path.file_name().map(|file| file.to_string_lossy().to_string());
-            if let Some(module) = self
-                .mods(name)?
-                .iter()
-                .find(|module| Some(&module.file) == target.as_ref())
-                && let Some(blocked) = &module.blocked
-            {
-                bail!(
-                    "{} {} needs {} {}, but this instance runs {}. Use a build that matches.",
-                    module.name,
-                    module.version,
-                    blocked.loader,
-                    blocked.required.join(" / "),
-                    blocked.actual
-                );
+            bail!(
+                "{} {} needs {} {}, but this instance runs {}. Use a build that matches.",
+                module.name,
+                module.version,
+                blocked.loader,
+                blocked.required.join(" / "),
+                blocked.actual
+            );
+        }
+        let new_path = tntl_instance::mods::set_enabled(&path, enabled)?;
+        if let Some(module) = mods.iter_mut().find(|module| module.file == old_file) {
+            module.enabled = enabled;
+            if let Some(new_file) = new_path.file_name() {
+                module.file = new_file.to_string_lossy().to_string();
             }
         }
-        tntl_instance::mods::set_enabled(&path, enabled)?;
-        self.mods(name)
+        tntl_instance::mods::reindex(&mut mods);
+        Ok(mods)
+    }
+
+    /// Problems the user chose to hide in the mod list, keyed by lowercased
+    /// mod id. The doctor keeps reporting them; this only filters the list.
+    pub fn mod_problem_ignores(&self, name: &str) -> Result<BTreeMap<String, Vec<String>>> {
+        Ok(read_mod_problems(&self.instance_dir(name)?).ignored)
+    }
+
+    /// Hide or unhide one kind of problem for one mod id.
+    pub fn set_mod_problem_ignored(
+        &self,
+        name: &str,
+        id: &str,
+        kind: &str,
+        ignored: bool,
+    ) -> Result<BTreeMap<String, Vec<String>>> {
+        if !tntl_store::valid_file_name(id) {
+            bail!("invalid mod id: {id}");
+        }
+        if !matches!(
+            kind,
+            "duplicate" | "blocked" | "missing" | "disabled" | "unreadable" | "version"
+        ) {
+            bail!("unknown problem kind: {kind}");
+        }
+        let dir = self.instance_dir(name)?;
+        let mut state = read_mod_problems(&dir);
+        let key = id.to_ascii_lowercase();
+        let kinds = state.ignored.entry(key.clone()).or_default();
+        if ignored {
+            if !kinds.iter().any(|existing| existing == kind) {
+                kinds.push(kind.to_string());
+                kinds.sort();
+            }
+        } else {
+            kinds.retain(|existing| existing != kind);
+            if kinds.is_empty() {
+                state.ignored.remove(&key);
+            }
+        }
+        tntl_store::atomic_write_json(&dir.join(MOD_PROBLEMS_FILE), &state)?;
+        Ok(state.ignored)
     }
 
     /// Delete one mod file and return the refreshed list.
@@ -5374,10 +5445,15 @@ impl Launcher {
                 .cmp(&mod_channel_rank(&right.version_type))
                 .then_with(|| right.date_published.cmp(&left.date_published))
         });
-        Ok(versions
+        // Only a build whose version provably satisfies every range may be
+        // installed. `ranges_match` treats an unparseable version as unknown
+        // (never a mismatch), which is right for warnings but wrong here: it
+        // used to pick a decade-old build whose version string could not be
+        // read, after deleting the newer one.
+        let accepted: Vec<_> = versions.iter().filter(|version| filter.accepts(version)).collect();
+        Ok(accepted
             .iter()
-            .filter(|version| filter.accepts(version))
-            .find(|version| ranges_match(&version.version_number, predicates))
+            .find(|version| ranges_proven(&version.version_number, predicates))
             .map(|version| version.id.clone()))
     }
 
@@ -6546,10 +6622,33 @@ fn parse_index(sort: &str) -> Result<SearchIndex> {
 /// newest compatible build would be an old one tagged `neoforge`.
 /// True when `version` satisfies every dependent's set of predicates. A set
 /// whose predicates are not understood does not reject the version.
+const MOD_PROBLEMS_FILE: &str = "mod-problems.json";
+
+#[derive(Default, Serialize, Deserialize)]
+struct ModProblems {
+    #[serde(default)]
+    ignored: BTreeMap<String, Vec<String>>,
+}
+
+fn read_mod_problems(dir: &Path) -> ModProblems {
+    fs::read(dir.join(MOD_PROBLEMS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 fn ranges_match(version: &str, predicates: &[Vec<String>]) -> bool {
     predicates
         .iter()
         .all(|ranges| tntl_doctor::version::any_matches(version, ranges) != Some(false))
+}
+
+/// Stricter than [`ranges_match`]: every range set must parse and match. Used
+/// when picking a download, where "unknown" must never win.
+fn ranges_proven(version: &str, predicates: &[Vec<String>]) -> bool {
+    predicates
+        .iter()
+        .all(|ranges| tntl_doctor::version::any_matches(version, ranges) == Some(true))
 }
 
 fn mod_filter(game_version: &str, loader: &str) -> Filter {
@@ -8382,6 +8481,70 @@ mod tests {
         assert!(launcher.hidden_version_details().is_empty());
         assert_eq!(launcher.installed_versions(), vec!["1.20.1".to_string()]);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn toggling_a_mod_updates_the_returned_list() {
+        let root = std::env::temp_dir().join(format!("tntl-toggle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        launcher.create_instance(&Instance::new("mods", "1.20.1")).unwrap();
+        let dir = launcher.instance_dir("mods").unwrap().join("minecraft/mods");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("foo.jar"), b"jar").unwrap();
+
+        let off = launcher.set_mod_enabled("mods", "foo.jar", false).unwrap();
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].file, "foo.jar.disabled");
+        assert!(!off[0].enabled);
+        assert!(dir.join("foo.jar.disabled").is_file());
+
+        let on = launcher.set_mod_enabled("mods", "foo.jar.disabled", true).unwrap();
+        assert_eq!(on[0].file, "foo.jar");
+        assert!(on[0].enabled);
+        assert!(dir.join("foo.jar").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mod_problem_ignores_round_trip() {
+        let root = std::env::temp_dir().join(format!("tntl-ignores-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        launcher.create_instance(&Instance::new("ignores", "1.20.1")).unwrap();
+
+        let map = launcher
+            .set_mod_problem_ignored("ignores", "Example", "duplicate", true)
+            .unwrap();
+        assert_eq!(map.get("example"), Some(&vec!["duplicate".to_string()]));
+        let map = launcher
+            .set_mod_problem_ignored("ignores", "example", "unreadable", true)
+            .unwrap();
+        assert_eq!(
+            map.get("example"),
+            Some(&vec!["duplicate".to_string(), "unreadable".to_string()])
+        );
+        let map = launcher
+            .set_mod_problem_ignored("ignores", "example", "duplicate", false)
+            .unwrap();
+        assert_eq!(map.get("example"), Some(&vec!["unreadable".to_string()]));
+        assert!(
+            launcher
+                .set_mod_problem_ignored("ignores", "example", "unknown", true)
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn candidate_versions_must_prove_the_range() {
+        let predicates = vec![vec!["[1.21-3.1.0c,]".to_string()]];
+        assert!(ranges_proven("1.21.1-3.7.2", &predicates));
+        assert!(!ranges_proven("1.21-2.18.11", &predicates));
+        // An unreadable version must not win just because the parser shrugs.
+        assert!(!ranges_proven("neoforge_1.21-2.18.11", &predicates));
     }
 
     #[test]

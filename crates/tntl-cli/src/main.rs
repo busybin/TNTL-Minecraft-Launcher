@@ -586,6 +586,15 @@ fn configured_root() -> Option<PathBuf> {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE, so `tntl doctor | head` panics with exit 101 when
+    // the reader closes the pipe. Restore the Unix default instead.
+    #[cfg(unix)]
+    // SAFETY: restoring the default disposition is the only signal change;
+    // no handler is installed and no memory is shared.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => std::process::exit(code),

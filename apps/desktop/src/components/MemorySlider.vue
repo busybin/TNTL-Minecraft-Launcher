@@ -67,6 +67,9 @@ watch(
     // Nothing saved yet: emitting the resting handles would silently write a
     // guessed value, which is the one thing this screen must not do.
     if (unset.value) return;
+    // Older configs may have a maximum but no minimum. Emitting would write
+    // the resting minimum on page open, an edit the user never made.
+    if (props.min === null || props.max === null) return;
     if (props.min !== valueMin.value || props.max !== valueMax.value) {
       emit("update", valueMin.value, valueMax.value);
     }

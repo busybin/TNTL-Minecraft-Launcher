@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -836,26 +837,61 @@ async fn list_mods(state: State<'_, AppState>, name: String) -> Result<Vec<tntl_
 }
 
 #[tauri::command]
-fn set_mod_enabled(
+async fn mod_problem_ignores(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.mod_problem_ignores(&name).map_err(message))
+        .await
+        .map_err(message)?
+}
+
+#[tauri::command]
+async fn set_mod_problem_ignored(
+    state: State<'_, AppState>,
+    name: String,
+    id: String,
+    kind: String,
+    ignored: bool,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher
+            .set_mod_problem_ignored(&name, &id, &kind, ignored)
+            .map_err(message)
+    })
+    .await
+    .map_err(message)?
+}
+
+#[tauri::command]
+async fn set_mod_enabled(
     state: State<'_, AppState>,
     name: String,
     file: String,
     enabled: bool,
 ) -> Result<Vec<tntl_instance::mods::ModInfo>, String> {
     ensure_stopped(&state, &name)?;
-    state_launcher(&state)
-        .set_mod_enabled(&name, &file, enabled)
-        .map_err(message)
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher.set_mod_enabled(&name, &file, enabled).map_err(message)
+    })
+    .await
+    .map_err(message)?
 }
 
 #[tauri::command]
-fn remove_mod(
+async fn remove_mod(
     state: State<'_, AppState>,
     name: String,
     file: String,
 ) -> Result<Vec<tntl_instance::mods::ModInfo>, String> {
     ensure_stopped(&state, &name)?;
-    state_launcher(&state).remove_mod(&name, &file).map_err(message)
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.remove_mod(&name, &file).map_err(message))
+        .await
+        .map_err(message)?
 }
 
 #[tauri::command]
@@ -993,7 +1029,7 @@ async fn list_content(
 }
 
 #[tauri::command]
-fn set_content_enabled(
+async fn set_content_enabled(
     state: State<'_, AppState>,
     name: String,
     kind: String,
@@ -1002,26 +1038,34 @@ fn set_content_enabled(
 ) -> Result<tntl_app::ContentListing, String> {
     ensure_stopped(&state, &name)?;
     let kind = tntl_app::ProjectKind::from_key(&kind).ok_or_else(|| format!("unknown project kind {kind}"))?;
-    state_launcher(&state)
-        .set_content_enabled(&name, kind, &file, enabled)
-        .map_err(message)
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher
+            .set_content_enabled(&name, kind, &file, enabled)
+            .map_err(message)
+    })
+    .await
+    .map_err(message)?
 }
 
 #[tauri::command]
-fn move_resource_pack(
+async fn move_resource_pack(
     state: State<'_, AppState>,
     name: String,
     file: String,
     up: bool,
 ) -> Result<tntl_app::ContentListing, String> {
     ensure_stopped(&state, &name)?;
-    state_launcher(&state)
-        .move_resource_pack(&name, &file, up)
-        .map_err(message)
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher.move_resource_pack(&name, &file, up).map_err(message)
+    })
+    .await
+    .map_err(message)?
 }
 
 #[tauri::command]
-fn remove_content(
+async fn remove_content(
     state: State<'_, AppState>,
     name: String,
     kind: String,
@@ -1029,9 +1073,10 @@ fn remove_content(
 ) -> Result<tntl_app::ContentListing, String> {
     ensure_stopped(&state, &name)?;
     let kind = tntl_app::ProjectKind::from_key(&kind).ok_or_else(|| format!("unknown project kind {kind}"))?;
-    state_launcher(&state)
-        .remove_content(&name, kind, &file)
-        .map_err(message)
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.remove_content(&name, kind, &file).map_err(message))
+        .await
+        .map_err(message)?
 }
 
 #[tauri::command]
@@ -1870,10 +1915,27 @@ async fn read_crash_report(state: State<'_, AppState>, name: String, file: Strin
 }
 
 #[tauri::command]
-fn delete_crash_report(state: State<'_, AppState>, name: String, file: String) -> Result<(), String> {
-    state_launcher(&state)
-        .delete_crash_report(&name, &file)
-        .map_err(message)
+async fn delete_crash_report(state: State<'_, AppState>, name: String, file: String) -> Result<(), String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher.delete_crash_report(&name, &file).map_err(message)
+    })
+    .await
+    .map_err(message)?
+}
+
+#[tauri::command]
+async fn delete_crash_reports(
+    state: State<'_, AppState>,
+    name: String,
+    files: Vec<String>,
+) -> Result<Vec<tntl_instance::crashes::CrashReport>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher.delete_crash_reports(&name, &files).map_err(message)
+    })
+    .await
+    .map_err(message)?
 }
 
 #[tauri::command]
@@ -1903,8 +1965,30 @@ async fn read_screenshot(
 }
 
 #[tauri::command]
-fn delete_screenshot(state: State<'_, AppState>, name: String, file: String) -> Result<(), String> {
-    state_launcher(&state).delete_screenshot(&name, &file).map_err(message)
+async fn read_screenshot_thumbnail(
+    state: State<'_, AppState>,
+    name: String,
+    file: String,
+    width: Option<u32>,
+) -> Result<tauri::ipc::Response, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let width = width.unwrap_or_else(tntl_instance::screenshots::default_thumbnail_width);
+        let bytes = launcher
+            .read_screenshot_thumbnail(&name, &file, width)
+            .map_err(message)?;
+        Ok(tauri::ipc::Response::new(bytes))
+    })
+    .await
+    .map_err(message)?
+}
+
+#[tauri::command]
+async fn delete_screenshot(state: State<'_, AppState>, name: String, file: String) -> Result<(), String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.delete_screenshot(&name, &file).map_err(message))
+        .await
+        .map_err(message)?
 }
 
 #[tauri::command]
@@ -2955,6 +3039,8 @@ fn main() {
             diagnose_instance,
             analyze_log,
             set_mod_enabled,
+            mod_problem_ignores,
+            set_mod_problem_ignored,
             remove_mod,
             search_mods,
             install_mods,
@@ -3008,8 +3094,10 @@ fn main() {
             list_crash_reports,
             read_crash_report,
             delete_crash_report,
+            delete_crash_reports,
             list_screenshots,
             read_screenshot,
+            read_screenshot_thumbnail,
             delete_screenshot,
             list_servers,
             save_servers,

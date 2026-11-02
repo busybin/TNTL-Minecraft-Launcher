@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   api,
   events,
@@ -42,6 +42,7 @@ import TransferBar from "../components/TransferBar.vue";
 import UpdateList from "../components/UpdateList.vue";
 import ModrinthDialog from "./ModrinthDialog.vue";
 import DoctorDialog from "../components/DoctorDialog.vue";
+import ScreenshotAlbum from "../components/ScreenshotAlbum.vue";
 import FindingCard from "../components/FindingCard.vue";
 import { findingsReport } from "../findings";
 import MemorySlider from "../components/MemorySlider.vue";
@@ -74,6 +75,7 @@ type Tab =
   | "mods"
   | "resourcepacks"
   | "shaders"
+  | "screenshots"
   | "worlds"
   | "datapacks"
   | "servers"
@@ -82,6 +84,7 @@ type Tab =
   | "manage";
 
 const tab = ref<Tab>("overview");
+const panelRef = ref<HTMLElement | null>(null);
 
 const TAB_GROUPS: { label: string; items: { id: Tab; label: string; icon: string }[] }[] = [
   {
@@ -98,6 +101,7 @@ const TAB_GROUPS: { label: string; items: { id: Tab; label: string; icon: string
       { id: "mods", label: "editor.mods", icon: "spark" },
       { id: "resourcepacks", label: "editor.resourcePacks", icon: "image" },
       { id: "shaders", label: "editor.shaders", icon: "image" },
+      { id: "screenshots", label: "detail.screenshotsTab", icon: "image" },
       { id: "worlds", label: "editor.worlds", icon: "folder" },
       { id: "datapacks", label: "editor.datapacks", icon: "package" },
     ],
@@ -199,6 +203,12 @@ const contentLoaded = ref(false);
 const modFilter = ref("");
 const modOnlyDisabled = ref(false);
 const modSort = ref<SortKey>("name");
+/** Narrow the list to the jars a check flagged; `issues` is the union. */
+type ModIssueFilter = "all" | "issues" | "duplicate" | "blocked" | "missing";
+const modIssue = ref<ModIssueFilter>("all");
+/** Mod problems the user hid; `showIgnoredMods` brings them back. */
+const modIgnores = ref<Record<string, string[]>>({});
+const showIgnoredMods = ref(false);
 const resourcePacks = ref<ContentFile[]>([]);
 const packFilter = ref("");
 const packSort = ref<PackSort>("manual");
@@ -294,12 +304,16 @@ interface PingState {
 
 const pings = ref<Record<string, PingState>>({});
 const crashes = ref<CrashReport[]>([]);
+/** Files ticked for the batch delete; names, not indexes, so a refresh keeps it. */
+const crashSelected = ref<string[]>([]);
+const crashAllSelected = computed(
+  () => crashes.value.length > 0 && crashSelected.value.length === crashes.value.length,
+);
 const crashFile = ref<string | null>(null);
 const crashText = ref<string | null>(null);
 const crashAnalysis = ref<LogAnalysis | null>(null);
 let crashRequest = 0;
 const shots = ref<Screenshot[]>([]);
-const shotPreview = ref<{ file: string; url: string } | null>(null);
 const archiveStatus = ref<string | null>(null);
 const archiving = ref(false);
 const loaderStatus = ref<LoaderStatus | null>(null);
@@ -472,6 +486,7 @@ function onLoaderProgress({ job, event }: JobEvent<InstallEvent>) {
 }
 
 onMounted(async () => {
+  ensureIconObserver();
   for (const listen of [
     () => events.onModProgress(onProgress),
     () => events.onPackProgress(onPackProgress),
@@ -518,6 +533,7 @@ async function reloadLists() {
   // Every listing is independent; awaiting the mods first only delayed the rest.
   await Promise.all([
     reloadMods(),
+    reloadModIgnores(),
     reloadContent(),
     reloadWorlds(),
     reloadServers().then(pingAll),
@@ -542,14 +558,23 @@ watch(tab, (next) => {
   if (next === "worlds") {
     reloadWorlds().catch((cause) => (error.value = String(cause)));
   }
-  if (next === "mods" && !modsLoaded.value) void reloadMods();
+  if (next === "mods") {
+    if (!modsLoaded.value) void reloadMods();
+    else void nextTick(observeModRows);
+  }
   if ((next === "resourcepacks" || next === "shaders") && !contentLoaded.value) void reloadContent();
+  // The game writes screenshots and crash reports behind our back.
+  if (next === "logs" || next === "screenshots") {
+    void reloadMedia();
+  }
 });
 
 onBeforeUnmount(() => {
   unlisten.forEach((off) => off());
+  iconsDisposed = true;
+  queuedIcons.clear();
+  modIconObserver?.disconnect();
   revokeIcon();
-  revokeShot();
   clearPackIcons();
   clearRowIcons();
   // Flushing pending saves keeps a quick close from losing the last edit.
@@ -674,14 +699,30 @@ function pingAll() {
   }
 }
 
+let mediaRequest = 0;
+
 async function reloadMedia() {
   const instance = config.value?.name ?? props.name;
-  try {
-    crashes.value = await api.listCrashReports(instance);
-    shots.value = await api.listScreenshots(instance);
-  } catch (cause) {
-    error.value = String(cause);
+  const token = ++mediaRequest;
+  // A broken screenshots folder must not hide the crash reports (or the other
+  // way around), so the two listings settle independently.
+  const [reports, screenshots] = await Promise.allSettled([
+    api.listCrashReports(instance),
+    api.listScreenshots(instance),
+  ]);
+  // Deleting a report triggers another reload; an older listing must not
+  // resurrect the file that was just removed.
+  if (token !== mediaRequest) return;
+  if (reports.status === "fulfilled") {
+    crashes.value = reports.value;
+    const present = new Set(crashes.value.map((report) => report.file));
+    crashSelected.value = crashSelected.value.filter((file) => present.has(file));
   }
+  if (screenshots.status === "fulfilled") {
+    shots.value = screenshots.value;
+  }
+  const failure = [reports, screenshots].find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") error.value = String(failure.reason);
 }
 
 async function showCrash(report: CrashReport) {
@@ -705,42 +746,47 @@ async function copyCrashReport() {
   if (crashAnalysis.value) await navigator.clipboard.writeText(findingsReport(crashAnalysis.value.findings));
 }
 
+function clearCrashView(file: string) {
+  if (crashFile.value !== file) return;
+  crashFile.value = null;
+  crashText.value = null;
+  crashAnalysis.value = null;
+}
+
 async function deleteCrash(report: CrashReport) {
   if (!window.confirm(t("editor.crashDeleteConfirm", { file: report.file }))) return;
   try {
     await api.deleteCrashReport(config.value?.name ?? props.name, report.file);
-    if (crashFile.value === report.file) {
-      crashFile.value = null;
-      crashText.value = null;
-      crashAnalysis.value = null;
-    }
+    clearCrashView(report.file);
     await reloadMedia();
   } catch (cause) {
     error.value = String(cause);
   }
 }
 
-async function viewShot(shot: Screenshot) {
-  try {
-    const bytes = await api.readScreenshot(config.value?.name ?? props.name, shot.file);
-    revokeShot();
-    shotPreview.value = { file: shot.file, url: imageUrl(bytes, shot.file) };
-  } catch (cause) {
-    error.value = String(cause);
-  }
+function crashIsSelected(file: string): boolean {
+  return crashSelected.value.includes(file);
 }
 
-function revokeShot() {
-  if (shotPreview.value) URL.revokeObjectURL(shotPreview.value.url);
-  shotPreview.value = null;
+function toggleCrash(file: string) {
+  crashSelected.value = crashIsSelected(file)
+    ? crashSelected.value.filter((entry) => entry !== file)
+    : [...crashSelected.value, file];
 }
 
-async function deleteShot(shot: Screenshot) {
-  if (!window.confirm(t("editor.screenshotDeleteConfirm", { file: shot.file }))) return;
+function toggleAllCrashes() {
+  crashSelected.value = crashAllSelected.value ? [] : crashes.value.map((report) => report.file);
+}
+
+/** Delete every ticked report; the backend returns the remaining list. */
+async function deleteSelectedCrashes() {
+  const files = [...crashSelected.value];
+  if (!files.length) return;
+  if (!window.confirm(t("editor.crashDeleteSelectedConfirm", { count: files.length }))) return;
   try {
-    await api.deleteScreenshot(config.value?.name ?? props.name, shot.file);
-    if (shotPreview.value?.file === shot.file) revokeShot();
-    await reloadMedia();
+    crashes.value = await api.deleteCrashReports(config.value?.name ?? props.name, files);
+    for (const file of files) clearCrashView(file);
+    crashSelected.value = [];
   } catch (cause) {
     error.value = String(cause);
   }
@@ -839,11 +885,20 @@ async function reloadMods() {
     const instance = config.value?.name ?? props.name;
     mods.value = await api.listMods(instance);
     modsLoaded.value = true;
-    void loadModIcons(instance, mods.value);
+    await nextTick();
+    observeModRows();
   } catch (cause) {
     error.value = String(cause);
   } finally {
     modsLoading.value = false;
+  }
+}
+
+async function reloadModIgnores() {
+  try {
+    modIgnores.value = await api.modProblemIgnores(config.value?.name ?? props.name);
+  } catch (cause) {
+    error.value = String(cause);
   }
 }
 
@@ -909,14 +964,89 @@ function clearRowIcons() {
   worldIcons.value = {};
 }
 
-async function loadModIcons(instance: string, list: ModInfo[]) {
-  const missing = list.filter((mod) => !modIcons.value[mod.file]);
-  modIcons.value = await mapIcons(
-    missing,
-    (mod) => mod.file,
-    (mod) => api.modIcon(instance, mod.file),
-    modIcons.value,
+/** Toggling renames the file, but the icon belongs to the jar, not the suffix. */
+function iconKey(file: string): string {
+  return file.replace(/\.disabled$/, "");
+}
+
+let modIconObserver: IntersectionObserver | null = null;
+const queuedIcons = new Set<string>();
+let loadingIcons = false;
+let iconsDisposed = false;
+
+function ensureIconObserver() {
+  if (modIconObserver || typeof IntersectionObserver === "undefined") return;
+  modIconObserver = new IntersectionObserver(
+    (entries) => {
+      let queued = false;
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const file = (entry.target as HTMLElement).dataset.modFile;
+        modIconObserver?.unobserve(entry.target);
+        if (!file || modIcons.value[iconKey(file)]) continue;
+        queuedIcons.add(file);
+        queued = true;
+      }
+      if (queued) void loadQueuedIcons();
+    },
+    { rootMargin: "240px 0px" },
   );
+}
+
+/** Read icons for rows near the viewport only: a 400-jar instance must not
+ * open every archive just to paint the first screen. */
+function observeModRows() {
+  if (tab.value !== "mods") return;
+  const rows = panelRef.value?.querySelectorAll<HTMLElement>("[data-mod-file]") ?? [];
+  if (!modIconObserver) {
+    // No IntersectionObserver in very old webviews: read the icons eagerly
+    // rather than leaving every row with the placeholder cube.
+    for (const row of rows) {
+      const file = row.dataset.modFile;
+      if (file && !modIcons.value[iconKey(file)]) queuedIcons.add(file);
+    }
+    if (queuedIcons.size) void loadQueuedIcons();
+    return;
+  }
+  rows.forEach((row) => modIconObserver?.observe(row));
+}
+
+async function loadQueuedIcons() {
+  if (loadingIcons) return;
+  loadingIcons = true;
+  const instance = config.value?.name ?? props.name;
+  try {
+    while (queuedIcons.size && !iconsDisposed) {
+      const batch = [...queuedIcons].slice(0, 4);
+      for (const file of batch) queuedIcons.delete(file);
+      const bytes = await Promise.all(
+        batch.map(async (file) => {
+          try {
+            const data = await api.modIcon(instance, file);
+            return data.byteLength ? bytesImageUrl(data) : null;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      if (iconsDisposed) {
+        bytes.forEach((url) => url && URL.revokeObjectURL(url));
+        break;
+      }
+      const icons = { ...modIcons.value };
+      let changed = false;
+      batch.forEach((file, index) => {
+        const url = bytes[index];
+        if (!url) return;
+        rowIconUrls.push(url);
+        icons[iconKey(file)] = url;
+        changed = true;
+      });
+      if (changed) modIcons.value = icons;
+    }
+  } finally {
+    loadingIcons = false;
+  }
 }
 
 async function loadWorldIcons(instance: string, list: WorldInfo[]) {
@@ -1072,6 +1202,10 @@ function openInGameDir(relative = "") {
   api
     .openInstanceFolder(props.name, relative || undefined)
     .catch((cause) => (error.value = String(cause)));
+}
+
+function openScreenshotsFolder() {
+  openInGameDir("screenshots");
 }
 
 function openDatapacks() {
@@ -1368,6 +1502,8 @@ const doctorBusy = ref(false);
 const doctorReport = ref<DiagnosticReport | null>(null);
 const doctorError = ref<string | null>(null);
 const doctorAction = ref<string | null>(null);
+/** Result of the last fix action, shown inside the dialog. */
+const doctorStatus = ref<string | null>(null);
 
 async function runDoctor() {
   doctorBusy.value = true;
@@ -1383,6 +1519,7 @@ async function runDoctor() {
 
 function openDoctor() {
   doctorOpen.value = true;
+  doctorStatus.value = null;
   void runDoctor();
 }
 
@@ -1398,16 +1535,53 @@ async function onDoctorAction(kind: "deps" | "versions" | "repair" | "mods" | "l
     emit("log", props.name);
     return;
   }
+  if (props.running) {
+    doctorStatus.value = t("editor.runningLocked");
+    return;
+  }
   doctorAction.value = kind;
+  doctorStatus.value = null;
+  error.value = null;
   try {
-    if (kind === "deps") await installMissingDeps();
-    else if (kind === "versions") await fixDependencyVersions();
-    else await repairInstance();
+    if (kind === "deps") {
+      await installMissingDeps();
+      doctorStatus.value = depsStatus.value;
+    } else if (kind === "versions") {
+      await fixDependencyVersions();
+      doctorStatus.value = depsStatus.value;
+    } else {
+      await repairInstance();
+      doctorStatus.value = repairStatus.value;
+    }
+    // The fix methods report failures through the page banner; the dialog is
+    // on top of it, so mirror it here.
+    if (!doctorStatus.value && error.value) doctorStatus.value = error.value;
     await runDoctor();
   } finally {
     doctorAction.value = null;
   }
 }
+
+/** Close the dialog and land on the filtered problem list. */
+function showProblemMods() {
+  doctorOpen.value = false;
+  tab.value = "mods";
+  modIssue.value = "issues";
+  showIgnoredMods.value = false;
+  void nextTick(() => panelRef.value?.scrollTo({ top: 0 }));
+}
+
+const doctorProgress = computed(() => {
+  if (doctorAction.value === "repair") {
+    return {
+      done: repairBytes.value,
+      total: repairTotal.value,
+      speed: repairSpeed.value,
+      detail: repairStage.value,
+    };
+  }
+  return { done: modBytes.value, total: modTotal.value, speed: modSpeed.value, detail: modFile.value };
+});
 
 const modsEnabled = computed(() => mods.value.filter((mod) => mod.enabled).length);
 
@@ -1421,6 +1595,160 @@ function blockedText(blocked: ModInfo["blocked"]): string {
     actual: blocked.actual,
   });
 }
+
+/** Files that declare the same mod id, among the enabled jars only: the
+ * loader picks one, so a switched-off twin is clutter but not an error. */
+const duplicateGroups = computed(() => {
+  const groups = new Map<string, string[]>();
+  for (const mod of mods.value) {
+    if (!mod.enabled) continue;
+    const key = mod.id.toLowerCase();
+    const files = groups.get(key);
+    if (files) files.push(mod.file);
+    else groups.set(key, [mod.file]);
+  }
+  return groups;
+});
+
+function duplicateFiles(mod: ModInfo): string[] {
+  if (!mod.duplicate) return [];
+  return (duplicateGroups.value.get(mod.id.toLowerCase()) ?? []).filter((file) => file !== mod.file);
+}
+
+type ModProblemKind = "duplicate" | "blocked" | "missing" | "disabled" | "unreadable" | "version";
+type ModTag = {
+  kind: ModProblemKind;
+  tone: "danger" | "warn" | "muted";
+  text: string;
+  title: string;
+  ignored: boolean;
+};
+
+function ignoredKinds(mod: ModInfo): Set<string> {
+  return new Set(modIgnores.value[mod.id.toLowerCase()] ?? []);
+}
+
+/** Mod findings from the last check, keyed by the mod name the doctor used. */
+const doctorFindingsBySubject = computed(() => {
+  const map = new Map<string, DiagnosticReport["findings"]>();
+  for (const finding of doctorReport.value?.findings ?? []) {
+    if (!finding.subject) continue;
+    const list = map.get(finding.subject) ?? [];
+    list.push(finding);
+    map.set(finding.subject, list);
+  }
+  return map;
+});
+
+function buildModTags(mod: ModInfo): ModTag[] {
+  const ignored = ignoredKinds(mod);
+  const tags: ModTag[] = [];
+  const add = (kind: ModProblemKind, tone: ModTag["tone"], text: string, title: string) => {
+    if (ignored.has(kind) && !showIgnoredMods.value) return;
+    tags.push({ kind, tone, text, title, ignored: ignored.has(kind) });
+  };
+  if (mod.enabled && mod.duplicate) {
+    const others = duplicateFiles(mod);
+    add(
+      "duplicate",
+      "warn",
+      t("editor.tagDuplicate", { count: others.length + 1 }),
+      others.length ? t("editor.duplicateWith", { files: others.join(", ") }) : "",
+    );
+  }
+  if (mod.blocked) {
+    add(
+      "blocked",
+      mod.enabled ? "danger" : "warn",
+      mod.enabled ? t("editor.tagBlocked") : t("editor.tagBlockedDisabled"),
+      blockedText(mod.blocked),
+    );
+  }
+  if (mod.enabled && mod.missing_dependencies.length) {
+    add(
+      "missing",
+      "warn",
+      t("editor.tagMissingDeps", { count: mod.missing_dependencies.length }),
+      mod.missing_dependencies.join(", "),
+    );
+  }
+  if (mod.enabled && mod.disabled_dependencies.length) {
+    add(
+      "disabled",
+      "warn",
+      t("editor.tagDisabledDeps", { count: mod.disabled_dependencies.length }),
+      mod.disabled_dependencies.join(", "),
+    );
+  }
+  if (mod.enabled && !mod.recognized) {
+    add("unreadable", "muted", t("editor.tagUnreadable"), mod.file);
+  }
+  // The last check may have found a dependency whose installed build is
+  // outside the range this mod asks for; that is a list-worthy problem too.
+  const version = (doctorFindingsBySubject.value.get(mod.name) ?? []).find(
+    (finding) => finding.code === "dependency_version",
+  );
+  if (mod.enabled && version) {
+    add(
+      "version",
+      "warn",
+      t("editor.tagDependencyVersion"),
+      t("editor.tagDependencyVersionDetail", version.params),
+    );
+  }
+  return tags;
+}
+
+const modTagsByFile = computed(() => {
+  const map = new Map<string, ModTag[]>();
+  for (const mod of mods.value) map.set(mod.file, buildModTags(mod));
+  return map;
+});
+
+function modTags(mod: ModInfo): ModTag[] {
+  return modTagsByFile.value.get(mod.file) ?? [];
+}
+
+function modHasProblem(mod: ModInfo): boolean {
+  return modTags(mod).length > 0;
+}
+
+async function toggleModIgnore(mod: ModInfo, tag: ModTag) {
+  try {
+    modIgnores.value = await api.setModProblemIgnored(
+      config.value?.name ?? props.name,
+      mod.id,
+      tag.kind,
+      !tag.ignored,
+    );
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+const ignoredModCount = computed(() => {
+  let count = 0;
+  for (const mod of mods.value) {
+    if ((modIgnores.value[mod.id.toLowerCase()] ?? []).length) count += 1;
+  }
+  return count;
+});
+
+const modIssueCounts = computed(() => {
+  let issues = 0;
+  let duplicate = 0;
+  let blocked = 0;
+  let missing = 0;
+  for (const mod of mods.value) {
+    const tags = modTags(mod);
+    if (!tags.length) continue;
+    issues += 1;
+    if (tags.some((tag) => tag.kind === "duplicate")) duplicate += 1;
+    if (tags.some((tag) => tag.kind === "blocked")) blocked += 1;
+    if (tags.some((tag) => tag.kind === "missing")) missing += 1;
+  }
+  return { issues, duplicate, blocked, missing };
+});
 
 type SortKey = "name" | "size" | "modified";
 type PackSort = SortKey | "manual";
@@ -1448,6 +1776,11 @@ const filteredMods = computed(() => {
   const needle = modFilter.value.trim().toLowerCase();
   const list = mods.value.filter((mod) => {
     if (modOnlyDisabled.value && mod.enabled) return false;
+    const tags = modTags(mod);
+    if (modIssue.value === "issues" && !modHasProblem(mod)) return false;
+    if (modIssue.value === "duplicate" && !tags.some((tag) => tag.kind === "duplicate")) return false;
+    if (modIssue.value === "blocked" && !tags.some((tag) => tag.kind === "blocked")) return false;
+    if (modIssue.value === "missing" && !tags.some((tag) => tag.kind === "missing")) return false;
     if (!needle) return true;
     return (
       mod.name.toLowerCase().includes(needle) ||
@@ -1458,6 +1791,8 @@ const filteredMods = computed(() => {
   });
   return [...list].sort(sortBy<ModInfo>(modSort.value, (mod) => mod.name, (mod) => mod.size, (mod) => mod.modified));
 });
+
+watch(filteredMods, () => void nextTick(observeModRows), { flush: "post" });
 
 const filteredPacks = computed(() => {
   const list = matchFiles(resourcePacks.value, packFilter.value);
@@ -1498,7 +1833,9 @@ function tabCount(id: Tab): number | null {
     case "servers":
       return servers.value.length || null;
     case "logs":
-      return crashes.value.length + shots.value.length || null;
+      return crashes.value.length || null;
+    case "screenshots":
+      return shots.value.length || null;
     default:
       return null;
   }
@@ -1906,7 +2243,7 @@ async function openPath(path: string) {
         </div>
       </nav>
 
-      <div class="panel scroll">
+      <div ref="panelRef" class="panel scroll">
         <div v-if="error" class="error error-banner">
           <span class="error-text">{{ error }}</span>
           <button class="ghost error-close" type="button" :title="t('action.close')" @click="error = null">✕</button>
@@ -2380,13 +2717,38 @@ async function openPath(path: string) {
         <div v-if="tab === 'logs'" class="group">
           <div class="group-head">
             <h3>{{ t("editor.crashes") }} <span v-if="crashes.length" class="count">{{ crashes.length }}</span></h3>
+            <template v-if="crashes.length > 1">
+              <button class="ghost small" type="button" @click="toggleAllCrashes">
+                {{ crashAllSelected ? t("editor.selectNone") : t("editor.selectAll") }}
+              </button>
+              <button
+                class="ghost small danger-text"
+                type="button"
+                :disabled="!crashSelected.length"
+                @click="deleteSelectedCrashes"
+              >
+                <Icon name="trash" :size="13" />
+                {{ t("editor.deleteSelected", { count: crashSelected.length }) }}
+              </button>
+            </template>
             <button class="ghost small" @click="reloadMedia">
               <Icon name="refresh" :size="13" /> {{ t("editor.refreshMedia") }}
             </button>
           </div>
           <p v-if="!crashes.length" class="mods-empty">{{ t("editor.noCrashes") }}</p>
           <ul v-else class="mods">
-            <li v-for="report in crashes" :key="report.file">
+            <li
+              v-for="report in crashes"
+              :key="report.file"
+              :class="{ selected: crashIsSelected(report.file) }"
+            >
+              <input
+                class="select-box"
+                type="checkbox"
+                :checked="crashIsSelected(report.file)"
+                :title="t('editor.selectCrash')"
+                @change="toggleCrash(report.file)"
+              />
               <div class="mod-text">
                 <strong class="mono">{{ report.file }}</strong>
                 <small>{{ formatBytes(report.bytes) }}</small>
@@ -2421,29 +2783,29 @@ async function openPath(path: string) {
             </div>
           </div>
           <pre v-if="crashText" class="crash-text scroll">{{ crashText }}</pre>
+        </div>
 
+        <div v-if="tab === 'screenshots'" class="group">
           <div class="group-head">
             <h3>
               {{ t("editor.screenshots") }}
               <span v-if="shots.length" class="count">{{ shots.length }}</span>
             </h3>
+            <button class="ghost small" @click="reloadMedia">
+              <Icon name="refresh" :size="13" /> {{ t("editor.refreshMedia") }}
+            </button>
+            <button v-if="shots.length" class="ghost small" @click="openScreenshotsFolder">
+              <Icon name="folder" :size="13" /> {{ t("editor.openFolder") }}
+            </button>
           </div>
           <p v-if="!shots.length" class="mods-empty">{{ t("editor.noScreenshots") }}</p>
-          <ul v-else class="mods">
-            <li v-for="shot in shots" :key="shot.file">
-              <div class="mod-text">
-                <strong class="mono">{{ shot.file }}</strong>
-                <small>{{ formatBytes(shot.bytes) }}</small>
-              </div>
-              <button class="ghost small" @click="viewShot(shot)">{{ t("editor.view") }}</button>
-              <button class="icon danger" :title="t('editor.deleteScreenshot')" @click="deleteShot(shot)">
-                <Icon name="trash" :size="14" />
-              </button>
-            </li>
-          </ul>
-          <div v-if="shotPreview" class="shot-preview">
-            <img :src="shotPreview.url" :alt="shotPreview.file" />
-          </div>
+          <ScreenshotAlbum
+            v-else
+            :instance="config?.name ?? props.name"
+            :shots="shots"
+            @changed="reloadMedia"
+            @error="error = $event"
+          />
         </div>
 
         <div v-if="tab === 'launch'" class="group">
@@ -2502,7 +2864,7 @@ async function openPath(path: string) {
               }}
             </button>
           </div>
-          <p v-if="blockedMods.length" class="warn-note">
+          <p v-if="blockedMods.length" class="warn-note jump-note" role="button" tabindex="0" @click="showProblemMods" @keydown.enter="showProblemMods">
             <Icon name="alert" :size="15" />
             {{ t("editor.blockedBanner", { count: blockedMods.length }) }}
           </p>
@@ -2536,12 +2898,23 @@ async function openPath(path: string) {
               <input v-model="modOnlyDisabled" type="checkbox" />
               {{ t("editor.onlyDisabled") }}
             </label>
+            <label v-if="ignoredModCount" class="filter-toggle">
+              <input v-model="showIgnoredMods" type="checkbox" />
+              {{ t("editor.showIgnored", { count: ignoredModCount }) }}
+            </label>
+            <select v-model="modIssue" class="sort" :title="t('editor.modFilter')">
+              <option value="all">{{ t("editor.filterAll") }}</option>
+              <option value="issues">{{ t("editor.filterIssues", { count: modIssueCounts.issues }) }}</option>
+              <option value="duplicate">{{ t("editor.filterDuplicate", { count: modIssueCounts.duplicate }) }}</option>
+              <option value="blocked">{{ t("editor.filterBlocked", { count: modIssueCounts.blocked }) }}</option>
+              <option value="missing">{{ t("editor.filterMissing", { count: modIssueCounts.missing }) }}</option>
+            </select>
             <select v-model="modSort" class="sort" :title="t('editor.sort')">
               <option value="name">{{ t("editor.sortName") }}</option>
               <option value="size">{{ t("editor.sortSize") }}</option>
               <option value="modified">{{ t("editor.sortModified") }}</option>
             </select>
-            <span v-if="modFilter.trim() || modOnlyDisabled" class="count">
+            <span v-if="modFilter.trim() || modOnlyDisabled || showIgnoredMods || modIssue !== 'all'" class="count">
               {{ filteredMods.length }}/{{ mods.length }}
             </span>
           </div>
@@ -2551,22 +2924,42 @@ async function openPath(path: string) {
           </p>
           <p v-else-if="!filteredMods.length" class="mods-empty">{{ t("editor.noModsMatch") }}</p>
           <ul v-else class="mods">
-            <li v-for="mod in filteredMods" :key="mod.file" :class="{ off: !mod.enabled }">
+            <li
+              v-for="mod in filteredMods"
+              :key="mod.file"
+              :class="{ off: !mod.enabled }"
+              :data-mod-file="mod.file"
+            >
               <span class="row-icon">
-                <img v-if="modIcons[mod.file]" :src="modIcons[mod.file]" alt="" loading="lazy" />
+                <img
+                  v-if="modIcons[iconKey(mod.file)]"
+                  :src="modIcons[iconKey(mod.file)]"
+                  alt=""
+                  loading="lazy"
+                />
                 <Icon v-else name="cube" :size="16" />
               </span>
               <div class="mod-text">
                 <strong>{{ mod.name }}</strong>
                 <small class="mono">{{ mod.version }} · {{ mod.loader }} · {{ formatBytes(mod.size) }}</small>
-                <small v-if="mod.blocked" class="missing-deps">{{ blockedText(mod.blocked) }}</small>
-                <small v-if="mod.missing_dependencies.length" class="missing-deps">
-                  {{ t("editor.missingDeps", { list: mod.missing_dependencies.join(", ") }) }}
-                </small>
-                <small v-if="mod.disabled_dependencies?.length" class="missing-deps">
-                  {{ t("editor.disabledDeps", { list: mod.disabled_dependencies.join(", ") }) }}
-                </small>
-                <small v-if="mod.duplicate" class="missing-deps">{{ t("editor.duplicateMod") }}</small>
+                <div v-if="modTags(mod).length" class="mod-tags">
+                  <span
+                    v-for="tag in modTags(mod)"
+                    :key="tag.kind"
+                    class="mod-tag"
+                    :class="[tag.tone, { ignored: tag.ignored }]"
+                    role="button"
+                    tabindex="0"
+                    :title="
+                      tag.title
+                        ? `${tag.title} · ${t(tag.ignored ? 'editor.unignoreProblem' : 'editor.ignoreProblem')}`
+                        : t(tag.ignored ? 'editor.unignoreProblem' : 'editor.ignoreProblem')
+                    "
+                    @click.stop="toggleModIgnore(mod, tag)"
+                    @keydown.enter.stop="toggleModIgnore(mod, tag)"
+                    >{{ tag.text }}</span
+                  >
+                </div>
               </div>
               <button
                 class="toggle"
@@ -2826,9 +3219,16 @@ async function openPath(path: string) {
       :busy="doctorBusy"
       :error="doctorError"
       :action-busy="doctorAction"
+      :status="doctorStatus"
+      :problem-count="modIssueCounts.issues"
+      :done="doctorProgress.done"
+      :total="doctorProgress.total"
+      :speed="doctorProgress.speed"
+      :detail="doctorProgress.detail"
       @close="doctorOpen = false"
       @rerun="runDoctor"
       @action="onDoctorAction"
+      @problems="showProblemMods"
     />
 
     <ModrinthDialog
@@ -2854,6 +3254,7 @@ async function openPath(path: string) {
 .detail-head {
   flex: none;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 14px;
   padding: 16px 18px;
@@ -2923,6 +3324,7 @@ async function openPath(path: string) {
 
 .head-actions {
   flex: none;
+  margin-inline-start: auto;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2959,6 +3361,7 @@ async function openPath(path: string) {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  overflow-x: hidden;
 }
 
 .side-label {
@@ -3066,6 +3469,7 @@ async function openPath(path: string) {
 .panel {
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -3189,6 +3593,14 @@ textarea {
   padding: 10px 12px;
 }
 
+.jump-note {
+  cursor: pointer;
+}
+
+.jump-note:hover {
+  border-color: var(--warning);
+}
+
 .hint {
   display: flex;
   align-items: center;
@@ -3207,8 +3619,10 @@ textarea {
 
 .group-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+  row-gap: 6px;
 }
 
 .group-head h3 {
@@ -3268,8 +3682,10 @@ textarea {
 
 .filter-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
+  row-gap: 8px;
 }
 .filter-row .filter {
   flex: 1;
@@ -3349,10 +3765,12 @@ textarea {
 }
 
 .mod-text {
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  overflow: hidden;
 }
 
 .mod-text strong {
@@ -3366,6 +3784,68 @@ textarea {
 .mod-text small {
   font-size: 10.5px;
   color: var(--muted-2);
+  overflow-wrap: anywhere;
+}
+
+.mod-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.mod-tag {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-3);
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.mod-tag:hover {
+  border-color: var(--muted);
+}
+
+.mod-tag.ignored {
+  border-style: dashed;
+  opacity: 0.6;
+}
+
+.mod-tag.muted {
+  color: var(--muted-2);
+}
+
+.mod-tag.danger {
+  color: var(--danger);
+  border-color: rgba(255, 95, 95, 0.45);
+  background: rgba(255, 95, 95, 0.1);
+}
+
+.mod-tag.warn {
+  color: var(--warning);
+  border-color: rgba(255, 184, 77, 0.45);
+  background: rgba(255, 184, 77, 0.1);
+}
+
+.select-box {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.mods li.selected {
+  border-color: rgba(111, 220, 111, 0.4);
+  background: rgba(111, 220, 111, 0.08);
+}
+
+.danger-text {
+  color: var(--danger);
 }
 
 .toggle {
@@ -3543,19 +4023,6 @@ textarea {
   font-size: 11px;
   line-height: 1.5;
   white-space: pre-wrap;
-}
-
-.shot-preview {
-  border-radius: 12px;
-  overflow: hidden;
-  border: 1px solid var(--border);
-  background: rgba(0, 0, 0, 0.3);
-}
-
-.shot-preview img {
-  display: block;
-  width: 100%;
-  height: auto;
 }
 
 .segmented {

@@ -332,8 +332,10 @@ fn duplicates(by_id: &BTreeMap<String, Vec<&ModInfo>>, nested_ids: &BTreeSet<Str
         if files.len() < 2 {
             continue;
         }
+        // FML picks one of the copies and the game still starts; this is a
+        // cleanup hint, not a failure.
         findings.push(
-            Finding::new(Severity::Error, "duplicate_mod")
+            Finding::new(Severity::Warning, "duplicate_mod")
                 .param("id", id)
                 .param("count", files.len().to_string())
                 .param("names", files.join(", ")),

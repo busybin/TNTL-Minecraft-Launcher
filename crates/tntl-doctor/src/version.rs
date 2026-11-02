@@ -16,7 +16,7 @@ pub fn matches(version: &str, constraint: &str) -> Option<bool> {
         return Some(true);
     }
     if constraint.starts_with('[') || constraint.starts_with('(') {
-        return maven_range(version, constraint);
+        return maven_ranges(version, constraint);
     }
     let mut understood = false;
     for alternative in constraint.split("||") {
@@ -78,19 +78,26 @@ pub fn any_matches_series(version: &str, ranges: &[String]) -> Option<bool> {
             return Some(true);
         }
         understood = true;
-        if is_series_idiom(range) || is_series_pin(range) {
-            if series.is_some_and(|series| series_in(series, range)) {
-                return Some(true);
+        // One value can hold several ranges (`[1.21,1.21.1),[1.22,1.23)`).
+        // They are alternatives and each keeps its own series treatment.
+        let Some(parts) = split_ranges(range) else {
+            return Some(true);
+        };
+        for part in parts {
+            if is_series_idiom(part) || is_series_pin(part) {
+                if series.is_some_and(|series| series_in(series, part)) {
+                    return Some(true);
+                }
+                continue;
             }
-            continue;
-        }
-        // Any other range is a normal Maven range: `[1.21.1,1.21.2)` means
-        // exactly 1.21.1, not "every 1.21.x". A bound that cannot be parsed is
-        // unknown, and unknown never blocks.
-        match matches(version, range) {
-            Some(true) => return Some(true),
-            Some(false) => {}
-            None => return Some(true),
+            // Any other range is a normal Maven range: `[1.21.1,1.21.2)` means
+            // exactly 1.21.1, not "every 1.21.x". A bound that cannot be parsed
+            // is unknown, and unknown never blocks.
+            match matches(version, part) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => return Some(true),
+            }
         }
     }
     understood.then_some(false)
@@ -193,6 +200,95 @@ fn series_in(series: (u64, u64), range: &str) -> bool {
     true
 }
 
+/// Split `[a,b),[c,d)` into ranges; commas inside a range stay put.
+fn split_ranges(value: &str) -> Option<Vec<&str>> {
+    let mut rest = value.trim();
+    let mut parts = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches([',', ' ']);
+        if rest.is_empty() {
+            break;
+        }
+        if !rest.starts_with('[') && !rest.starts_with('(') {
+            return None;
+        }
+        let end = rest.find([')', ']'])?;
+        parts.push(&rest[..=end]);
+        rest = &rest[end + 1..];
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// One metadata value can hold several Maven ranges separated by commas:
+/// `[21.0.143,21.1),[21.1.1,21.2),` (NeoForge) or `[1.21.0],[1.21.1]`.
+/// They are alternatives, so any matching range is enough.
+fn maven_ranges(version: &str, constraint: &str) -> Option<bool> {
+    let mut rest = constraint.trim();
+    if !rest.starts_with('[') && !rest.starts_with('(') {
+        return None;
+    }
+    let mut understood = false;
+    let mut matched = false;
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches([',', ' ']);
+        if rest.is_empty() {
+            break;
+        }
+        if !rest.starts_with('[') && !rest.starts_with('(') {
+            return None;
+        }
+        let end = rest.find([')', ']'])?;
+        match maven_range(version, &rest[..=end]) {
+            Some(true) => {
+                matched = true;
+                understood = true;
+            }
+            Some(false) => understood = true,
+            None => {}
+        }
+        rest = &rest[end + 1..];
+    }
+    if matched {
+        Some(true)
+    } else {
+        understood.then_some(false)
+    }
+}
+
+/// Game and mod versions are often glued together: Moonlight ships
+/// `1.21-3.1.0c`, Supplementaries asks for `[1.21-3.1.0c,]` while the project
+/// publishes `1.21.1-3.7.2`. Comparing the whole strings made every newer
+/// build look older because of the extra patch in the game prefix; when both
+/// sides are `<1.x>-<rest>` on the same series, compare `<rest>` instead.
+fn compare_versions(version: &str, bound: &str) -> Option<Ordering> {
+    if let (Some((left_game, left_mod)), Some((right_game, right_mod))) =
+        (split_game_prefix(version), split_game_prefix(bound))
+        && same_series(left_game, right_game)
+        && let (Some(left), Some(right)) = (Version::parse(left_mod), Version::parse(right_mod))
+    {
+        return Some(left.compare(&right));
+    }
+    // Pre-release tails (`pre1`, `forge`) are not parseable on their own, so
+    // fall back to the whole string instead of reporting "unknown".
+    Some(Version::parse(version)?.compare(&Version::parse(bound)?))
+}
+
+fn split_game_prefix(text: &str) -> Option<(&str, &str)> {
+    let (prefix, rest) = text.split_once('-')?;
+    let prefix = prefix.trim_start_matches('v');
+    let mut parts = prefix.split('.');
+    let major: u64 = parts.next()?.parse().ok()?;
+    let minor: u64 = parts.next()?.parse().ok()?;
+    let patch_ok = parts.all(|part| part.parse::<u64>().is_ok());
+    (major == 1 && minor > 0 && patch_ok && !rest.is_empty()).then_some((prefix, rest))
+}
+
+fn same_series(left: &str, right: &str) -> bool {
+    let mut left = left.split('.');
+    let mut right = right.split('.');
+    left.next() == right.next() && left.next() == right.next()
+}
+
 fn maven_range(version: &str, range: &str) -> Option<bool> {
     if range.len() < 2 {
         return None;
@@ -202,26 +298,22 @@ fn maven_range(version: &str, range: &str) -> Option<bool> {
     // `get` returns `None` instead of panicking when the last character is not
     // ASCII (a malformed range such as `[1.21é`).
     let body = range.get(1..range.len().saturating_sub(1))?;
-    let version = Version::parse(version)?;
     if !body.contains(',') {
         // `[1.20.1]` pins one version.
-        let bound = Version::parse(body)?;
-        return Some(version.compare(&bound) == Ordering::Equal);
+        return Some(compare_versions(version, body)? == Ordering::Equal);
     }
     let (lower, upper) = body.split_once(',')?;
     if lower.trim().is_empty() && upper.trim().is_empty() {
         return Some(true);
     }
     if !lower.trim().is_empty() {
-        let bound = Version::parse(lower)?;
-        let ordering = version.compare(&bound);
+        let ordering = compare_versions(version, lower)?;
         if ordering == Ordering::Less || (ordering == Ordering::Equal && !lower_inclusive) {
             return Some(false);
         }
     }
     if !upper.trim().is_empty() {
-        let bound = Version::parse(upper)?;
-        let ordering = version.compare(&bound);
+        let ordering = compare_versions(version, upper)?;
         if ordering == Ordering::Greater || (ordering == Ordering::Equal && !upper_inclusive) {
             return Some(false);
         }
@@ -235,16 +327,16 @@ fn token_matches(version: &str, token: &str) -> Option<bool> {
         return Some(true);
     }
     if let Some(rest) = token.strip_prefix(">=") {
-        return Some(Version::parse(version)?.compare(&Version::parse(rest)?) != Ordering::Less);
+        return Some(compare_versions(version, rest)? != Ordering::Less);
     }
     if let Some(rest) = token.strip_prefix("<=") {
-        return Some(Version::parse(version)?.compare(&Version::parse(rest)?) != Ordering::Greater);
+        return Some(compare_versions(version, rest)? != Ordering::Greater);
     }
     if let Some(rest) = token.strip_prefix('>') {
-        return Some(Version::parse(version)?.compare(&Version::parse(rest)?) == Ordering::Greater);
+        return Some(compare_versions(version, rest)? == Ordering::Greater);
     }
     if let Some(rest) = token.strip_prefix('<') {
-        return Some(Version::parse(version)?.compare(&Version::parse(rest)?) == Ordering::Less);
+        return Some(compare_versions(version, rest)? == Ordering::Less);
     }
     if let Some(rest) = token.strip_prefix('~') {
         let base = Version::parse(rest)?;
@@ -266,7 +358,7 @@ fn token_matches(version: &str, token: &str) -> Option<bool> {
     if has_wildcard(token) {
         return Some(wildcard_matches(version, token));
     }
-    Some(Version::parse(version)?.compare(&Version::parse(token)?) == Ordering::Equal)
+    Some(compare_versions(version, token)? == Ordering::Equal)
 }
 
 fn has_wildcard(token: &str) -> bool {
@@ -486,6 +578,42 @@ mod tests {
         yes("1.20", "(,1.20]");
         yes("1.20.1", "[1.20.1]");
         no("1.20.2", "[1.20.1]");
+    }
+
+    #[test]
+    fn several_series_ranges_in_one_value_are_alternatives() {
+        let ranges = vec!["[1.21,1.21.1),[1.22,1.23)".to_string()];
+        assert_eq!(any_matches_series("1.22.3", &ranges), Some(true));
+        assert_eq!(any_matches_series("1.21.4", &ranges), Some(true));
+        assert_eq!(any_matches_series("1.24.1", &ranges), Some(false));
+    }
+
+    #[test]
+    fn pre_release_bounds_fall_back_to_the_whole_string() {
+        assert_eq!(matches("1.21.1-pre1", ">=1.21.1-pre1"), Some(true));
+        assert_eq!(matches("1.21.1-pre1", "[1.21.1-pre1,1.21.2)"), Some(true));
+        assert_eq!(matches("1.21.1-pre1", "[1.21.2,1.21.3)"), Some(false));
+    }
+
+    #[test]
+    fn several_maven_ranges_in_one_value_are_alternatives() {
+        // NeoForge metadata writes comma-separated ranges, sometimes with a
+        // trailing comma. Better Clouds 1.13.6 declares exactly this.
+        let ranges = "[21.0.143,21.1),[21.1.1,21.2),";
+        assert_eq!(matches("21.1.244", ranges), Some(true));
+        assert_eq!(matches("21.1.0", ranges), Some(false));
+        assert_eq!(matches("1.21.1", "[1.21.0],[1.21.1]"), Some(true));
+        assert_eq!(matches("1.20.1", "[1.21.0],[1.21.1]"), Some(false));
+    }
+
+    #[test]
+    fn game_prefixed_versions_compare_on_the_mod_part() {
+        // Moonlight: the bound has no patch in the game prefix, the published
+        // build does. Comparing the whole strings flagged every new build.
+        assert_eq!(matches("1.21.1-3.7.2", "[1.21-3.1.0c,]"), Some(true));
+        assert_eq!(matches("1.21-2.18.11", "[1.21-3.1.0c,]"), Some(false));
+        assert_eq!(matches("1.21.1-3.1.0c", "[1.21-3.1.0c,]"), Some(true));
+        assert_eq!(matches("1.20.1-3.7.2", "[1.21-3.1.0c,]"), Some(false));
     }
 
     #[test]

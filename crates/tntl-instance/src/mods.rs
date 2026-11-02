@@ -3,16 +3,17 @@
 //! Disabling a mod is the launcher convention of renaming `foo.jar` to
 //! `foo.jar.disabled`; the loaders ignore anything that is not a `.jar`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 pub const DISABLED_SUFFIX: &str = ".disabled";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModLoader {
     Fabric,
@@ -158,6 +159,15 @@ fn modified_secs(meta: &fs::Metadata) -> Option<u64> {
         .map(|elapsed| elapsed.as_secs())
 }
 
+/// Nanosecond mtime for the metadata cache; zero when the platform cannot say.
+fn modified_stamp(meta: &fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default()
+}
+
 /// Every jar in `dir` that looks like a mod. A missing directory is empty.
 pub fn scan(dir: &Path) -> io::Result<Vec<ModInfo>> {
     scan_for(dir, None, "")
@@ -179,7 +189,7 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let mut mods = Vec::new();
+    let mut pending = Vec::new();
     for entry in entries.flatten() {
         if !entry.path().is_file() {
             continue;
@@ -190,57 +200,80 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
             continue;
         }
         let meta = entry.metadata().ok();
-        let size = meta.as_ref().map(|meta| meta.len()).unwrap_or_default();
-        let modified = meta.as_ref().and_then(modified_secs).unwrap_or_default();
-        let (metadata, nested) = read_jar(&entry.path(), neoforge_style, loader);
-        let mut nested = nested;
-        nested.sort();
-        nested.dedup();
-        nested.retain(|id| metadata.id.as_deref() != Some(id.as_str()) && !metadata.provides.contains(id));
-        let mut provides = metadata.provides.clone();
-        provides.extend(nested.iter().cloned());
-        let fabric_depends = metadata.fabric_depends.clone();
-        let fabric_ranges = metadata.fabric_dependency_ranges.clone();
-        let fallback = stem.trim_end_matches(".jar").to_string();
-        let info = ModInfo {
-            id: metadata.id.clone().unwrap_or_else(|| fallback.clone()),
-            name: metadata.name.clone().unwrap_or_else(|| fallback.clone()),
-            version: metadata.version.clone().unwrap_or_else(|| fallback.clone()),
-            loader: metadata.loader,
-            enabled,
-            size,
-            modified,
+        pending.push(PendingMod {
+            path: entry.path(),
             file,
-            missing_dependencies: Vec::new(),
-            disabled_dependencies: Vec::new(),
-            dependency: Vec::new(),
-            duplicate: false,
-            // A wrapper jar (Connector, KotlinForForge) carries no top-level
-            // metadata but does ship mods in `META-INF/jarjar/`; the loader loads
-            // those, so the file is not unreadable.
-            recognized: metadata.recognized || !nested.is_empty(),
-            provides: provides.clone(),
-            nested: nested.clone(),
-            game_versions: metadata.game_versions,
-            loader_versions: metadata.loader_versions,
-            java_versions: metadata.java_versions,
-            breaks: metadata.breaks,
-            break_ranges: metadata.break_ranges,
-            dependency_ranges: metadata.dependency_ranges,
-            fabric_dependency: fabric_depends.clone(),
-            fabric_dependency_ranges: fabric_ranges.clone(),
-            blocked: None,
-        };
-        mods.push((info, metadata.depends.clone(), fabric_depends, fabric_ranges, provides));
+            stem: stem.trim_end_matches(".jar").to_string(),
+            enabled,
+            size: meta.as_ref().map(|meta| meta.len()).unwrap_or_default(),
+            modified: meta.as_ref().and_then(modified_secs).unwrap_or_default(),
+            stamp: meta.as_ref().map(modified_stamp).unwrap_or_default(),
+            cacheable: meta.is_some(),
+        });
     }
-    let mut counts = std::collections::BTreeMap::new();
-    for (info, ..) in &mods {
-        if info.enabled {
-            *counts.entry(info.id.to_ascii_lowercase()).or_insert(0usize) += 1;
+    let mut mods = Vec::with_capacity(pending.len());
+    for parsed in parse_all(pending, neoforge_style, loader) {
+        let ParsedMod {
+            mut info,
+            forge_depends,
+            fabric_depends,
+            fabric_ranges,
+        } = parsed;
+        // Everything this mod requires that the loader itself does not
+        // provide: the frontend unions it into "this instance's dependencies",
+        // while `missing_dependencies` drives the download hint.
+        let use_fabric = matches!(loader, Some(ModLoader::Fabric | ModLoader::Quilt))
+            && info.loader == ModLoader::Universal
+            && !fabric_depends.is_empty();
+        if use_fabric {
+            info.dependency_ranges = fabric_ranges;
         }
+        info.dependency = if use_fabric { fabric_depends } else { forge_depends }
+            .iter()
+            .filter(|dependency| sane_id(dependency))
+            .cloned()
+            .collect();
+        info.dependency.sort();
+        info.dependency.dedup();
+        mods.push(info);
     }
-    for (info, ..) in &mut mods {
-        info.duplicate = info.enabled && counts.get(&info.id.to_ascii_lowercase()).copied().unwrap_or(0) > 1;
+    reindex(&mut mods);
+    mods.sort_by_key(|entry| entry.name.to_lowercase());
+    Ok(mods)
+}
+
+/// One file in `mods/` before its archive is read.
+struct PendingMod {
+    path: PathBuf,
+    file: String,
+    /// File name without `.jar`: the last-resort id, name and version.
+    stem: String,
+    enabled: bool,
+    size: u64,
+    modified: u64,
+    /// Nanosecond mtime; part of the cache key so two writes in the same
+    /// second are still told apart.
+    stamp: u128,
+    cacheable: bool,
+}
+
+/// A jar after its metadata was read. The relations need the whole directory,
+/// so they are computed once at the end.
+struct ParsedMod {
+    info: ModInfo,
+    forge_depends: Vec<String>,
+    fabric_depends: Vec<String>,
+    fabric_ranges: BTreeMap<String, Vec<String>>,
+}
+
+/// Recompute everything that depends on which files are enabled: duplicate
+/// ids, missing prerequisites and switched-off prerequisites. Toggling one mod
+/// changes only that entry, so callers update the list in place instead of
+/// scanning every archive a second time.
+pub fn reindex(mods: &mut [ModInfo]) {
+    let mut counts = BTreeMap::new();
+    for info in mods.iter().filter(|info| info.enabled) {
+        *counts.entry(info.id.to_ascii_lowercase()).or_insert(0usize) += 1;
     }
     // Forge mod ids are not case-sensitive: a jar may declare `Mekanism` while
     // a dependent asks for `mekanism`. Comparing the raw strings reported the
@@ -250,33 +283,18 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
     // which the loader refuses to start with.
     let installed: Vec<String> = mods
         .iter()
-        .flat_map(|(info, ..)| std::iter::once(info.id.clone()).chain(info.provides.iter().cloned()))
+        .flat_map(|info| std::iter::once(info.id.clone()).chain(info.provides.iter().cloned()))
         .map(|id| id.to_ascii_lowercase())
         .collect();
     // Ids the loader will actually see at start-up.
     let switched_on: Vec<String> = mods
         .iter()
-        .filter(|(info, ..)| info.enabled)
-        .flat_map(|(info, ..)| std::iter::once(info.id.clone()).chain(info.provides.iter().cloned()))
+        .filter(|info| info.enabled)
+        .flat_map(|info| std::iter::once(info.id.clone()).chain(info.provides.iter().cloned()))
         .map(|id| id.to_ascii_lowercase())
         .collect();
-    for (info, forge_depends, fabric_depends, fabric_ranges, _) in &mut mods {
-        // Everything this mod requires that the loader itself does not
-        // provide: the frontend unions it into "this instance's
-        // dependencies", while `missing_dependencies` drives the download hint.
-        let use_fabric = matches!(loader, Some(ModLoader::Fabric | ModLoader::Quilt))
-            && info.loader == ModLoader::Universal
-            && !fabric_depends.is_empty();
-        if use_fabric {
-            info.dependency_ranges = fabric_ranges.clone();
-        }
-        info.dependency = if use_fabric { fabric_depends } else { forge_depends }
-            .iter()
-            .filter(|dependency| sane_id(dependency))
-            .cloned()
-            .collect();
-        info.dependency.sort();
-        info.dependency.dedup();
+    for info in mods.iter_mut() {
+        info.duplicate = info.enabled && counts.get(&info.id.to_ascii_lowercase()).copied().unwrap_or(0) > 1;
         info.missing_dependencies = info
             .dependency
             .iter()
@@ -296,9 +314,150 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
             Vec::new()
         };
     }
-    let mut mods: Vec<ModInfo> = mods.into_iter().map(|(info, ..)| info).collect();
-    mods.sort_by_key(|entry| entry.name.to_lowercase());
-    Ok(mods)
+}
+
+/// Read one archive, in parallel when there are enough files to be worth it.
+/// A handful of threads keeps hundreds of jars from being opened one by one,
+/// which is where a Windows install with an antivirus spends its time.
+fn parse_all(pending: Vec<PendingMod>, neoforge_style: bool, loader: Option<ModLoader>) -> Vec<ParsedMod> {
+    let threads = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    if threads == 1 || pending.len() < 32 {
+        return pending
+            .iter()
+            .map(|entry| parse_mod(entry, neoforge_style, loader))
+            .collect();
+    }
+    let chunk = pending.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = pending
+            .chunks(chunk)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|entry| parse_mod(entry, neoforge_style, loader))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut parsed = Vec::with_capacity(pending.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(chunk) => parsed.extend(chunk),
+                // A panicking worker must not silently drop its share of the
+                // list; surface it like a serial scan would.
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        parsed
+    })
+}
+
+fn parse_mod(entry: &PendingMod, neoforge_style: bool, loader: Option<ModLoader>) -> ParsedMod {
+    let (metadata, mut nested) = if entry.cacheable {
+        read_jar_cached(&entry.path, entry.size, entry.stamp, neoforge_style, loader)
+    } else {
+        read_jar(&entry.path, neoforge_style, loader)
+    };
+    nested.sort();
+    nested.dedup();
+    nested.retain(|id| metadata.id.as_deref() != Some(id.as_str()) && !metadata.provides.contains(id));
+    let mut provides = metadata.provides.clone();
+    provides.extend(nested.iter().cloned());
+    let forge_depends = metadata.depends.clone();
+    let fabric_depends = metadata.fabric_depends.clone();
+    let fabric_ranges = metadata.fabric_dependency_ranges.clone();
+    let fallback = entry.stem.clone();
+    let info = ModInfo {
+        id: metadata.id.clone().unwrap_or_else(|| fallback.clone()),
+        name: metadata.name.clone().unwrap_or_else(|| fallback.clone()),
+        version: metadata.version.clone().unwrap_or_else(|| fallback.clone()),
+        loader: metadata.loader,
+        enabled: entry.enabled,
+        size: entry.size,
+        modified: entry.modified,
+        file: entry.file.clone(),
+        missing_dependencies: Vec::new(),
+        disabled_dependencies: Vec::new(),
+        dependency: Vec::new(),
+        duplicate: false,
+        // A wrapper jar (Connector, KotlinForForge) carries no top-level
+        // metadata but does ship mods in `META-INF/jarjar/`; the loader loads
+        // those, so the file is not unreadable.
+        recognized: metadata.recognized || !nested.is_empty(),
+        provides,
+        nested,
+        game_versions: metadata.game_versions,
+        loader_versions: metadata.loader_versions,
+        java_versions: metadata.java_versions,
+        breaks: metadata.breaks,
+        break_ranges: metadata.break_ranges,
+        dependency_ranges: metadata.dependency_ranges,
+        fabric_dependency: metadata.fabric_depends,
+        fabric_dependency_ranges: metadata.fabric_dependency_ranges,
+        blocked: None,
+    };
+    ParsedMod {
+        info,
+        forge_depends,
+        fabric_depends,
+        fabric_ranges,
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct JarKey {
+    path: PathBuf,
+    size: u64,
+    stamp: u128,
+    neoforge: bool,
+    loader: Option<ModLoader>,
+}
+
+type JarMetadata = (Metadata, Vec<String>);
+type JarCache = Mutex<HashMap<JarKey, JarMetadata>>;
+
+const JAR_CACHE_LIMIT: usize = 4096;
+
+/// Parsed metadata per archive, keyed by path, size and nanosecond mtime.
+/// Opening hundreds of jars for every listing (and again after a toggle) was
+/// the slow part; the files rarely change while the launcher is open.
+fn read_jar_cached(
+    path: &Path,
+    size: u64,
+    stamp: u128,
+    neoforge_style: bool,
+    loader: Option<ModLoader>,
+) -> (Metadata, Vec<String>) {
+    let key = JarKey {
+        path: path.to_path_buf(),
+        size,
+        stamp,
+        neoforge: neoforge_style,
+        loader,
+    };
+    if let Some(hit) = jar_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&key)
+    {
+        return hit.clone();
+    }
+    let parsed = read_jar(path, neoforge_style, loader);
+    let mut cache = jar_cache().lock().unwrap_or_else(|poison| poison.into_inner());
+    if cache.len() >= JAR_CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(key, parsed.clone());
+    parsed
+}
+
+fn jar_cache() -> &'static JarCache {
+    static CACHE: OnceLock<JarCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// `foo.jar.disabled` -> (`foo.jar`, false); `foo.jar` -> (`foo.jar`, true).
@@ -334,7 +493,7 @@ pub fn set_enabled(path: &Path, enabled: bool) -> io::Result<PathBuf> {
     Ok(target)
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Metadata {
     id: Option<String>,
     name: Option<String>,
@@ -1558,6 +1717,62 @@ versionRange="[1.21,1.21.1)"
             mods[0].dependency_ranges.get("lib").cloned(),
             Some(vec!["[2,)".to_string()])
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reindex_follows_a_manual_toggle() {
+        let dir = temp_dir("reindex");
+        write_zip(
+            &dir.join("mods/dep-1.jar"),
+            &[("fabric.mod.json", r#"{"id":"dep","version":"1"}"#)],
+        );
+        write_zip(
+            &dir.join("mods/user-1.jar"),
+            &[(
+                "fabric.mod.json",
+                r#"{"id":"user","version":"1","depends":{"dep":">=1"}}"#,
+            )],
+        );
+        let mut mods = scan(&dir.join("mods")).unwrap();
+        let user = mods.iter().find(|entry| entry.id == "user").unwrap();
+        assert!(user.missing_dependencies.is_empty());
+        assert!(user.disabled_dependencies.is_empty());
+
+        mods.iter_mut().find(|entry| entry.id == "dep").unwrap().enabled = false;
+        reindex(&mut mods);
+        let user = mods.iter().find(|entry| entry.id == "user").unwrap();
+        assert_eq!(user.disabled_dependencies, vec!["dep".to_string()]);
+
+        mods.iter_mut().find(|entry| entry.id == "user").unwrap().enabled = false;
+        reindex(&mut mods);
+        let user = mods.iter().find(|entry| entry.id == "user").unwrap();
+        assert!(user.disabled_dependencies.is_empty());
+        // A switched-off jar still counts as installed: the fix is to enable
+        // it, not to download a second copy.
+        assert!(user.missing_dependencies.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reindex_drops_the_duplicate_flag_when_one_copy_is_off() {
+        let dir = temp_dir("reindex-duplicate");
+        write_zip(
+            &dir.join("mods/example-1.jar"),
+            &[("fabric.mod.json", r#"{"id":"example","version":"1"}"#)],
+        );
+        write_zip(
+            &dir.join("mods/example-2.jar"),
+            &[("fabric.mod.json", r#"{"id":"example","version":"2"}"#)],
+        );
+        let mut mods = scan(&dir.join("mods")).unwrap();
+        assert!(mods.iter().all(|entry| entry.duplicate));
+        mods.iter_mut()
+            .find(|entry| entry.file == "example-2.jar")
+            .unwrap()
+            .enabled = false;
+        reindex(&mut mods);
+        assert!(mods.iter().all(|entry| !entry.duplicate));
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1472,6 +1472,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "libc",
  "serde_json",
  "tntl-app",
  "tntl-auth",
@@ -1539,6 +1540,7 @@ name = "tntl-instance"
 version = "8.0.0"
 dependencies = [
  "flate2",
+ "png",
  "serde",
  "serde_json",
  "thiserror",

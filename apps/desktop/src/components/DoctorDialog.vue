@@ -3,6 +3,7 @@ import { computed } from "vue";
 import type { DiagnosticReport } from "../api";
 import Icon from "./Icon.vue";
 import FindingCard from "./FindingCard.vue";
+import TransferBar from "./TransferBar.vue";
 import { findingsReport } from "../findings";
 import { t } from "../i18n";
 
@@ -12,11 +13,18 @@ const props = defineProps<{
   busy: boolean;
   error: string | null;
   actionBusy: string | null;
+  status: string | null;
+  problemCount: number;
+  done: number;
+  total: number | null;
+  speed: number;
+  detail: string | null;
 }>();
 defineEmits<{
   close: [];
   rerun: [];
   action: [kind: "deps" | "versions" | "repair" | "mods" | "log"];
+  problems: [];
 }>();
 
 const errors = computed(() => props.report?.findings.filter((f) => f.severity === "error").length ?? 0);
@@ -95,7 +103,28 @@ function copy() {
         </template>
       </div>
 
+      <div v-if="actionBusy || status" class="action-state">
+        <TransferBar
+          v-if="actionBusy"
+          :label="status ?? t('doctor.working')"
+          :done="done"
+          :total="total"
+          :speed="speed"
+          :detail="detail ?? ''"
+          :indeterminate="!total"
+        />
+        <p v-else class="status">{{ status }}</p>
+      </div>
+
       <footer>
+        <button
+          class="ghost small"
+          type="button"
+          :disabled="busy || actionBusy !== null"
+          @click="$emit('problems')"
+        >
+          <Icon name="alert" :size="13" />{{ t("doctor.showProblems", { count: problemCount }) }}
+        </button>
         <button
           v-if="hasMissing"
           class="ghost small"
@@ -212,6 +241,7 @@ header {
   flex: 1;
   min-height: 120px;
   overflow: auto;
+  overflow-x: hidden;
   padding: 12px 16px;
 }
 
@@ -232,6 +262,20 @@ header {
   margin: 12px 2px 0;
   font-size: 10.5px;
   color: var(--muted-2);
+}
+
+.action-state {
+  padding: 8px 16px 0;
+  border-top: 1px solid var(--border);
+}
+
+.action-state .status {
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid rgba(111, 220, 111, 0.28);
+  background: rgba(111, 220, 111, 0.08);
+  color: var(--text);
+  font-size: 11.5px;
 }
 
 footer {
