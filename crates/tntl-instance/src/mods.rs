@@ -162,9 +162,11 @@ fn modified_secs(meta: &fs::Metadata) -> Option<u64> {
         .map(|elapsed| elapsed.as_secs())
 }
 
-/// Inode/file index for the metadata cache. Atomic installs create a new file,
-/// so this catches a same-size rewrite even when the filesystem stores only
-/// two-second mtimes (FAT, exFAT, SMB).
+/// File identity for the metadata cache. Atomic installs replace the file, so
+/// this catches a same-size rewrite even when the filesystem stores only
+/// two-second mtimes (FAT, exFAT, SMB). Unix has an inode; `file_index()` is
+/// still unstable on Windows, so its creation time stands in for it — a
+/// replaced file gets a new timestamp.
 fn file_identity(meta: &fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
@@ -174,7 +176,7 @@ fn file_identity(meta: &fs::Metadata) -> u64 {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        meta.file_index().unwrap_or_default()
+        meta.creation_time().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ meta.file_size() ^ meta.last_write_time()
     }
     #[cfg(not(any(unix, windows)))]
     {
