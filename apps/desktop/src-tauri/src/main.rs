@@ -724,10 +724,24 @@ fn create_instance(
         instance.username = username;
     }
     if let Some(memory) = max_memory_mb {
-        instance.max_memory_mb = memory.clamp(512, 65536);
+        instance.max_memory_mb = Some(memory.clamp(512, 65536));
     }
     launcher.create_instance(&instance).map_err(message)?;
     Ok(())
+}
+
+/// Store the memory slider immediately; the page also keeps a save button for
+/// the other fields.
+#[tauri::command]
+fn set_instance_memory(
+    state: State<'_, AppState>,
+    name: String,
+    min_memory_mb: Option<u32>,
+    max_memory_mb: Option<u32>,
+) -> Result<Instance, String> {
+    state_launcher(&state)
+        .set_instance_memory(&name, min_memory_mb, max_memory_mb)
+        .map_err(message)
 }
 
 #[tauri::command]
@@ -1038,6 +1052,49 @@ async fn content_icon(
 }
 
 #[tauri::command]
+async fn mod_icon(
+    state: State<'_, AppState>,
+    name: String,
+    file: String,
+) -> Result<tauri::ipc::Response, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = launcher.mod_icon(&name, &file).map_err(message)?;
+        Ok(tauri::ipc::Response::new(bytes))
+    })
+    .await
+    .map_err(message)?
+}
+
+#[tauri::command]
+async fn world_icon(
+    state: State<'_, AppState>,
+    name: String,
+    world: String,
+) -> Result<tauri::ipc::Response, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = launcher.world_icon(&name, &world).map_err(message)?;
+        Ok(tauri::ipc::Response::new(bytes))
+    })
+    .await
+    .map_err(message)?
+}
+
+/// Images from a catalogue go through the shell: the webview has no proxy and
+/// its CSP only allows local and blob sources.
+#[tauri::command]
+async fn remote_image(state: State<'_, AppState>, url: String) -> Result<tauri::ipc::Response, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = launcher.remote_image(&url).map_err(message)?;
+        Ok(tauri::ipc::Response::new(bytes))
+    })
+    .await
+    .map_err(message)?
+}
+
+#[tauri::command]
 async fn search_projects(
     state: State<'_, AppState>,
     instance: String,
@@ -1182,15 +1239,27 @@ fn total_memory_mb() -> Option<u64> {
 
 #[tauri::command]
 async fn check_updates(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     instance: String,
     kind: String,
 ) -> Result<Vec<tntl_app::ModUpdate>, String> {
     let launcher = state_launcher(&state);
     let kind = tntl_app::ProjectKind::from_key(&kind).ok_or_else(|| format!("unknown project kind {kind}"))?;
-    tauri::async_runtime::spawn_blocking(move || launcher.check_updates(&instance, kind).map_err(message))
-        .await
-        .map_err(message)?
+    let kind_key = kind.key();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut progress = |done: usize, total: usize| {
+            let _ = app.emit(
+                "check-progress",
+                serde_json::json!({ "kind": kind_key, "done": done, "total": total }),
+            );
+        };
+        launcher
+            .check_updates_with(&instance, kind, &mut progress)
+            .map_err(message)
+    })
+    .await
+    .map_err(message)?
 }
 
 #[tauri::command]
@@ -1274,6 +1343,11 @@ async fn launch_instance(app: tauri::AppHandle, state: State<'_, AppState>, name
             // game may still be running; the marker catches that case.
             launcher.ensure_not_running(&name).map_err(message)?;
             let instance = launcher.load_instance(&name).map_err(message)?;
+            // A new instance has no memory choice yet; guessing one is exactly
+            // what the user asked to stop doing.
+            if instance.max_memory_mb.is_none() {
+                return Err("memory is not set for this instance; set the maximum memory first".to_string());
+            }
             launcher.prepare_skin(&name).map_err(message)?;
             let plan = launcher
                 .plan_instance(&instance, None, VerifyMode::Exists)
@@ -2896,6 +2970,9 @@ fn main() {
             move_resource_pack,
             remove_content,
             content_icon,
+            mod_icon,
+            world_icon,
+            remote_image,
             check_updates,
             check_dependency_updates,
             memory_advice,
@@ -2938,6 +3015,7 @@ fn main() {
             save_servers,
             disk_usage,
             cleanup_instance,
+            set_instance_memory,
             pick_file,
             pick_folder,
             is_directory,

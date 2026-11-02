@@ -158,31 +158,35 @@ fn installed_mod_ids(game_dir: &Path) -> Vec<String> {
 /// Which shader mod owns the shader settings. Iris wins when several are
 /// present; Oculus (Iris for Forge) is recognised by its mod id and file.
 fn shader_backend(game_dir: &Path) -> Option<ShaderBackend> {
+    // Cheap checks first: a config file or a jar name needs no zip read at all,
+    // while the metadata scan opens every jar in `mods/`. Instances with
+    // hundreds of jars spent seconds here on every listing.
+    let iris_config = game_dir.join(IRIS_CONFIG).is_file();
+    if iris_config || jar_named(game_dir, &["iris"]) {
+        return Some(ShaderBackend::Iris { config: IRIS_CONFIG });
+    }
+    if game_dir.join(OCULUS_CONFIG).is_file()
+        || jar_named(game_dir, &["oculus", "oculus-unofficial", "neoculus", "forgeoculus"])
+    {
+        // Oculus writes its own file; an existing Iris file is kept when the
+        // instance was set up with Iris before (checked above).
+        return Some(ShaderBackend::Iris { config: OCULUS_CONFIG });
+    }
+    // A jar renamed past recognition still leaves its config behind.
+    if game_dir.join(OPTIFINE_CONFIG).is_file() || jar_named(game_dir, &["optifine"]) {
+        return Some(ShaderBackend::OptiFine);
+    }
+    // Renamed or oddly packaged jars: only now read the archives. An Iris config
+    // found here is handled by the first branch on the next call.
     let ids = installed_mod_ids(game_dir);
-    let has = |needles: &[&str]| ids.iter().any(|id| needles.contains(&id.as_str())) || jar_named(game_dir, needles);
+    let has = |needles: &[&str]| ids.iter().any(|id| needles.contains(&id.as_str()));
     if has(&["iris"]) {
         return Some(ShaderBackend::Iris { config: IRIS_CONFIG });
     }
     if has(&["oculus", "oculus-unofficial", "neoculus", "forgeoculus"]) {
-        // Oculus writes its own file; an existing Iris file is kept when the
-        // instance was set up with Iris before.
-        let config = if game_dir.join(OCULUS_CONFIG).is_file() {
-            OCULUS_CONFIG
-        } else if game_dir.join(IRIS_CONFIG).is_file() {
-            IRIS_CONFIG
-        } else {
-            OCULUS_CONFIG
-        };
-        return Some(ShaderBackend::Iris { config });
-    }
-    // A jar renamed past recognition still leaves its config behind.
-    if game_dir.join(IRIS_CONFIG).is_file() {
-        return Some(ShaderBackend::Iris { config: IRIS_CONFIG });
-    }
-    if game_dir.join(OCULUS_CONFIG).is_file() {
         return Some(ShaderBackend::Iris { config: OCULUS_CONFIG });
     }
-    if game_dir.join(OPTIFINE_CONFIG).is_file() || has(&["optifine"]) {
+    if has(&["optifine"]) {
         return Some(ShaderBackend::OptiFine);
     }
     None
@@ -216,7 +220,24 @@ pub fn shaders_supported(game_dir: &Path) -> bool {
 /// Shader pack the shader mod has active, if any.
 pub fn active_shader(game_dir: &Path) -> Result<Option<String>, ContentError> {
     match shader_backend(game_dir) {
-        Some(ShaderBackend::Iris { config }) => {
+        Some(backend) => active_for(game_dir, backend),
+        None => Ok(None),
+    }
+}
+
+/// Active shader pack plus whether the instance can switch shaders at all.
+/// Both answers come from one backend lookup, so a listing does not scan
+/// `mods/` twice.
+pub fn shader_state(game_dir: &Path) -> Result<(Option<String>, bool), ContentError> {
+    match shader_backend(game_dir) {
+        Some(backend) => Ok((active_for(game_dir, backend)?, true)),
+        None => Ok((None, false)),
+    }
+}
+
+fn active_for(game_dir: &Path, backend: ShaderBackend) -> Result<Option<String>, ContentError> {
+    match backend {
+        ShaderBackend::Iris { config } => {
             let path = game_dir.join(config);
             if !path.is_file() {
                 return Ok(None);
@@ -231,7 +252,7 @@ pub fn active_shader(game_dir: &Path) -> Result<Option<String>, ContentError> {
                 .filter(|name| !name.is_empty() && *name != "(internal)")
                 .map(ToString::to_string))
         }
-        Some(ShaderBackend::OptiFine) => {
+        ShaderBackend::OptiFine => {
             let path = game_dir.join(OPTIFINE_CONFIG);
             if !path.is_file() {
                 return Ok(None);
@@ -243,7 +264,6 @@ pub fn active_shader(game_dir: &Path) -> Result<Option<String>, ContentError> {
                 .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("off"))
                 .map(ToString::to_string))
         }
-        None => Ok(None),
     }
 }
 

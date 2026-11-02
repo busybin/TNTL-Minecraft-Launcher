@@ -41,6 +41,7 @@ const pt: Record<string, string> = {
   "app.removedConfigIn": 'Entrada do iniciador (somente configuração): {path}',
   "app.openConfigFolder": 'Pasta do iniciador',
   "app.removeConfirm": 'Remover {name} da lista? Os arquivos são mantidos.',
+  "app.undoRemove": "Desfazer remoção",
   "app.librarySubtitle": "Seus mundos a um clique de distância",
   "app.install": "Instalar",
   "app.installSubtitle": "Versões oficiais da Mojang, direto da fonte",
@@ -846,6 +847,19 @@ const pt: Record<string, string> = {
   "modrinth.versions": "Versões",
   "modrinth.noVersions": "Nenhuma versão serve para esta instância.",
   "modrinth.installThis": "Usar esta versão",
+  "instances.memoryUnset": "memória não definida",
+  "editor.loadingList": "Lendo a pasta…",
+  "memory.unset": "Não definida: arraste um controle",
+  "memory.neededTitle": "Defina a memória primeiro",
+  "memory.neededHint": "Esta instância ainda não tem memória máxima. Abra a instância, ajuste o controle de memória e tente de novo.",
+  "memory.neededGo": "Abrir ajustes de memória",
+  "editor.location": "Localização",
+  "editor.gameDir": "Pasta do jogo",
+  "editor.open": "Abrir",
+  "editor.copied": "Copiado",
+  "editor.autoSaved": "Salvo automaticamente",
+  "editor.saveFailed": "Não salvo",
+  "action.copy": "Copiar",
 };
 
 export default pt;

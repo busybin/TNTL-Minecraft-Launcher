@@ -203,6 +203,31 @@ fn directory_size(path: &Path) -> u64 {
         .sum()
 }
 
+/// `icon.png` a world folder carries, for the picture in the saves list. The
+/// game writes a 128x128 screenshot before the first save; old worlds have
+/// none, which is not an error.
+pub fn icon(game_dir: &Path, world: &str) -> Result<Vec<u8>, WorldError> {
+    let dir = world_path(game_dir, world)?;
+    let path = dir.join("icon.png");
+    // A world icon is 128x128; anything huge is not the file the game wrote,
+    // and must not be read into memory.
+    match fs::metadata(&path) {
+        Ok(meta) if meta.len() > 1024 * 1024 => {
+            return Err(WorldError::Invalid(format!("{world} has no usable icon.png")));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(WorldError::Invalid(format!("{world} has no icon.png")));
+        }
+        Err(error) => return Err(io_err(&path, error)),
+    }
+    let bytes = fs::read(&path).map_err(|error| io_err(&path, error))?;
+    if !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Err(WorldError::Invalid(format!("{world} has no usable icon.png")));
+    }
+    Ok(bytes)
+}
+
 /// Zip a world into `backup_dir` and return the archive path.
 pub fn backup(game_dir: &Path, world: &str, backup_dir: &Path) -> Result<PathBuf, WorldError> {
     let source = world_path(game_dir, world)?;
@@ -783,6 +808,21 @@ mod tests {
         assert_eq!(second.dir, "MyWorld-2");
         fs::remove_dir_all(&game).unwrap();
         fs::remove_dir_all(&source).unwrap();
+    }
+
+    #[test]
+    fn reads_the_world_icon() {
+        let game = temp_dir("icon");
+        let world = game.join("saves/My World");
+        fs::create_dir_all(&world).unwrap();
+        // A world saved before the icon existed simply has none.
+        assert!(icon(&game, "My World").is_err());
+        fs::write(world.join("icon.png"), b"\x89PNG\r\n\x1a\nicon").unwrap();
+        assert_eq!(icon(&game, "My World").unwrap(), b"\x89PNG\r\n\x1a\nicon".to_vec());
+        // Something that is not a PNG is not shown as one.
+        fs::write(world.join("icon.png"), b"not an image").unwrap();
+        assert!(icon(&game, "My World").is_err());
+        fs::remove_dir_all(game).unwrap();
     }
 
     #[test]

@@ -5,7 +5,8 @@ export interface InstanceView {
   name: string;
   version_id: string;
   username: string;
-  max_memory_mb: number;
+  /** `null` until the user picks a maximum memory for the instance. */
+  max_memory_mb: number | null;
   java: string | null;
   imported: boolean;
   account_name: string | null;
@@ -144,7 +145,7 @@ export interface DiagnosticReport {
   loader_version: string | null;
   mods: number;
   enabled_mods: number;
-  memory_mb: number;
+  memory_mb: number | null;
   java_major: number | null;
   findings: Finding[];
 }
@@ -537,7 +538,7 @@ export interface InstanceConfig {
   game_dir: string | null;
   java: string | null;
   min_memory_mb: number | null;
-  max_memory_mb: number;
+  max_memory_mb: number | null;
   jvm_args: string[];
   game_args: string[];
   env: Record<string, string>;
@@ -761,6 +762,9 @@ export const api = {
     invoke<void>("create_instance", { name, versionId, username, maxMemoryMb }),
   loadInstance: (name: string) => invoke<InstanceConfig>("load_instance", { name }),
   saveInstance: (instance: InstanceConfig) => invoke<void>("save_instance", { instance }),
+  // The memory slider saves on its own so the value is there before Play.
+  setInstanceMemory: (name: string, minMemoryMb: number | null, maxMemoryMb: number | null) =>
+    invoke<InstanceConfig>("set_instance_memory", { name, minMemoryMb, maxMemoryMb }),
   clearInstanceJava: (name: string) => invoke<void>("clear_instance_java", { name }),
   // Removal only hides the entry; the files stay where they are.
   deleteInstance: (name: string) => invoke<InstanceLocation>("delete_instance", { name }),
@@ -895,6 +899,8 @@ export const api = {
     invoke<ContentListing>("remove_content", { name, kind, file }),
   contentIcon: (name: string, kind: ProjectKind, file: string) =>
     invoke<ArrayBuffer>("content_icon", { name, kind, file }),
+  modIcon: (name: string, file: string) => invoke<ArrayBuffer>("mod_icon", { name, file }),
+  worldIcon: (name: string, world: string) => invoke<ArrayBuffer>("world_icon", { name, world }),
   installMods: (instance: string, projects: string[]) =>
     invoke<InstalledMod[]>("install_mods", { instance, projects }),
   installMissingDeps: (instance: string) =>
@@ -1005,6 +1011,10 @@ export const events = {
   onGameLine: (handler: (line: string) => void) => listen<string>("game-line", (event) => handler(event.payload)),
   onModProgress: (handler: (event: ModProgress) => void) =>
     listen<ModProgress>("mod-progress", (event) => handler(event.payload)),
+  onCheckProgress: (handler: (event: { kind: ProjectKind; done: number; total: number }) => void) =>
+    listen<{ kind: ProjectKind; done: number; total: number }>("check-progress", (event) =>
+      handler(event.payload),
+    ),
   onPackProgress: (handler: (payload: JobEvent<PackProgress>) => void) =>
     listen<JobEvent<PackProgress>>("pack-progress", (event) => handler(event.payload)),
   onJavaProgress: (handler: (event: RuntimeProgress) => void) =>
@@ -1062,6 +1072,47 @@ const IMAGE_TYPES: Record<string, string> = {
 export function imageUrl(bytes: ArrayBuffer, file?: string | null): string {
   const extension = file?.split(".").pop()?.toLowerCase() ?? "png";
   return URL.createObjectURL(new Blob([bytes], { type: IMAGE_TYPES[extension] ?? "image/png" }));
+}
+
+/** Same, for bytes whose file name says nothing: sniff the magic number. */
+export function bytesImageUrl(bytes: ArrayBuffer): string {
+  const head = new Uint8Array(bytes.slice(0, 12));
+  const starts = (...bytes: number[]) => bytes.every((byte, index) => head[index] === byte);
+  let type = "image/png";
+  if (starts(0xff, 0xd8, 0xff)) type = "image/jpeg";
+  else if (starts(0x47, 0x49, 0x46, 0x38)) type = "image/gif";
+  else if (starts(0x52, 0x49, 0x46, 0x46)) type = "image/webp";
+  return URL.createObjectURL(new Blob([bytes], { type }));
+}
+
+/**
+ * Catalogue icons live on a CDN the webview cannot reach (CSP, and no proxy
+ * there), so the shell fetches them. Cached for the session: the same project
+ * shows up again on every search.
+ */
+const remoteIcons = new Map<string, string>();
+const remoteIconTasks = new Map<string, Promise<string | null>>();
+
+export function remoteImageUrl(url: string): Promise<string | null> {
+  const cached = remoteIcons.get(url);
+  if (cached) return Promise.resolve(cached);
+  const pending = remoteIconTasks.get(url);
+  if (pending) return pending;
+  const task = (async () => {
+    try {
+      const bytes = await invoke<ArrayBuffer>("remote_image", { url });
+      if (!bytes.byteLength) return null;
+      const blob = bytesImageUrl(bytes);
+      remoteIcons.set(url, blob);
+      return blob;
+    } catch {
+      return null;
+    } finally {
+      remoteIconTasks.delete(url);
+    }
+  })();
+  remoteIconTasks.set(url, task);
+  return task;
 }
 
 export type SessionState = {

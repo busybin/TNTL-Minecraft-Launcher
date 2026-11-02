@@ -618,9 +618,22 @@ impl<'a> CurseForge<'a> {
         filter: &Filter,
         kind: ProjectKind,
     ) -> Result<Vec<(ModUpdate, SourceEntry)>, CurseForgeError> {
+        self.updates_with_progress(entries, filter, kind, &mut |_| {})
+    }
+
+    /// [`updates`] with progress: one call per file, so the caller can show
+    /// how many are done.
+    pub fn updates_with_progress(
+        &self,
+        entries: &[(String, SourceEntry)],
+        filter: &Filter,
+        kind: ProjectKind,
+        progress: &mut dyn FnMut(usize),
+    ) -> Result<Vec<(ModUpdate, SourceEntry)>, CurseForgeError> {
         let mut names: HashMap<u64, String> = HashMap::new();
         let mut updates = Vec::new();
-        for (local, entry) in entries {
+        for (done, (local, entry)) in entries.iter().enumerate() {
+            progress(done);
             let files = match self.files(entry.project_id, filter) {
                 Ok(files) => files,
                 // A project or build that disappeared is not worth failing the
@@ -670,6 +683,7 @@ impl<'a> CurseForge<'a> {
                 },
             ));
         }
+        progress(entries.len());
         updates.sort_by_key(|(update, _)| update.name.to_lowercase());
         Ok(updates)
     }

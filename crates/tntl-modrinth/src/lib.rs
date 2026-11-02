@@ -549,14 +549,61 @@ impl<'a> Modrinth<'a> {
         filter: &Filter,
         kind: ProjectKind,
     ) -> Result<Vec<ModUpdate>, ModrinthError> {
-        let hashes: Vec<String> = locals
-            .iter()
-            .map(|local| local.sha1.trim().to_ascii_lowercase())
-            .filter(|sha1| sha1.len() == 40 && sha1.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .collect();
-        if hashes.is_empty() {
-            return Ok(Vec::new());
+        self.updates_with_progress(locals, filter, kind, &mut |_, _| {})
+    }
+
+    /// [`updates`] with progress. Hashes go out in batches: the old code asked
+    /// for every installed file's current version in its own request, which
+    /// turned a 376-mod instance into 376 round trips.
+    pub fn updates_with_progress(
+        &self,
+        locals: &[LocalMod],
+        filter: &Filter,
+        kind: ProjectKind,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Vec<ModUpdate>, ModrinthError> {
+        const BATCH: usize = 40;
+        let total = locals.len();
+        let mut updates = Vec::new();
+        let mut checked = 0;
+        for batch in locals.chunks(BATCH) {
+            let hashes: Vec<String> = batch
+                .iter()
+                .map(|local| local.sha1.trim().to_ascii_lowercase())
+                .filter(|sha1| sha1.len() == 40 && sha1.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .collect();
+            if !hashes.is_empty() {
+                let latest = self.latest_versions(&hashes, filter)?;
+                let current = self.versions_by_hashes(&hashes)?;
+                for local in batch {
+                    let sha1 = local.sha1.trim().to_ascii_lowercase();
+                    let Some(version) = latest.get(&sha1) else {
+                        continue;
+                    };
+                    // `/version_files/update` returns the newest build matching
+                    // the filters, which can be older than the installed file.
+                    // Compare channel rank and publish date so an update never
+                    // downgrades.
+                    if let Some(current) = current.get(&sha1) {
+                        if channel_rank(&version.version_type) < channel_rank(&current.version_type) {
+                            continue;
+                        }
+                        if version.date_published < current.date_published {
+                            continue;
+                        }
+                    }
+                    updates.extend(update_for(local, version, kind));
+                }
+            }
+            checked = (checked + batch.len()).min(total);
+            progress(checked, total);
         }
+        updates.sort_by_key(|update| update.name.to_lowercase());
+        Ok(updates)
+    }
+
+    /// Newest builds for a batch of hashes, honouring the instance's filter.
+    fn latest_versions(&self, hashes: &[String], filter: &Filter) -> Result<HashMap<String, Version>, ModrinthError> {
         let url = format!("{}/version_files/update", endpoints::MODRINTH_API);
         // Resource packs and shaders have no loader, so the filter is left out
         // for them instead of sending an empty one.
@@ -572,31 +619,16 @@ impl<'a> Modrinth<'a> {
         }
         let payload = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
         let bytes = self.http.post_json(&url, &payload)?;
-        let latest: HashMap<String, Version> =
-            serde_json::from_slice(&bytes).map_err(|source| decode_error(&url, source))?;
+        serde_json::from_slice(&bytes).map_err(|source| decode_error(&url, source))
+    }
 
-        let mut updates = Vec::new();
-        for local in locals {
-            let sha1 = local.sha1.trim().to_ascii_lowercase();
-            let Some(version) = latest.get(&sha1) else {
-                continue;
-            };
-            // `/version_files/update` returns the newest build matching the
-            // filters, which can be older than the installed file. Compare
-            // channel rank and publish date so an update never downgrades.
-            let current = self.version_by_hash(&sha1)?;
-            if let Some(current) = &current {
-                if channel_rank(&version.version_type) < channel_rank(&current.version_type) {
-                    continue;
-                }
-                if version.date_published < current.date_published {
-                    continue;
-                }
-            }
-            updates.extend(update_for(local, version, kind));
-        }
-        updates.sort_by_key(|update| update.name.to_lowercase());
-        Ok(updates)
+    /// Current versions of a batch of hashes, in one request.
+    pub fn versions_by_hashes(&self, hashes: &[String]) -> Result<HashMap<String, Version>, ModrinthError> {
+        let url = format!("{}/version_files", endpoints::MODRINTH_API);
+        let body = serde_json::json!({ "hashes": hashes, "algorithm": "sha1" });
+        let payload = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+        let bytes = self.http.post_json(&url, &payload)?;
+        serde_json::from_slice(&bytes).map_err(|source| decode_error(&url, source))
     }
 
     /// Download a newer build and drop the file it replaces. A disabled mod

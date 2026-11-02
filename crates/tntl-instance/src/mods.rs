@@ -111,6 +111,45 @@ pub fn mods_dir(game_dir: &Path) -> PathBuf {
     game_dir.join("mods")
 }
 
+/// Icon shipped inside one jar, for the picture next to its name. Fabric names
+/// it in `fabric.mod.json` (`icon`, possibly one file per size), Forge in
+/// `logoFile`; jars without either usually still ship `icon.png` at the root or
+/// under `assets/<id>/`.
+pub fn mod_icon(path: &Path) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let metadata = read_metadata(&mut archive, false, None).unwrap_or_default();
+    let mut candidates: Vec<String> = metadata.icon.into_iter().collect();
+    for fallback in ["icon.png", "logo.png", "pack.png"] {
+        candidates.push(fallback.to_string());
+    }
+    if let Some(id) = metadata.id.filter(|id| sane_id(id)) {
+        candidates.push(format!("assets/{id}/icon.png"));
+        candidates.push(format!("assets/{id}/logo.png"));
+    }
+    candidates
+        .into_iter()
+        .find_map(|name| read_icon_entry(&mut archive, &name))
+}
+
+fn read_icon_entry(archive: &mut zip::ZipArchive<fs::File>, name: &str) -> Option<Vec<u8>> {
+    let entry = archive.by_name(name).ok()?;
+    if entry.size() > 1024 * 1024 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    entry.take(1024 * 1024).read_to_end(&mut bytes).ok()?;
+    looks_like_image(&bytes).then_some(bytes)
+}
+
+/// Browsers sniff, but a blob URL needs the right type; only real images pass.
+fn looks_like_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x89, b'P', b'N', b'G'])
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"GIF8")
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
+}
+
 fn modified_secs(meta: &fs::Metadata) -> Option<u64> {
     meta.modified()
         .ok()?
@@ -176,7 +215,10 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
             disabled_dependencies: Vec::new(),
             dependency: Vec::new(),
             duplicate: false,
-            recognized: metadata.recognized,
+            // A wrapper jar (Connector, KotlinForForge) carries no top-level
+            // metadata but does ship mods in `META-INF/jarjar/`; the loader loads
+            // those, so the file is not unreadable.
+            recognized: metadata.recognized || !nested.is_empty(),
             provides: provides.clone(),
             nested: nested.clone(),
             game_versions: metadata.game_versions,
@@ -297,6 +339,8 @@ struct Metadata {
     id: Option<String>,
     name: Option<String>,
     version: Option<String>,
+    /// Path of the icon inside the jar, from `fabric.mod.json` or `logoFile`.
+    icon: Option<String>,
     loader: ModLoader,
     depends: Vec<String>,
     /// Extra ids the jar satisfies, such as `cloth-config2` from Cloth Config.
@@ -415,6 +459,7 @@ fn combine(fabric: Metadata, forge: Metadata, loader: Option<ModLoader>) -> Meta
         id: primary.id.clone().or_else(|| fallback.id.clone()),
         name: primary.name.clone().or_else(|| fallback.name.clone()),
         version: primary.version.clone().or_else(|| fallback.version.clone()),
+        icon: primary.icon.clone().or_else(|| fallback.icon.clone()),
         loader: ModLoader::Universal,
         depends: primary.depends.clone(),
         provides,
@@ -434,6 +479,18 @@ fn combine(fabric: Metadata, forge: Metadata, loader: Option<ModLoader>) -> Meta
 /// Shared by the mod list, the install guard and the doctor so they never
 /// disagree about a jar.
 pub fn compatible(instance: ModLoader, module: ModLoader, game_version: &str) -> bool {
+    compatible_with_connector(instance, module, game_version, false)
+}
+
+/// [`compatible`] plus Sinytra Connector: it runs Fabric mods on Forge and
+/// NeoForge, so a Fabric jar is not a "wrong loader" jar there.
+pub fn compatible_with_connector(instance: ModLoader, module: ModLoader, game_version: &str, connector: bool) -> bool {
+    if connector
+        && matches!(instance, ModLoader::Forge | ModLoader::NeoForge)
+        && matches!(module, ModLoader::Fabric | ModLoader::Quilt)
+    {
+        return true;
+    }
     match (instance, module) {
         (ModLoader::Fabric, ModLoader::Fabric) => true,
         (ModLoader::Quilt, ModLoader::Quilt | ModLoader::Fabric) => true,
@@ -445,6 +502,16 @@ pub fn compatible(instance: ModLoader, module: ModLoader, game_version: &str) ->
         (_, ModLoader::Universal) => true,
         _ => false,
     }
+}
+
+/// Whether Sinytra Connector is switched on. It loads Fabric mods on Forge and
+/// NeoForge, which changes what "wrong loader" means.
+pub fn connector_installed(mods: &[ModInfo]) -> bool {
+    mods.iter().filter(|module| module.enabled).any(|module| {
+        std::iter::once(&module.id)
+            .chain(module.provides.iter())
+            .any(|id| id.eq_ignore_ascii_case("connector"))
+    })
 }
 
 /// Ids shipped inside `META-INF/jars/` (Fabric) or `META-INF/jarjar/`
@@ -537,6 +604,7 @@ fn parse_json(bytes: &[u8], loader: ModLoader, keys: &[&str]) -> Metadata {
         id: field(keys[0]),
         name: field(keys[1]),
         version: field(keys[2]),
+        icon: json_icon(value.get("icon")),
         loader,
         provides: provides(value.get("provides")),
         breaks,
@@ -583,6 +651,19 @@ fn provides(value: Option<&serde_json::Value>) -> Vec<String> {
 /// `breaks` is an object keyed by mod id (Fabric) or an array of ids/objects
 /// (Quilt). A value may carry a version predicate: `{"other": "<1.0"}` only
 /// conflicts with those builds, while no value means every build.
+/// `icon` is a path, or a table of one path per size (`{"128": "icon.png"}`).
+fn json_icon(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(path) => (!path.is_empty()).then(|| path.clone()),
+        serde_json::Value::Object(sizes) => sizes
+            .iter()
+            .filter_map(|(size, path)| Some((size.parse::<u32>().ok()?, path.as_str()?)))
+            .max_by_key(|(size, _)| *size)
+            .map(|(_, path)| path.to_string()),
+        _ => None,
+    }
+}
+
 fn json_breaks(value: Option<&serde_json::Value>) -> (Vec<String>, BTreeMap<String, Vec<String>>) {
     let mut ids = Vec::new();
     let mut ranges = BTreeMap::new();
@@ -656,6 +737,7 @@ fn parse_quilt(bytes: &[u8]) -> Metadata {
         id: text(&loader["id"]),
         name: text(&loader["metadata"]["name"]).or_else(|| text(&loader["id"])),
         version: text(&loader["version"]),
+        icon: json_icon(loader["metadata"].get("icon")),
         loader: ModLoader::Quilt,
         provides: provides(loader.get("provides")),
         breaks,
@@ -708,6 +790,53 @@ fn logical_lines(text: &str) -> Vec<String> {
     lines
 }
 
+/// Fields of the first inline table in `[{ modId = "x", ... }]`, already
+/// trimmed to `key`/raw-value pairs. The array may hold several tables; only
+/// the first one is a mod, like `[[mods]]`.
+fn inline_mod_table(value: &str) -> Option<Vec<(String, String)>> {
+    let start = value.find('{')?;
+    let end = value.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let body = &value[start + 1..end];
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in body.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(open) => {
+                current.push(ch);
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == open {
+                    quote = None;
+                }
+            }
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            None if ch == ',' => fields.push(std::mem::take(&mut current)),
+            None => current.push(ch),
+        }
+    }
+    fields.push(current);
+    let pairs: Vec<(String, String)> = fields
+        .iter()
+        .filter_map(|field| field.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), toml_value(value)))
+        .filter(|(key, _)| !key.is_empty())
+        .collect();
+    (!pairs.is_empty()).then_some(pairs)
+}
+
 /// Forge and NeoForge keep mod metadata in a TOML file. Only the first
 /// `[[mods]]` table is needed, so a full TOML parser is overkill.
 fn parse_mods_toml(bytes: &[u8], loader: ModLoader) -> Metadata {
@@ -742,6 +871,27 @@ fn parse_mods_toml(bytes: &[u8], loader: ModLoader) -> Metadata {
             continue;
         };
         let key = key.trim();
+        // Modrinth wraps datapack jars with an inline array of tables instead of
+        // `[[mods]]`: `mods = [{ modId = "x", displayName = "y" }]`.
+        if key == "mods" && value.trim_start().starts_with('[') {
+            if let Some(fields) = inline_mod_table(value) {
+                saw_mods = true;
+                for (key, value) in fields {
+                    if value.is_empty() || value.contains("${") {
+                        continue;
+                    }
+                    match key.as_str() {
+                        "modId" => metadata.id = Some(value),
+                        "displayName" => metadata.name = Some(value),
+                        "version" => metadata.version = Some(value),
+                        "provides" => metadata.provides = toml_array(&value),
+                        "logoFile" => metadata.icon = Some(value),
+                        _ => {}
+                    }
+                }
+            }
+            continue;
+        }
         let value = toml_value(value);
         if let Some(dep) = dependency.as_mut() {
             match key {
@@ -767,6 +917,7 @@ fn parse_mods_toml(bytes: &[u8], loader: ModLoader) -> Metadata {
             "displayName" => metadata.name = Some(value),
             "version" => metadata.version = Some(value),
             "provides" => metadata.provides = toml_array(&value),
+            "logoFile" => metadata.icon = Some(value),
             _ => {}
         }
     }
@@ -1233,6 +1384,128 @@ version="${file.jarVersion}"
 
         let new = scan_for(&dir.join("mods"), Some(ModLoader::NeoForge), "1.21.1").unwrap();
         assert_eq!(new[0].missing_dependencies, vec!["reeses_sodium_options"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reads_inline_mods_array() {
+        // Modrinth wraps datapack jars with `mods = [{ ... }]` instead of
+        // `[[mods]]`; the file used to show up as unreadable.
+        let toml = br#"
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+mods = [
+  { modId = "dungeonsandtaverns", displayName = "Dungeons and Taverns", version = "4.3", provides = ["dnt"] }
+]
+
+[[dependencies.dungeonsandtaverns]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.21,1.21.1)"
+"#;
+        let metadata = parse_mods_toml(toml, ModLoader::NeoForge);
+        assert_eq!(metadata.id.as_deref(), Some("dungeonsandtaverns"));
+        assert_eq!(metadata.name.as_deref(), Some("Dungeons and Taverns"));
+        assert_eq!(metadata.version.as_deref(), Some("4.3"));
+        assert_eq!(metadata.provides, vec!["dnt"]);
+        assert_eq!(metadata.game_versions, vec!["[1.21,1.21.1)"]);
+        assert!(metadata.recognized);
+    }
+
+    #[test]
+    fn nested_only_jars_are_recognized() {
+        // Sinytra Connector and KotlinForForge ship no top-level metadata, only
+        // jars under META-INF/jarjar/. They load fine, so they are not
+        // unreadable files.
+        let dir = temp_dir("nested-only");
+        let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        inner.start_file("META-INF/mods.toml", options).unwrap();
+        inner
+            .write_all(b"modLoader=\"javafml\"\n[[mods]]\nmodId=\"connector\"\nversion=\"2.0\"\n")
+            .unwrap();
+        let nested = inner.finish().unwrap().into_inner();
+
+        let path = dir.join("mods/Connector-2.0.jar");
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("META-INF/jarjar/connector.jar", options).unwrap();
+        zip.write_all(&nested).unwrap();
+        zip.finish().unwrap();
+
+        let mods = scan_for_loader(&dir.join("mods"), Some(ModLoader::NeoForge)).unwrap();
+        assert!(mods[0].recognized, "{:?}", mods[0]);
+        assert!(mods[0].provides.contains(&"connector".to_string()));
+        assert!(connector_installed(&mods));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn connector_makes_fabric_jars_compatible() {
+        // Connector loads Fabric mods on NeoForge; without it the jar is dead.
+        assert!(!compatible(ModLoader::NeoForge, ModLoader::Fabric, "1.21.1"));
+        assert!(compatible_with_connector(
+            ModLoader::NeoForge,
+            ModLoader::Fabric,
+            "1.21.1",
+            true
+        ));
+        // Connector does nothing for a plain Fabric instance or for Forge jars.
+        assert!(!compatible_with_connector(
+            ModLoader::Fabric,
+            ModLoader::Forge,
+            "1.21.1",
+            true
+        ));
+        assert!(!connector_installed(&[]));
+    }
+
+    #[test]
+    fn reads_the_icon_named_by_the_metadata() {
+        let dir = temp_dir("icon");
+        let path = dir.join("mods/fabric-mod.jar");
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"demo","name":"Demo","version":"1.0","icon":{"64":"icon_64.png","128":"icon_128.png"}}"#,
+        )
+        .unwrap();
+        zip.start_file("icon_64.png", options).unwrap();
+        zip.write_all(b"\x89PNG\r\n\x1a\nsmall").unwrap();
+        zip.start_file("icon_128.png", options).unwrap();
+        zip.write_all(b"\x89PNG\r\n\x1a\nlarge").unwrap();
+        zip.finish().unwrap();
+        // The largest size the metadata names is the one shown in the list.
+        assert_eq!(mod_icon(&path).unwrap(), b"\x89PNG\r\n\x1a\nlarge".to_vec());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn icon_falls_back_to_the_root_file() {
+        let dir = temp_dir("icon-fallback");
+        let path = dir.join("mods/plain.jar");
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/mods.toml", options).unwrap();
+        zip.write_all(b"modLoader=\"javafml\"\n[[mods]]\nmodId=\"plain\"\nversion=\"1.0\"\n")
+            .unwrap();
+        zip.start_file("icon.png", options).unwrap();
+        zip.write_all(b"\x89PNG\r\n\x1a\nroot").unwrap();
+        zip.finish().unwrap();
+        assert_eq!(mod_icon(&path).unwrap(), b"\x89PNG\r\n\x1a\nroot".to_vec());
+        // A jar without any image is not an error, just no icon.
+        let other = dir.join("mods/empty.jar");
+        let file = fs::File::create(&other).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("META-INF/mods.toml", options).unwrap();
+        zip.write_all(b"modLoader=\"javafml\"\n[[mods]]\nmodId=\"empty\"\nversion=\"1.0\"\n")
+            .unwrap();
+        zip.finish().unwrap();
+        assert!(mod_icon(&other).is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 

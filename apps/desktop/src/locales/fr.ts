@@ -41,6 +41,7 @@ const fr: Record<string, string> = {
   "app.removedConfigIn": 'Entrée du lanceur (configuration uniquement) : {path}',
   "app.openConfigFolder": 'Dossier du lanceur',
   "app.removeConfirm": 'Retirer {name} de la liste ? Les fichiers sont conservés.',
+  "app.undoRemove": "Annuler la suppression",
   "app.librarySubtitle": "Vos mondes, à portée de clic",
   "app.install": "Installer",
   "app.installSubtitle": "Les versions officielles de Mojang, directement à la source",
@@ -846,6 +847,19 @@ const fr: Record<string, string> = {
   "modrinth.versions": "Versions",
   "modrinth.noVersions": "Aucune version ne correspond à cette instance.",
   "modrinth.installThis": "Utiliser cette version",
+  "instances.memoryUnset": "mémoire non définie",
+  "editor.loadingList": "Lecture du dossier…",
+  "memory.unset": "Non définie : faites glisser un curseur",
+  "memory.neededTitle": "Définissez d'abord la mémoire",
+  "memory.neededHint": "Cette instance n'a pas encore de mémoire maximale. Ouvrez-la, réglez le curseur de mémoire et réessayez.",
+  "memory.neededGo": "Ouvrir les réglages de mémoire",
+  "editor.location": "Emplacement",
+  "editor.gameDir": "Dossier du jeu",
+  "editor.open": "Ouvrir",
+  "editor.copied": "Copié",
+  "editor.autoSaved": "Enregistré automatiquement",
+  "editor.saveFailed": "Non enregistré",
+  "action.copy": "Copier",
 };
 
 export default fr;

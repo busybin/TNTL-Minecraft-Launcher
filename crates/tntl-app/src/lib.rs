@@ -587,7 +587,8 @@ pub struct DiagnosticReport {
     pub loader_version: Option<String>,
     pub mods: usize,
     pub enabled_mods: usize,
-    pub memory_mb: u32,
+    /// `None` when the user has not set a maximum memory yet.
+    pub memory_mb: Option<u32>,
     pub java_major: Option<u32>,
     pub findings: Vec<tntl_doctor::Finding>,
 }
@@ -598,7 +599,8 @@ pub struct InstanceView {
     pub name: String,
     pub version_id: String,
     pub username: String,
-    pub max_memory_mb: u32,
+    /// `None` when the instance has no maximum memory yet.
+    pub max_memory_mb: Option<u32>,
     pub java: Option<String>,
     pub imported: bool,
     pub dir: PathBuf,
@@ -1598,11 +1600,12 @@ impl Launcher {
             let mut instance = self.load_instance(&name)?;
             let game_dir = instance.game_dir(&instance_dir);
             let files = ftb.install(&version, &game_dir, self.settings().concurrency, pack_progress)?;
-            // Large FTB packs rarely fit in the 4 GiB default.
+            // Large FTB packs rarely fit in the 4 GiB default. An existing
+            // choice always wins over the pack's suggestion.
             if let Some(recommended) = version.recommended_memory_mb {
                 let recommended = recommended.clamp(1024, 65_536);
-                if recommended > instance.max_memory_mb {
-                    instance.max_memory_mb = recommended;
+                if instance.max_memory_mb.is_none_or(|current| recommended > current) {
+                    instance.max_memory_mb = Some(recommended);
                     self.save_instance(&instance)?;
                 }
             }
@@ -2344,6 +2347,17 @@ impl Launcher {
         let dir = self.instance_dir(&instance.name)?;
         instance.save(&dir)?;
         Ok(dir)
+    }
+
+    /// Persist the memory slider without waiting for the page's save button:
+    /// the value has to be there before the next Play.
+    pub fn set_instance_memory(&self, name: &str, min: Option<u32>, max: Option<u32>) -> Result<Instance> {
+        self.ensure_not_running(name)?;
+        let mut instance = self.load_instance(name)?;
+        instance.min_memory_mb = min.map(|mb| mb.clamp(128, 65_536));
+        instance.max_memory_mb = max.map(|mb| mb.clamp(512, 65_536));
+        self.save_instance(&instance)?;
+        Ok(instance)
     }
 
     /// Point an instance at another version chain. The file is re-read here so
@@ -3222,7 +3236,7 @@ impl Launcher {
                 copy_game_dir(&game_source, &game_dir)?;
             }
             if let Some(memory) = settings.max_memory_mb {
-                instance.max_memory_mb = memory;
+                instance.max_memory_mb = Some(memory);
             }
             if !settings.notes.trim().is_empty() {
                 instance.notes = settings.notes;
@@ -3366,7 +3380,9 @@ impl Launcher {
         let mut options = InstanceOptions::new(instance.game_dir(&instance_dir), instance.natives_dir(&instance_dir));
         options.java = java_path;
         options.min_memory_mb = instance.min_memory_mb;
-        options.max_memory_mb = instance.max_memory_mb;
+        // Plan and verify still work without a saved memory setting; launching
+        // is the only path that insists on one.
+        options.max_memory_mb = instance.max_memory_mb.unwrap_or(2048);
         options.extra_jvm_args = instance.jvm_args.clone();
         options.extra_game_args = instance.game_args.clone();
         options.width = instance.width;
@@ -5204,6 +5220,9 @@ impl Launcher {
         let mut missing: Vec<String> = self
             .mods(name)?
             .into_iter()
+            // A switched-off mod cannot stop the game from starting, so its
+            // missing dependencies are not worth downloading.
+            .filter(|entry| entry.enabled)
             .flat_map(|entry| entry.missing_dependencies)
             .collect();
         missing.sort();
@@ -5558,13 +5577,34 @@ impl Launcher {
     /// reported. CurseForge files are matched through the source sidecar, so
     /// without a key the Modrinth results are still returned.
     pub fn check_updates(&self, name: &str, kind: ProjectKind) -> Result<Vec<ModUpdate>> {
-        self.updated_files(name, kind).map(|(updates, _)| updates)
+        self.check_updates_with(name, kind, &mut |_, _| {})
+    }
+
+    /// [`check_updates`] with progress: `done` of `total` files looked at, so
+    /// the page can show a bar instead of a frozen "checking".
+    pub fn check_updates_with(
+        &self,
+        name: &str,
+        kind: ProjectKind,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Vec<ModUpdate>> {
+        self.updated_files_with(name, kind, progress)
+            .map(|(updates, _)| updates)
     }
 
     /// The update list plus, for mods, the instance's dependency set. The
     /// frontend filters the updates down to dependencies to offer the
     /// "upgrade dependencies" button without a second catalogue round trip.
     pub fn updated_files(&self, name: &str, kind: ProjectKind) -> Result<(Vec<ModUpdate>, HashSet<String>)> {
+        self.updated_files_with(name, kind, &mut |_, _| {})
+    }
+
+    pub fn updated_files_with(
+        &self,
+        name: &str,
+        kind: ProjectKind,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<(Vec<ModUpdate>, HashSet<String>)> {
         let deps = if kind == ProjectKind::Mod {
             self.mods(name)?
                 .into_iter()
@@ -5574,22 +5614,29 @@ impl Launcher {
         } else {
             HashSet::new()
         };
-        let (_, locals, filter) = self.local_content(name, kind)?;
+        let (dir, locals, filter) = self.local_content(name, kind)?;
+        let curseforge_locals = existing_locals(&dir, self.content_sources(name)?.entries(kind));
+        let total = locals.len() + curseforge_locals.len();
         let http = Http::new()?;
         let mut updates = if locals.is_empty() {
             Vec::new()
         } else {
-            Modrinth::new(&http).updates(&locals, &filter, kind)?
+            // The Modrinth check only knows its own file count; report against
+            // the combined total so the bar never jumps to 100% and restarts.
+            Modrinth::new(&http).updates_with_progress(&locals, &filter, kind, &mut |done, _| progress(done, total))?
         };
         let mut seen: HashSet<String> = updates.iter().map(|update| update.file.clone()).collect();
         // Only ask CurseForge about files it installed, but then surface its
         // errors: a swallowed bad key or rate limit looks like "up to date".
-        if !self.content_sources(name)?.entries(kind).is_empty() {
+        if !curseforge_locals.is_empty() {
+            let offset = locals.len();
             updates.extend(
-                self.curseforge_updates(name, kind)?
-                    .into_iter()
-                    .map(|(update, _)| update)
-                    .filter(|update| seen.insert(update.file.clone())),
+                self.curseforge_updates(&http, &curseforge_locals, &filter, kind, &mut |done| {
+                    progress(offset + done, total)
+                })?
+                .into_iter()
+                .map(|(update, _)| update)
+                .filter(|update| seen.insert(update.file.clone())),
             );
         }
         Ok((updates, deps))
@@ -5618,32 +5665,20 @@ impl Launcher {
 
     /// CurseForge updates for the files the sidecar knows, with the source
     /// entry that has to replace the recorded one after applying.
-    fn curseforge_updates(&self, name: &str, kind: ProjectKind) -> Result<Vec<(ModUpdate, SourceEntry)>> {
-        let sources = self.content_sources(name)?;
-        let entries = sources.entries(kind);
-        if entries.is_empty() {
-            return Ok(Vec::new());
-        }
-        let (dir, _, filter) = self.local_content(name, kind)?;
-        let locals: Vec<(String, SourceEntry)> = entries
-            .into_iter()
-            .filter_map(|(base, entry)| {
-                let disabled = format!("{base}.disabled");
-                // A file the user deleted needs no update.
-                if dir.join(&disabled).is_file() {
-                    Some((disabled, entry))
-                } else if dir.join(&base).is_file() {
-                    Some((base, entry))
-                } else {
-                    None
-                }
-            })
-            .collect();
+    fn curseforge_updates(
+        &self,
+        http: &Http,
+        locals: &[(String, SourceEntry)],
+        filter: &Filter,
+        kind: ProjectKind,
+        progress: &mut dyn FnMut(usize),
+    ) -> Result<Vec<(ModUpdate, SourceEntry)>> {
         if locals.is_empty() {
             return Ok(Vec::new());
         }
-        let http = Http::new()?;
-        Ok(self.curseforge(&http)?.updates(&locals, &filter, kind)?)
+        Ok(self
+            .curseforge(http)?
+            .updates_with_progress(locals, filter, kind, progress)?)
     }
 
     /// Replace outdated files of one kind, all of them unless `files` names
@@ -5656,7 +5691,7 @@ impl Launcher {
         progress: &(dyn Fn(tntl_modrinth::InstallEvent) + Send + Sync),
     ) -> Result<Vec<InstalledMod>> {
         self.ensure_not_running(name)?;
-        let (dir, _, _) = self.local_content(name, kind)?;
+        let (dir, _, filter) = self.local_content(name, kind)?;
         let updates = self.check_updates(name, kind)?;
         if !files.is_empty() {
             let installed = content_files(&dir);
@@ -5680,7 +5715,10 @@ impl Launcher {
         }
         let http = Http::new()?;
         let modrinth = Modrinth::new(&http);
-        let curseforge = self.curseforge_updates(name, kind).unwrap_or_default();
+        let curseforge_locals = existing_locals(&dir, self.content_sources(name)?.entries(kind));
+        let curseforge = self
+            .curseforge_updates(&http, &curseforge_locals, &filter, kind, &mut |_| {})
+            .unwrap_or_default();
         let mut sources = self.content_sources(name)?;
         let mut modrinth_record = ModrinthContent::load(&self.modrinth_content_path(name)?);
         let mut record_touched = false;
@@ -5758,10 +5796,10 @@ impl Launcher {
         let dir = game_dir.join(kind.dir());
         let (enabled, toggle_supported) = match kind {
             ProjectKind::ResourcePack => (tntl_instance::content::enabled_resource_packs(&game_dir)?, true),
-            ProjectKind::Shader => (
-                tntl_instance::content::active_shader(&game_dir)?.into_iter().collect(),
-                tntl_instance::content::shaders_supported(&game_dir),
-            ),
+            ProjectKind::Shader => {
+                let (active, supported) = tntl_instance::content::shader_state(&game_dir)?;
+                (active.into_iter().collect(), supported)
+            }
             ProjectKind::Mod => (
                 tntl_instance::mods::scan(&dir)?
                     .into_iter()
@@ -5858,6 +5896,40 @@ impl Launcher {
         self.content(name, ProjectKind::ResourcePack)
     }
 
+    /// Icon one installed mod jar ships, for the picture next to its name.
+    pub fn mod_icon(&self, name: &str, file: &str) -> Result<Vec<u8>> {
+        if file.is_empty() || file.contains('/') || file.contains('\\') || file == ".." {
+            bail!("invalid mod file name: {file}");
+        }
+        let instance = self.load_instance(name)?;
+        let game_dir = instance.game_dir(&self.instance_dir(name)?);
+        let path = tntl_instance::mods::mods_dir(&game_dir).join(file);
+        if !path.is_file() {
+            bail!(
+                "{file} is not installed in {}",
+                tntl_instance::mods::mods_dir(&game_dir).display()
+            );
+        }
+        tntl_instance::mods::mod_icon(&path).with_context(|| format!("{file} has no icon"))
+    }
+
+    /// Fetch one image through the launcher's HTTP client, so it uses the
+    /// configured proxy and the webview never has to reach the CDN itself.
+    pub fn remote_image(&self, url: &str) -> Result<Vec<u8>> {
+        let host = https_host(url).ok_or_else(|| anyhow::anyhow!("only https image urls are allowed"))?;
+        let allowed = [
+            "cdn.modrinth.com",
+            "cdn-raw.modrinth.com",
+            "media.forgecdn.net",
+            "edge.forgecdn.net",
+        ];
+        if !allowed.contains(&host.as_str()) {
+            bail!("{url} is not an allowed image host");
+        }
+        let http = Http::new()?;
+        Ok(http.get_bytes(url, 4 * 1024 * 1024)?)
+    }
+
     /// `pack.png` of one resource pack, for the icon next to its name.
     pub fn content_icon(&self, name: &str, kind: ProjectKind, file: &str) -> Result<Vec<u8>> {
         if file.is_empty() || file.contains('/') || file.contains('\\') || file == ".." {
@@ -5901,6 +5973,13 @@ impl Launcher {
         let instance = self.load_instance(name)?;
         let game_dir = instance.game_dir(&self.instance_dir(name)?);
         Ok(tntl_instance::worlds::list(&game_dir)?)
+    }
+
+    /// `icon.png` of one world, for the picture in the saves list.
+    pub fn world_icon(&self, name: &str, world: &str) -> Result<Vec<u8>> {
+        let instance = self.load_instance(name)?;
+        let game_dir = instance.game_dir(&self.instance_dir(name)?);
+        Ok(tntl_instance::worlds::icon(&game_dir, world)?)
     }
 
     /// Zip one world into `<instance>/backups/worlds/`.
@@ -6878,6 +6957,15 @@ fn loader_from_key(key: &str) -> ModLoader {
     }
 }
 
+/// Host of an `https://` url, lowercased and without userinfo or port. Written
+/// by hand because `tntl-app` does not depend on a url parser.
+fn https_host(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
 fn loader_label(key: &str) -> &'static str {
     match key {
         "fabric" | "legacyfabric" => "Fabric",
@@ -6897,12 +6985,20 @@ fn mark_blocked(mods: &mut [tntl_instance::mods::ModInfo], status: &LoaderStatus
     let forge_family = matches!(kind, "forge" | "neoforge");
     let label = loader_label(kind);
     let instance_loader = loader_from_key(kind);
+    // Sinytra Connector runs Fabric jars on NeoForge, so their metadata no
+    // longer means "wrong loader".
+    let connector = tntl_instance::mods::connector_installed(mods);
     for module in mods {
         // A Forge jar in a Fabric instance (or the other way round) can never
         // load, whatever its version bounds say. The wizard already switched it
         // off; without a reason the mod list just showed a disabled file.
         let wrong_loader = module.loader != ModLoader::Unknown
-            && !tntl_instance::mods::compatible(instance_loader, module.loader, &status.game_version);
+            && !tntl_instance::mods::compatible_with_connector(
+                instance_loader,
+                module.loader,
+                &status.game_version,
+                connector,
+            );
         if wrong_loader {
             let module_label = match module.loader {
                 ModLoader::Fabric => "Fabric",
@@ -7028,6 +7124,24 @@ fn real_game_version(version_id: &str, chain: &[VersionJson]) -> String {
 
 /// Files in a content directory such as `resourcepacks/`. Unzipped packs are
 /// directories and count as content too.
+/// Sidecar entries whose file still exists on disk, with the name it currently
+/// has (a disabled mod keeps its `.disabled` suffix).
+fn existing_locals(dir: &Path, entries: Vec<(String, SourceEntry)>) -> Vec<(String, SourceEntry)> {
+    entries
+        .into_iter()
+        .filter_map(|(base, entry)| {
+            let disabled = format!("{base}.disabled");
+            if dir.join(&disabled).is_file() {
+                Some((disabled, entry))
+            } else if dir.join(&base).is_file() {
+                Some((base, entry))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn content_files(dir: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();

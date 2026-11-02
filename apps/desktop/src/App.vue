@@ -73,6 +73,8 @@ const accountName = ref("");
 const accountError = ref<string | null>(null);
 const accountBusy = ref(false);
 const pendingLaunch = ref<string | null>(null);
+/** Instance that refused to start because it has no maximum memory yet. */
+const memoryPrompt = ref<string | null>(null);
 
 /** Avatar of the account that will launch games, shown in the rail's foot. */
 const currentAccount = computed(
@@ -226,6 +228,9 @@ async function launch(name: string) {
       pendingLaunch.value = name;
       accountError.value = null;
       accountOpen.value = true;
+    } else if (message.includes("set the maximum memory")) {
+      // New instances carry no memory choice; send the user to the slider.
+      memoryPrompt.value = name;
     } else if (!maybePromptJava(message, () => void relaunchWithNewJava(name))) {
       error.value = message;
     }
@@ -313,6 +318,13 @@ function openDetail(name: string) {
 function closeDetail() {
   detailInstance.value = null;
   page.value = "instances";
+}
+
+/** Jump straight to the memory slider after a refused launch. */
+function openMemorySettings() {
+  const name = memoryPrompt.value;
+  memoryPrompt.value = null;
+  if (name) openDetail(name);
 }
 
 async function remove(name: string) {
@@ -1005,6 +1017,17 @@ onUnmounted(() => {
           <button class="primary" :disabled="accountBusy || !accountName.trim()" @click="addAccountAndPlay">
             {{ accountBusy ? t("editor.working") : t("accounts.neededPlay") }}
           </button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="memoryPrompt" class="archive-overlay" @click.self="memoryPrompt = null">
+      <section class="archive-dialog">
+        <h3>{{ t("memory.neededTitle") }}</h3>
+        <p class="hint">{{ t("memory.neededHint") }}</p>
+        <div class="archive-actions">
+          <button class="ghost" @click="memoryPrompt = null">{{ t("action.cancel") }}</button>
+          <button class="primary" @click="openMemorySettings">{{ t("memory.neededGo") }}</button>
         </div>
       </section>
     </div>

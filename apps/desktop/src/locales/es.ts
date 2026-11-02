@@ -41,6 +41,7 @@ const es: Record<string, string> = {
   "app.removedConfigIn": 'Entrada del lanzador (solo configuración): {path}',
   "app.openConfigFolder": 'Carpeta del lanzador',
   "app.removeConfirm": '¿Quitar {name} de la lista? Los archivos se conservan.',
+  "app.undoRemove": "Deshacer eliminación",
   "app.librarySubtitle": "Tus mundos, a un clic",
   "app.install": "Instalar",
   "app.installSubtitle": "Versiones oficiales de Mojang, directas de la fuente",
@@ -846,6 +847,19 @@ const es: Record<string, string> = {
   "modrinth.versions": "Versiones",
   "modrinth.noVersions": "Ninguna versión encaja con esta instancia.",
   "modrinth.installThis": "Usar esta versión",
+  "instances.memoryUnset": "memoria sin definir",
+  "editor.loadingList": "Leyendo la carpeta…",
+  "memory.unset": "Sin definir: arrastra un control",
+  "memory.neededTitle": "Define la memoria primero",
+  "memory.neededHint": "Esta instancia aún no tiene memoria máxima. Abre la instancia, ajusta el control de memoria y vuelve a intentarlo.",
+  "memory.neededGo": "Abrir ajustes de memoria",
+  "editor.location": "Ubicación",
+  "editor.gameDir": "Carpeta del juego",
+  "editor.open": "Abrir",
+  "editor.copied": "Copiado",
+  "editor.autoSaved": "Guardado automáticamente",
+  "editor.saveFailed": "Sin guardar",
+  "action.copy": "Copiar",
 };
 
 export default es;

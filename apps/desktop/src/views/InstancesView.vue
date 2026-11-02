@@ -87,6 +87,16 @@ watch(() => props.instances, loadIcons, { immediate: true });
 onBeforeUnmount(() => {
   Object.keys(iconCache.value).forEach(forgetIcon);
 });
+/** Game folder of an instance that runs outside the launcher's own folder. */
+function externalDir(instance: InstanceView): string | null {
+  const game = instance.game_dir?.trim();
+  if (!game) return null;
+  const norm = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "");
+  // A normal instance keeps its game files next to its config; that path is
+  // always the one picked on this page, so repeating it on every card is noise.
+  return norm(game) === norm(instance.dir) ? null : game;
+}
+
 const groups = computed(() => {
   const seen = new Set<string>();
   for (const instance of props.instances) {
@@ -203,7 +213,13 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
           <div class="chips">
             <span class="badge version mono">{{ featured.version_id }}</span>
             <span v-if="featured.username" class="badge"><Icon name="user" :size="12" />{{ featured.username }}</span>
-            <span class="badge"><Icon name="cpu" :size="12" />{{ featured.max_memory_mb }} MB</span>
+            <span class="badge" :class="{ warn: featured.max_memory_mb === null }"
+              ><Icon name="cpu" :size="12" />{{
+                featured.max_memory_mb === null
+                  ? t("instances.memoryUnset")
+                  : `${featured.max_memory_mb} MB`
+              }}</span
+            >
             <span class="badge"><Icon name="clock" :size="12" />{{ playtimeText(featured) }}</span>
             <span v-if="featured.modpack" class="badge"><Icon name="package" :size="12" />{{ featured.modpack }}</span>
             <span v-if="featured.group" class="badge"><Icon name="grid" :size="12" />{{ featured.group }}</span>
@@ -211,6 +227,17 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
             <span v-if="!featured.installed" class="badge warn">{{ t("instances.missing") }}</span>
             <span v-if="running === featured.name" class="badge ok">{{ t("instances.running") }}</span>
           </div>
+
+          <button
+            v-if="externalDir(featured)"
+            type="button"
+            class="game-dir mono"
+            :title="`${t('editor.gameDir')}: ${externalDir(featured)}`"
+            @click="$emit('openPath', externalDir(featured)!)"
+          >
+            <Icon name="folder" :size="11" />
+            <span>{{ externalDir(featured) }}</span>
+          </button>
 
           <div class="hero-actions">
             <button
@@ -290,6 +317,16 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
                 <p v-if="instance.modpack" class="pack">{{ instance.modpack }}</p>
                 <p v-if="instance.group" class="pack">{{ instance.group }}</p>
                 <p class="pack">{{ playtimeText(instance) }}</p>
+                <button
+                  v-if="externalDir(instance)"
+                  type="button"
+                  class="game-dir mono"
+                  :title="`${t('editor.gameDir')}: ${externalDir(instance)}`"
+                  @click.stop="$emit('openPath', externalDir(instance)!)"
+                >
+                  <Icon name="folder" :size="11" />
+                  <span>{{ externalDir(instance) }}</span>
+                </button>
               </div>
               <div class="tile-actions">
                 <button class="icon" :title="t('instances.logsTitle')" @click.stop="$emit('log', instance.name)">
@@ -781,6 +818,34 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
 .tile-actions {
   display: flex;
   gap: 4px;
+}
+
+/* Game folder of an imported instance, shown because it lives elsewhere. */
+.game-dir {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  margin-top: 3px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted-2, var(--muted));
+  font-size: 10.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.game-dir:hover {
+  color: var(--accent);
+}
+
+.game-dir span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Keep the last segments of a long path visible. */
+  direction: rtl;
 }
 
 .tile-actions .icon {

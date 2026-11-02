@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   api,
   events,
   formatBytes,
+  remoteImageUrl,
   type CursePack,
   type FtbPack,
   type InstallEvent,
@@ -66,6 +67,35 @@ const curseOffset = ref(0);
 const curseLoading = ref(false);
 const curseError = ref<string | null>(null);
 const curseChoice = ref<Record<number, number>>({});
+
+/**
+ * Catalogue icons are fetched through the shell (the webview has no proxy and
+ * its CSP blocks the CDN), keyed by url so a pack keeps its icon across searches.
+ */
+const icons = ref<Record<string, string>>({});
+const iconUrls = computed(() => [
+  ...packs.value.map((pack) => pack.icon_url),
+  ...cursePacks.value.map((pack) => pack.icon_url),
+]);
+watch(
+  iconUrls,
+  (urls) => {
+    const missing = urls.filter((url): url is string => Boolean(url) && !icons.value[url!]);
+    void (async () => {
+      for (let index = 0; index < missing.length; index += 6) {
+        const batch = missing.slice(index, index + 6);
+        const loaded = await Promise.all(batch.map((url) => remoteImageUrl(url)));
+        const next = { ...icons.value };
+        batch.forEach((url, position) => {
+          const blob = loaded[position];
+          if (blob) next[url] = blob;
+        });
+        icons.value = next;
+      }
+    })();
+  },
+  { immediate: true },
+);
 
 function curseFile(pack: CursePack): number | null {
   const chosen = curseChoice.value[pack.project_id];
@@ -429,7 +459,13 @@ onUnmounted(() => {
         <template v-if="source === 'modrinth'">
           <div v-if="packs.length" class="pack-list">
             <article v-for="hit in packs" :key="hit.project_id" class="pack-card">
-              <img v-if="hit.icon_url" :src="hit.icon_url" alt="" class="pack-icon" @error="hideImage" />
+              <img
+                v-if="hit.icon_url && icons[hit.icon_url]"
+                :src="icons[hit.icon_url]"
+                alt=""
+                class="pack-icon"
+                @error="hideImage"
+              />
               <div class="pack-text">
                 <strong>{{ hit.title }}</strong>
                 <small>{{ hit.description }}</small>
@@ -458,7 +494,13 @@ onUnmounted(() => {
         <template v-else-if="source === 'curseforge'">
           <div v-if="cursePacks.length" class="pack-list">
             <article v-for="pack in cursePacks" :key="pack.project_id" class="pack-card">
-              <img v-if="pack.icon_url" :src="pack.icon_url" alt="" class="pack-icon" @error="hideImage" />
+              <img
+                v-if="pack.icon_url && icons[pack.icon_url]"
+                :src="icons[pack.icon_url]"
+                alt=""
+                class="pack-icon"
+                @error="hideImage"
+              />
               <div class="pack-text">
                 <strong>{{ pack.title }}</strong>
                 <small>{{ pack.description }}</small>
@@ -498,7 +540,13 @@ onUnmounted(() => {
         <template v-else>
           <div v-if="ftbPacks.length" class="pack-list">
             <article v-for="pack in ftbPacks" :key="pack.id" class="pack-card">
-              <img v-if="pack.icon_url" :src="pack.icon_url" alt="" class="pack-icon" @error="hideImage" />
+              <img
+                v-if="pack.icon_url && icons[pack.icon_url]"
+                :src="icons[pack.icon_url]"
+                alt=""
+                class="pack-icon"
+                @error="hideImage"
+              />
               <div class="pack-text">
                 <strong>{{ pack.name }}</strong>
                 <small>{{ pack.synopsis }}</small>

@@ -14,7 +14,8 @@ pub struct ModContext<'a> {
     pub game_version: &'a str,
     pub loader_version: Option<&'a str>,
     pub java_major: Option<u32>,
-    pub memory_mb: u32,
+    /// `None` when the user has not chosen a maximum memory yet.
+    pub memory_mb: Option<u32>,
     pub total_memory_mb: Option<u64>,
 }
 
@@ -27,10 +28,6 @@ pub fn loader_name(loader: ModLoader) -> &'static str {
         ModLoader::Universal => "Universal",
         ModLoader::Unknown => "Unknown",
     }
-}
-
-fn compatible(instance: ModLoader, module: ModLoader, game_version: &str) -> bool {
-    tntl_instance::mods::compatible(instance, module, game_version)
 }
 
 /// `1.20.1-47.4.28` -> `47.4.28`: Forge-family metadata declares the loader's
@@ -133,6 +130,8 @@ pub fn check(mods: &[ModInfo], context: &ModContext<'_>) -> Vec<Finding> {
             }
         }
     }
+    // Connector loads Fabric jars on Forge/NeoForge, so they are not wrong.
+    let connector = enabled_by_id.keys().any(|key| key == "connector");
 
     for module in &enabled {
         if !module.recognized {
@@ -147,7 +146,14 @@ pub fn check(mods: &[ModInfo], context: &ModContext<'_>) -> Vec<Finding> {
         let Some(instance_loader) = context.loader else {
             continue;
         };
-        if module.loader != ModLoader::Unknown && !compatible(instance_loader, module.loader, context.game_version) {
+        if module.loader != ModLoader::Unknown
+            && !tntl_instance::mods::compatible_with_connector(
+                instance_loader,
+                module.loader,
+                context.game_version,
+                connector,
+            )
+        {
             findings.push(
                 Finding::new(Severity::Error, "wrong_loader")
                     .subject(&module.name)
@@ -351,11 +357,24 @@ fn conflicts(enabled: &[&ModInfo], by_id: &BTreeMap<String, Vec<&ModInfo>>) -> V
     let mut findings = Vec::new();
     let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
     for (left, right) in KNOWN_CONFLICTS {
-        if by_id.contains_key(*left) && by_id.contains_key(*right) {
-            let mut pair = [name_of(by_id, left), name_of(by_id, right)];
-            pair.sort();
-            pairs.insert((pair[0].clone(), pair[1].clone()));
+        if left == right {
+            continue;
         }
+        // Oculus provides `iris`: one jar can own both ids, and a jar never
+        // conflicts with itself ("Oculus + Oculus" was exactly this).
+        let (Some(left_mods), Some(right_mods)) = (by_id.get(*left), by_id.get(*right)) else {
+            continue;
+        };
+        let left_files: BTreeSet<&str> = left_mods.iter().map(|module| module.file.as_str()).collect();
+        let right_files: BTreeSet<&str> = right_mods.iter().map(|module| module.file.as_str()).collect();
+        // Two ids offered by exactly the same jars are one installation, not a
+        // collision between two mods.
+        if left_files == right_files {
+            continue;
+        }
+        let mut pair = [name_of(by_id, left), name_of(by_id, right)];
+        pair.sort();
+        pairs.insert((pair[0].clone(), pair[1].clone()));
     }
     for module in enabled {
         for broken in &module.breaks {
@@ -395,10 +414,15 @@ fn memory_findings(enabled: &[&ModInfo], context: &ModContext<'_>) -> Vec<Findin
         101..=220 => 4096,
         _ => 6144,
     };
-    if context.memory_mb < recommended {
+    // No saved maximum yet: the instance page asks for one before the first
+    // launch, so there is no number to judge here.
+    let Some(memory) = context.memory_mb else {
+        return findings;
+    };
+    if memory < recommended {
         findings.push(
             Finding::new(Severity::Warning, "memory_low")
-                .param("memory", context.memory_mb.to_string())
+                .param("memory", memory.to_string())
                 .param("count", count.to_string())
                 .param("recommended", recommended.to_string()),
         );
@@ -407,10 +431,10 @@ fn memory_findings(enabled: &[&ModInfo], context: &ModContext<'_>) -> Vec<Findin
         let total = total as u32;
         if total >= 8 * 1024 {
             let limit = total.saturating_sub(4 * 1024).max(2048);
-            if context.memory_mb > limit {
+            if memory > limit {
                 findings.push(
                     Finding::new(Severity::Warning, "memory_high")
-                        .param("memory", context.memory_mb.to_string())
+                        .param("memory", memory.to_string())
                         .param("limit", limit.to_string()),
                 );
             }
@@ -531,7 +555,7 @@ mod tests {
             game_version: "1.21.1",
             loader_version: Some("21.1.80"),
             java_major: Some(21),
-            memory_mb: 4096,
+            memory_mb: Some(4096),
             total_memory_mb: Some(16 * 1024),
         }
     }
@@ -723,9 +747,27 @@ mod tests {
     }
 
     #[test]
+    fn a_jar_that_provides_a_second_id_is_not_a_conflict() {
+        // Oculus provides `iris`, so the known-conflict table used to see both
+        // ids in one jar and report "Oculus + Oculus".
+        let mut oculus = module("oculus", "Oculus", "1.8.0", ModLoader::NeoForge);
+        oculus.provides = vec!["iris".to_string()];
+        assert!(codes(&[oculus], &context()).is_empty());
+    }
+
+    #[test]
+    fn two_shader_forks_are_still_a_conflict() {
+        let mut oculus = module("oculus", "Oculus", "1.8.0", ModLoader::Forge);
+        oculus.provides = vec!["iris".to_string()];
+        let iris = module("iris", "Iris", "1.7.0", ModLoader::Forge);
+        // Different jars behind the two ids: the skip must not hide this.
+        assert!(codes(&[oculus, iris], &context()).contains(&"mod_conflict".to_string()));
+    }
+
+    #[test]
     fn memory_advice_scales_with_mod_count() {
         let mut ctx = context();
-        ctx.memory_mb = 1024;
+        ctx.memory_mb = Some(1024);
         assert!(
             codes(&[module("example", "Example", "1.0", ModLoader::NeoForge)], &ctx)
                 .contains(&"memory_low".to_string())

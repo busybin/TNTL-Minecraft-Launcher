@@ -7,6 +7,7 @@ import {
   formatDate,
   formatPlaytime,
   imageUrl,
+  bytesImageUrl,
   type ContentFile,
   type CrashReport,
   type DatapackInfo,
@@ -117,13 +118,63 @@ const TAB_GROUPS: { label: string; items: { id: Tab; label: string; icon: string
 
 const config = ref<InstanceConfig | null>(null);
 /** Slider needs plain numbers even before the instance json lands. */
-const memoryMin = computed(() => config.value?.min_memory_mb ?? 4096);
-const memoryMax = computed(() => config.value?.max_memory_mb ?? 4096);
+const memoryMin = computed(() => config.value?.min_memory_mb ?? null);
+const memoryMax = computed(() => config.value?.max_memory_mb ?? null);
+let memoryTimer: number | null = null;
+
+/** The slider saves on its own: the value must be stored before the next Play. */
+async function persistMemory() {
+  memoryTimer = null;
+  const current = config.value;
+  if (!current) return;
+  try {
+    const saved = await api.setInstanceMemory(
+      current.name,
+      positiveInt(current.min_memory_mb, 128, 65536),
+      positiveInt(current.max_memory_mb, 512, 65536),
+    );
+    current.min_memory_mb = saved.min_memory_mb;
+    current.max_memory_mb = saved.max_memory_mb;
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
 function setMemory(lo: number, hi: number) {
   if (!config.value) return;
   config.value.min_memory_mb = lo;
   config.value.max_memory_mb = hi;
+  if (memoryTimer !== null) window.clearTimeout(memoryTimer);
+  memoryTimer = window.setTimeout(() => void persistMemory(), 400);
 }
+
+// Every editable field stores itself shortly after the last keystroke. The
+// slider is excluded: it has its own command so the value lands before Play.
+watch(
+  () => {
+    const current = config.value;
+    if (!current) return null;
+    return [
+      current.version_id,
+      current.java,
+      current.width,
+      current.height,
+      current.group,
+      current.notes,
+      current.username,
+      current.demo,
+      jvmArgs.value,
+      gameArgs.value,
+      envText.value,
+      serverText.value,
+    ];
+  },
+  (next) => {
+    if (!next) return;
+    scheduleSave();
+  },
+);
+
 const playtime = ref<{ seconds: number; launches: number; last: number | null } | null>(null);
 const playtimeText = computed(() => {
   const value = playtime.value;
@@ -134,13 +185,17 @@ const playtimeText = computed(() => {
 });
 const java = ref<JavaView[]>([]);
 const error = ref<string | null>(null);
-const saving = ref(false);
 const jvmArgs = ref("");
 const gameArgs = ref("");
 const envText = ref("");
 const serverText = ref("");
 const name = ref("");
 const mods = ref<ModInfo[]>([]);
+/** A listing that failed is retried when its tab is opened again. */
+const modsLoading = ref(false);
+const modsLoaded = ref(false);
+const contentLoading = ref(false);
+const contentLoaded = ref(false);
 const modFilter = ref("");
 const modOnlyDisabled = ref(false);
 const modSort = ref<SortKey>("name");
@@ -152,6 +207,10 @@ const packExpectedFormat = ref<number | null>(null);
 /** pack.png of each resource pack, as a blob URL. */
 const packIcons = ref<Record<string, string>>({});
 let packIconUrls: string[] = [];
+/** Mod and world icons are read on demand; the listing itself stays fast. */
+const modIcons = ref<Record<string, string>>({});
+const worldIcons = ref<Record<string, string>>({});
+let rowIconUrls: string[] = [];
 const shaders = ref<ContentFile[]>([]);
 const shaderFilter = ref("");
 const shaderSort = ref<SortKey>("name");
@@ -180,6 +239,9 @@ const modUpdates = ref<ModUpdate[]>([]);
 const packUpdates = ref<ModUpdate[]>([]);
 const shaderUpdates = ref<ModUpdate[]>([]);
 const checking = ref<ProjectKind | null>(null);
+/** Files the catalogue check has looked at, so a big list shows a bar. */
+const checkDone = ref(0);
+const checkTotal = ref(0);
 const checkingPack = ref(false);
 const updating = ref<string | null>(null);
 const packUpdate = ref<PackUpdate | null>(null);
@@ -215,6 +277,8 @@ const servers = ref<ServerEntry[]>([]);
 const serverStatus = ref<string | null>(null);
 /** Absolute game directory, resolved once the instance list is loaded. */
 const gameDir = ref<string | null>(null);
+/** Launcher-owned folder of the instance entry; differs from `gameDir` when imported. */
+const instanceDir = ref<string | null>(null);
 const accounts = ref<AccountsResponse>({ current: null, accounts: [], client_id: false });
 /** The null pick is no "launcher default": it *is* the current account. */
 const accountCurrentLabel = computed(() => {
@@ -327,6 +391,9 @@ async function switchLoader(kind: "vanilla" | LoaderKind, version: string | null
     error.value = t("editor.runningLocked");
     return;
   }
+  // The install rewrites the instance file; an edit still in the debounce must
+  // not land on top of it afterwards.
+  await flushPending();
   loaderBusy.value = true;
   loaderStage.value = null;
   resetLoader();
@@ -336,7 +403,10 @@ async function switchLoader(kind: "vanilla" | LoaderKind, version: string | null
     const status =
       kind === "vanilla" ? await api.removeLoader(instance) : await api.installLoader(instance, kind, version);
     loaderStatus.value = status;
-    if (config.value) config.value.version_id = status.version_id;
+    if (config.value) {
+      config.value.version_id = status.version_id;
+      savedKey = payloadKey();
+    }
     loaderStatusText.value =
       kind === "vanilla"
         ? t("editor.loaderRemoved", { version: status.game_version })
@@ -406,6 +476,7 @@ onMounted(async () => {
     () => events.onModProgress(onProgress),
     () => events.onPackProgress(onPackProgress),
     () => events.onInstallProgress(onLoaderProgress),
+    () => events.onCheckProgress(onCheckProgress),
   ]) {
     try {
       unlisten.push(await listen());
@@ -422,6 +493,9 @@ onMounted(async () => {
       .map(([key, value]) => `${key}=${value}`)
       .join("\n");
     serverText.value = serverToText(config.value.server);
+    // The form now mirrors the file: anything that does not differ from this
+    // point on must not be written back.
+    savedKey = payloadKey();
     await reloadLists();
     await loadIcon();
   } catch (cause) {
@@ -439,9 +513,11 @@ async function reloadLists() {
   if (view) {
     playtime.value = { seconds: view.playtime_seconds, launches: view.launches, last: view.last_played };
     gameDir.value = view.game_dir;
+    instanceDir.value = view.dir;
   }
-  mods.value = await api.listMods(instance);
+  // Every listing is independent; awaiting the mods first only delayed the rest.
   await Promise.all([
+    reloadMods(),
     reloadContent(),
     reloadWorlds(),
     reloadServers().then(pingAll),
@@ -459,11 +535,15 @@ watch(
 );
 
 // The game writes new worlds behind our back, so re-read the folder whenever
-// the saves tab is opened instead of trusting the list from page load.
+// the saves tab is opened instead of trusting the list from page load. The
+// content tabs retry a listing that failed while the page was loading.
 watch(tab, (next) => {
-  if (next === "worlds" && config.value) {
+  if (!config.value) return;
+  if (next === "worlds") {
     reloadWorlds().catch((cause) => (error.value = String(cause)));
   }
+  if (next === "mods" && !modsLoaded.value) void reloadMods();
+  if ((next === "resourcepacks" || next === "shaders") && !contentLoaded.value) void reloadContent();
 });
 
 onBeforeUnmount(() => {
@@ -471,6 +551,16 @@ onBeforeUnmount(() => {
   revokeIcon();
   revokeShot();
   clearPackIcons();
+  clearRowIcons();
+  // Flushing pending saves keeps a quick close from losing the last edit.
+  if (memoryTimer !== null) {
+    window.clearTimeout(memoryTimer);
+    void persistMemory();
+  }
+  if (autoTimer !== null) {
+    window.clearTimeout(autoTimer);
+    void autoSave();
+  }
 });
 
 async function loadIcon() {
@@ -704,6 +794,13 @@ async function exportArchive() {
   }
 }
 
+/** Progress of a catalogue check: files looked at so far. */
+function onCheckProgress(event: { kind: ProjectKind; done: number; total: number }) {
+  if (event.kind !== checking.value) return;
+  checkDone.value = event.done;
+  checkTotal.value = event.total;
+}
+
 function onProgress(event: ModProgress) {
   if (event.stage === "downloading") {
     const size = event.total ? `${formatBytes(event.done)} / ${formatBytes(event.total)}` : formatBytes(event.done);
@@ -737,10 +834,16 @@ function onPackProgress({ job, event }: JobEvent<PackProgress>) {
 }
 
 async function reloadMods() {
+  modsLoading.value = true;
   try {
-    mods.value = await api.listMods(config.value?.name ?? props.name);
+    const instance = config.value?.name ?? props.name;
+    mods.value = await api.listMods(instance);
+    modsLoaded.value = true;
+    void loadModIcons(instance, mods.value);
   } catch (cause) {
     error.value = String(cause);
+  } finally {
+    modsLoading.value = false;
   }
 }
 
@@ -768,18 +871,84 @@ async function loadPackIcons(instance: string, files: ContentFile[]) {
   packIcons.value = icons;
 }
 
+/** Read one icon at a time in small batches: 400 jars must not stall the page. */
+async function mapIcons<T>(
+  items: T[],
+  key: (item: T) => string,
+  bytes: (item: T) => Promise<ArrayBuffer>,
+  cache: Record<string, string>,
+): Promise<Record<string, string>> {
+  const icons = { ...cache };
+  for (let index = 0; index < items.length; index += 4) {
+    const batch = items.slice(index, index + 4);
+    const loaded = await Promise.all(
+      batch.map(async (item) => {
+        try {
+          const data = await bytes(item);
+          return data.byteLength ? bytesImageUrl(data) : null;
+        } catch {
+          // No icon is not an error: most jars ship nothing usable.
+          return null;
+        }
+      }),
+    );
+    batch.forEach((item, position) => {
+      const url = loaded[position];
+      if (!url) return;
+      rowIconUrls.push(url);
+      icons[key(item)] = url;
+    });
+  }
+  return icons;
+}
+
+function clearRowIcons() {
+  for (const url of rowIconUrls) URL.revokeObjectURL(url);
+  rowIconUrls = [];
+  modIcons.value = {};
+  worldIcons.value = {};
+}
+
+async function loadModIcons(instance: string, list: ModInfo[]) {
+  const missing = list.filter((mod) => !modIcons.value[mod.file]);
+  modIcons.value = await mapIcons(
+    missing,
+    (mod) => mod.file,
+    (mod) => api.modIcon(instance, mod.file),
+    modIcons.value,
+  );
+}
+
+async function loadWorldIcons(instance: string, list: WorldInfo[]) {
+  const missing = list.filter((world) => !worldIcons.value[world.dir]);
+  worldIcons.value = await mapIcons(
+    missing,
+    (world) => world.dir,
+    (world) => api.worldIcon(instance, world.dir),
+    worldIcons.value,
+  );
+}
+
 async function reloadContent() {
   const instance = config.value?.name ?? props.name;
+  contentLoading.value = true;
   try {
-    const packs = await api.listContent(instance, "resourcepack");
+    // Packs and shaders are independent listings; asking for both at once
+    // halves the wait on instances with hundreds of jars.
+    const [packs, shaderListing] = await Promise.all([
+      api.listContent(instance, "resourcepack"),
+      api.listContent(instance, "shader"),
+    ]);
     resourcePacks.value = packs.files;
     packExpectedFormat.value = packs.expected_format ?? null;
     void loadPackIcons(instance, packs.files);
-    const shaderListing = await api.listContent(instance, "shader");
     shaders.value = shaderListing.files;
     shaderToggle.value = shaderListing.toggle_supported;
+    contentLoaded.value = true;
   } catch (cause) {
     error.value = String(cause);
+  } finally {
+    contentLoading.value = false;
   }
 }
 
@@ -823,6 +992,7 @@ async function reloadWorlds() {
   try {
     worlds.value = await api.listWorlds(instance);
     worldBackups.value = await api.listWorldBackups(instance);
+    void loadWorldIcons(instance, worlds.value);
     if (!datapackWorld.value || !worlds.value.some((world) => world.dir === datapackWorld.value)) {
       datapackWorld.value = worlds.value[0]?.dir ?? null;
     }
@@ -1087,6 +1257,8 @@ function setStatus(kind: ProjectKind, text: string | null) {
 
 async function checkKind(kind: ProjectKind) {
   checking.value = kind;
+  checkDone.value = 0;
+  checkTotal.value = 0;
   error.value = null;
   setStatus(kind, t("editor.checkingModrinth"));
   try {
@@ -1098,6 +1270,8 @@ async function checkKind(kind: ProjectKind) {
     setStatus(kind, null);
   } finally {
     checking.value = null;
+    checkDone.value = 0;
+    checkTotal.value = 0;
   }
 }
 
@@ -1301,6 +1475,9 @@ const filteredShaders = computed(() => {
 const missingDeps = computed(() => {
   const ids = new Set<string>();
   for (const mod of mods.value) {
+    // A switched-off mod cannot stop the game from starting, so its missing
+    // dependencies do not belong in the banner or the download button.
+    if (!mod.enabled) continue;
     for (const id of mod.missing_dependencies) ids.add(id);
   }
   return [...ids];
@@ -1471,6 +1648,7 @@ async function applyPackUpdate(target: PackTarget) {
   packUpdating.value = target.version_id;
   resetPack();
   error.value = null;
+  await flushPending();
   bundleStatus.value = t("editor.packUpdating", { version: target.version_number });
   try {
     const report = await api.updatePack(props.name, target.version_id);
@@ -1482,6 +1660,7 @@ async function applyPackUpdate(target: PackTarget) {
     if (config.value) {
       config.value.version_id = fresh.version_id;
       config.value.game_dir = fresh.game_dir;
+      savedKey = payloadKey();
     }
     await Promise.all([reloadMods(), reloadContent(), reloadLoader()]);
     emit("saved", config.value?.name ?? props.name);
@@ -1507,36 +1686,135 @@ function positiveInt(value: unknown, min: number, max: number): number | null {
   return Math.min(max, Math.max(min, Math.round(number)));
 }
 
-async function save() {
+/** The instance file as the form currently shows it. */
+function instancePayload() {
+  const current = config.value!;
+  return {
+    ...current,
+    java: current.java?.trim() || null,
+    jvm_args: splitArgs(jvmArgs.value),
+    game_args: splitArgs(gameArgs.value),
+    env: parseEnv(envText.value),
+    server: textToServer(serverText.value),
+    min_memory_mb: positiveInt(current.min_memory_mb, 128, 65536),
+    max_memory_mb: positiveInt(current.max_memory_mb, 512, 65536),
+    width: positiveInt(current.width, 320, 16384),
+    height: positiveInt(current.height, 240, 16384),
+    group: current.group?.trim() || null,
+    notes: current.notes?.trim() ?? "",
+  };
+}
+
+/** `idle` while an edit is pending, `saving` in flight, `saved` when stored. */
+const autoState = ref<"idle" | "saving" | "saved" | "failed">("idle");
+let autoTimer: number | null = null;
+/** The payload of the last successful write, so an unchanged form never writes. */
+let savedKey = "";
+
+function payloadKey(): string {
+  return JSON.stringify(instancePayload());
+}
+
+/** Every field writes itself; there is no "save changes" button to forget. */
+function scheduleSave() {
   if (!config.value || props.running) return;
-  saving.value = true;
-  error.value = null;
+  autoState.value = "idle";
+  if (autoTimer !== null) window.clearTimeout(autoTimer);
+  autoTimer = window.setTimeout(() => void autoSave(), 700);
+}
+
+/** Write whatever the debounce is still holding, right now. */
+async function flushPending() {
+  if (autoTimer === null) return;
+  window.clearTimeout(autoTimer);
+  await autoSave();
+}
+
+async function autoSave() {
+  autoTimer = null;
+  if (!config.value || props.running) return;
+  const payload = instancePayload();
+  const key = JSON.stringify(payload);
+  // Populating the form from disk, or an edit that was typed and undone, must
+  // not rewrite the instance file.
+  if (key === savedKey) return;
+  autoState.value = "saving";
   try {
-    const nextName = name.value.trim() || props.name;
-    if (nextName !== props.name) {
-      await api.renameInstance(props.name, nextName);
-      config.value.name = nextName;
-      name.value = nextName;
-    }
-    await api.saveInstance({
-      ...config.value,
-      java: config.value.java?.trim() || null,
-      jvm_args: splitArgs(jvmArgs.value),
-      game_args: splitArgs(gameArgs.value),
-      env: parseEnv(envText.value),
-      server: textToServer(serverText.value),
-      min_memory_mb: positiveInt(config.value.min_memory_mb, 128, 65536),
-      max_memory_mb: Math.max(512, Math.round(Number(config.value.max_memory_mb) || 4096)),
-      width: positiveInt(config.value.width, 320, 16384),
-      height: positiveInt(config.value.height, 240, 16384),
-      group: config.value.group?.trim() || null,
-      notes: config.value.notes?.trim() ?? "",
-    });
-    emit("saved", nextName);
+    await api.saveInstance(payload);
+    savedKey = key;
+    autoState.value = "saved";
+    emit("changed");
+  } catch (cause) {
+    autoState.value = "failed";
+    error.value = String(cause);
+  }
+}
+
+/**
+ * Renaming moves the instance folder, so it waits for the field to lose focus
+ * instead of firing on every keystroke.
+ */
+async function commitName() {
+  if (!config.value) return;
+  const next = name.value.trim();
+  if (!next || next === props.name) {
+    name.value = props.name;
+    return;
+  }
+  if (props.running) {
+    error.value = t("editor.runningLocked");
+    name.value = props.name;
+    return;
+  }
+  // A pending edit belongs to the folder that is about to move.
+  await flushPending();
+  try {
+    await api.renameInstance(props.name, next);
+    config.value.name = next;
+    savedKey = payloadKey();
+    emit("saved", next);
   } catch (cause) {
     error.value = String(cause);
-  } finally {
-    saving.value = false;
+    name.value = props.name;
+  }
+}
+
+function samePath(left: string, right: string): boolean {
+  const norm = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "");
+  return norm(left) === norm(right);
+}
+
+/**
+ * Game folder, for the overview — but only when it is not the launcher's own
+ * instance folder: an imported instance runs from wherever it came from, and
+ * that path is otherwise nowhere in the UI.
+ */
+const locationRows = computed(() => {
+  const path = gameDir.value;
+  if (!path) return [];
+  if (instanceDir.value && samePath(path, instanceDir.value)) return [];
+  return [{ label: t("editor.gameDir"), path }];
+});
+
+const copiedPath = ref<string | null>(null);
+let copiedTimer: number | null = null;
+
+async function copyPath(path: string) {
+  try {
+    await navigator.clipboard.writeText(path);
+    copiedPath.value = path;
+    if (copiedTimer !== null) window.clearTimeout(copiedTimer);
+    copiedTimer = window.setTimeout(() => (copiedPath.value = null), 1600);
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+async function openPath(path: string) {
+  try {
+    await api.openPath(path);
+  } catch (cause) {
+    error.value = String(cause);
   }
 }
 </script>
@@ -1614,9 +1892,17 @@ async function save() {
           </template>
         </div>
         <div class="side-foot">
-          <button class="primary" :disabled="saving || !config || running" @click="save">
-            {{ saving ? t("editor.saving") : t("editor.save") }}
-          </button>
+          <span class="auto-state" :class="autoState">
+            {{
+              running
+                ? t("editor.runningLocked")
+                : autoState === "saving"
+                  ? t("editor.saving")
+                  : autoState === "failed"
+                    ? t("editor.saveFailed")
+                    : t("editor.autoSaved")
+            }}
+          </span>
         </div>
       </nav>
 
@@ -1626,6 +1912,15 @@ async function save() {
           <button class="ghost error-close" type="button" :title="t('action.close')" @click="error = null">✕</button>
         </div>
         <p v-if="running" class="warn-note"><Icon name="alert" :size="15" />{{ t("editor.runningLocked") }}</p>
+
+        <TransferBar
+          v-if="checking"
+          :label="t('editor.checkingModrinth')"
+          :files-done="checkTotal ? checkDone : null"
+          :files-total="checkTotal || null"
+          :indeterminate="!checkTotal"
+          :detail="checkTotal ? `${checkDone} / ${checkTotal}` : ''"
+        />
 
         <div v-if="config" class="pane-body">
         <div v-if="tab === 'overview' && modpack" class="group">
@@ -1704,12 +1999,26 @@ async function save() {
           </label>
         </div>
 
+        <div v-if="tab === 'overview' && locationRows.length" class="group">
+          <h3>{{ t("editor.location") }}</h3>
+          <div v-for="row in locationRows" :key="row.label" class="path-row">
+            <span class="path-label">{{ row.label }}</span>
+            <code class="path-value mono" :title="row.path">{{ row.path }}</code>
+            <button class="ghost small" type="button" @click="openPath(row.path)">
+              <Icon name="folder" :size="13" />{{ t("editor.open") }}
+            </button>
+            <button class="ghost small" type="button" @click="copyPath(row.path)">
+              <Icon name="copy" :size="13" />{{ copiedPath === row.path ? t("editor.copied") : t("action.copy") }}
+            </button>
+          </div>
+        </div>
+
         <div v-if="tab === 'overview'" class="group">
           <h3>{{ t("editor.game") }}</h3>
           <div class="grid">
             <label>
               <span>{{ t("editor.instanceName") }}</span>
-              <input v-model="name" spellcheck="false" />
+              <input v-model="name" spellcheck="false" @blur="commitName" @keyup.enter="commitName" />
             </label>
             <label>
               <span>{{ t("editor.version") }}</span>
@@ -1962,6 +2271,10 @@ async function save() {
           <p v-if="!worlds.length" class="mods-empty">{{ t("editor.noWorlds") }}</p>
           <ul v-else class="mods">
             <li v-for="world in worlds" :key="world.dir">
+              <span class="row-icon world">
+                <img v-if="worldIcons[world.dir]" :src="worldIcons[world.dir]" alt="" loading="lazy" />
+                <Icon v-else name="image" :size="16" />
+              </span>
               <div class="mod-text">
                 <strong>{{ world.name }}</strong>
                 <small class="mono">
@@ -2232,12 +2545,17 @@ async function save() {
               {{ filteredMods.length }}/{{ mods.length }}
             </span>
           </div>
-          <p v-if="!mods.length" class="mods-empty">
+          <p v-if="!mods.length && modsLoading" class="mods-empty">{{ t("editor.loadingList") }}</p>
+          <p v-else-if="!mods.length" class="mods-empty">
             {{ t("editor.noMods") }}
           </p>
           <p v-else-if="!filteredMods.length" class="mods-empty">{{ t("editor.noModsMatch") }}</p>
           <ul v-else class="mods">
             <li v-for="mod in filteredMods" :key="mod.file" :class="{ off: !mod.enabled }">
+              <span class="row-icon">
+                <img v-if="modIcons[mod.file]" :src="modIcons[mod.file]" alt="" loading="lazy" />
+                <Icon v-else name="cube" :size="16" />
+              </span>
               <div class="mod-text">
                 <strong>{{ mod.name }}</strong>
                 <small class="mono">{{ mod.version }} · {{ mod.loader }} · {{ formatBytes(mod.size) }}</small>
@@ -2312,7 +2630,8 @@ async function save() {
             </select>
             <span v-if="packFilter.trim()" class="count">{{ filteredPacks.length }}/{{ resourcePacks.length }}</span>
           </div>
-          <p v-if="!resourcePacks.length" class="mods-empty">{{ t("editor.noResourcePacks") }}</p>
+          <p v-if="!resourcePacks.length && contentLoading" class="mods-empty">{{ t("editor.loadingList") }}</p>
+          <p v-else-if="!resourcePacks.length" class="mods-empty">{{ t("editor.noResourcePacks") }}</p>
           <p v-else-if="!filteredPacks.length" class="mods-empty">{{ t("editor.noFilesMatch") }}</p>
           <ul v-else class="mods">
             <li v-for="pack in filteredPacks" :key="pack.file" :class="{ off: !pack.enabled }">
@@ -2400,7 +2719,8 @@ async function save() {
             </select>
             <span v-if="shaderFilter.trim()" class="count">{{ filteredShaders.length }}/{{ shaders.length }}</span>
           </div>
-          <p v-if="!shaders.length" class="mods-empty">{{ t("editor.noShaders") }}</p>
+          <p v-if="!shaders.length && contentLoading" class="mods-empty">{{ t("editor.loadingList") }}</p>
+          <p v-else-if="!shaders.length" class="mods-empty">{{ t("editor.noShaders") }}</p>
           <p v-else-if="!filteredShaders.length" class="mods-empty">{{ t("editor.noFilesMatch") }}</p>
           <ul v-else class="mods">
             <li v-for="shader in filteredShaders" :key="shader.file" :class="{ off: !shader.enabled }">
@@ -2696,9 +3016,51 @@ async function save() {
   padding-top: 10px;
 }
 
-.side-foot .primary {
-  width: 100%;
-  justify-content: center;
+.auto-state {
+  display: block;
+  text-align: center;
+  font-size: 10.5px;
+  color: var(--muted-2);
+}
+
+.auto-state.saving {
+  color: var(--muted);
+}
+
+.auto-state.saved {
+  color: var(--accent);
+}
+
+.auto-state.failed {
+  color: var(--danger);
+}
+
+.path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--row-bg);
+}
+
+.path-label {
+  flex: none;
+  width: 96px;
+  font-size: 11px;
+  color: var(--muted-2);
+}
+
+.path-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  font-size: 11px;
 }
 
 .panel {
@@ -2964,6 +3326,26 @@ textarea {
 
 .mods li.off {
   opacity: 0.62;
+}
+
+.row-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-3);
+  color: var(--muted-2);
+  overflow: hidden;
+}
+
+.row-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: pixelated;
 }
 
 .mod-text {

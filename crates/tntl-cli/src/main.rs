@@ -853,12 +853,16 @@ fn cmd_check(launcher: &Launcher, instance: &str, json: bool) -> Result<i32> {
         .as_deref()
         .map(|kind| format!("{kind} {}", report.loader_version.as_deref().unwrap_or("")))
         .unwrap_or_else(|| "vanilla".to_string());
+    let memory = report
+        .memory_mb
+        .map(|mb| format!("{mb} MB"))
+        .unwrap_or_else(|| "memory not set".to_string());
     println!(
-        "{instance}: {} · {} · {} mod(s), {} MB, Java {}",
+        "{instance}: {} · {} · {} mod(s), {}, Java {}",
         report.game_version,
         loader.trim_end(),
         report.enabled_mods,
-        report.memory_mb,
+        memory,
         report
             .java_major
             .map(|major| major.to_string())
@@ -1791,6 +1795,9 @@ fn cmd_launch(
 ) -> Result<i32> {
     launcher.ensure_not_running(name)?;
     let mut instance = launcher.load_instance(name)?;
+    if instance.max_memory_mb.is_none() {
+        bail!("memory is not set for this instance; set max_memory_mb in instance.json first");
+    }
     if demo {
         instance.demo = true;
     }

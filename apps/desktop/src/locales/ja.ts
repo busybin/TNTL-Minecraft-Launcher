@@ -41,6 +41,7 @@ const ja: Record<string, string> = {
   "app.removedConfigIn": 'ランチャーの項目（設定のみ）：{path}',
   "app.openConfigFolder": 'ランチャーのフォルダー',
   "app.removeConfirm": '「{name}」を一覧から削除しますか？ファイルは残ります。',
+  "app.undoRemove": "削除を取り消す",
   "app.librarySubtitle": "あなたのワールドへ、ワンクリックで",
   "app.install": "インストール",
   "app.installSubtitle": "Mojang 公式リリースをそのまま取得",
@@ -846,6 +847,19 @@ const ja: Record<string, string> = {
   "modrinth.versions": "ビルド",
   "modrinth.noVersions": "このインスタンスに合うビルドがありません。",
   "modrinth.installThis": "このビルドを使う",
+  "instances.memoryUnset": "メモリ未設定",
+  "editor.loadingList": "フォルダーを読み込み中…",
+  "memory.unset": "未設定 — つまみをドラッグして選択",
+  "memory.neededTitle": "先にメモリを設定",
+  "memory.neededHint": "このインスタンスには最大メモリがまだありません。開いてスライダーを動かしてから再試行してください。",
+  "memory.neededGo": "メモリ設定を開く",
+  "editor.location": "場所",
+  "editor.gameDir": "ゲームフォルダー",
+  "editor.open": "開く",
+  "editor.copied": "コピーしました",
+  "editor.autoSaved": "自動保存済み",
+  "editor.saveFailed": "未保存",
+  "action.copy": "コピー",
 };
 
 export default ja;

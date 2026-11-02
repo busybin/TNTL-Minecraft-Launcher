@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   api,
   events,
   formatBytes,
+  remoteImageUrl,
   type ContentSource,
   type ModProgress,
   type ModSearchHit,
@@ -43,6 +44,31 @@ const sort = ref<SearchIndex>("relevance");
 const hideInstalled = ref(false);
 const visibleHits = computed(() =>
   hideInstalled.value ? hits.value.filter((hit) => !hit.installed) : hits.value,
+);
+/** Project id -> blob URL of its icon, fetched through the shell. */
+const icons = ref<Record<string, string>>({});
+
+watch(
+  visibleHits,
+  (list) => {
+    const missing = list.filter((hit) => hit.icon_url && !icons.value[hit.project_id]);
+    // Six at a time keeps a long result page from opening 20 sockets at once.
+    void (async () => {
+      for (let index = 0; index < missing.length; index += 6) {
+        const batch = missing.slice(index, index + 6);
+        const loaded = await Promise.all(
+          batch.map((hit) => (hit.icon_url ? remoteImageUrl(hit.icon_url) : Promise.resolve(null))),
+        );
+        const next = { ...icons.value };
+        batch.forEach((hit, position) => {
+          const url = loaded[position];
+          if (url) next[hit.project_id] = url;
+        });
+        icons.value = next;
+      }
+    })();
+  },
+  { immediate: true },
 );
 const SORTS: SearchIndex[] = ["relevance", "downloads", "follows", "newest", "updated"];
 const searching = ref(false);
@@ -393,7 +419,7 @@ function formatDownloads(value: number): string {
         <p v-else-if="!visibleHits.length" class="empty">{{ t("modrinth.allInstalled") }}</p>
         <ul v-else>
           <li v-for="hit in visibleHits" :key="hit.project_id">
-            <img v-if="hit.icon_url" :src="hit.icon_url" alt="" loading="lazy" />
+            <img v-if="icons[hit.project_id]" :src="icons[hit.project_id]" alt="" loading="lazy" />
             <span v-else class="fallback"><Icon name="cube" :size="18" /></span>
             <div class="text">
               <div class="title-line">

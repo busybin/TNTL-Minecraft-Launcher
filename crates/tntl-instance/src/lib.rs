@@ -55,7 +55,10 @@ pub struct Instance {
     pub game_dir: Option<PathBuf>,
     pub java: Option<PathBuf>,
     pub min_memory_mb: Option<u32>,
-    pub max_memory_mb: u32,
+    /// `-Xmx`. `None` means the user has not chosen yet: launching is refused
+    /// until the memory slider in the instance page is used.
+    #[serde(default)]
+    pub max_memory_mb: Option<u32>,
     pub jvm_args: Vec<String>,
     pub game_args: Vec<String>,
     /// Extra environment variables for the game process.
@@ -147,7 +150,7 @@ impl Default for Instance {
             game_dir: None,
             java: None,
             min_memory_mb: None,
-            max_memory_mb: 4096,
+            max_memory_mb: None,
             jvm_args: Vec::new(),
             game_args: Vec::new(),
             env: BTreeMap::new(),
@@ -335,12 +338,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tntl-instance-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut instance = Instance::new("test", "1.20.1");
-        instance.max_memory_mb = 8192;
+        instance.max_memory_mb = Some(8192);
         instance.game_args.push("--demo".to_string());
         instance.save(&dir).unwrap();
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.version_id, "1.20.1");
-        assert_eq!(loaded.max_memory_mb, 8192);
+        assert_eq!(loaded.max_memory_mb, Some(8192));
         assert_eq!(loaded.game_args, vec!["--demo"]);
         fs::remove_dir_all(&dir).unwrap();
     }

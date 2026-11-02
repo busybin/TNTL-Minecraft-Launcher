@@ -41,6 +41,7 @@ const ar: Record<string, string> = {
   "app.removedConfigIn": 'مدخل المشغّل (إعدادات فقط): {path}',
   "app.openConfigFolder": 'مجلد المشغّل',
   "app.removeConfirm": 'إزالة {name} من القائمة؟ ستبقى الملفات.',
+  "app.undoRemove": "تراجع عن الإزالة",
   "app.librarySubtitle": "عوالمك على بعد نقرة واحدة",
   "app.install": "التثبيت",
   "app.installSubtitle": "إصدارات Mojang الرسمية مباشرة من المصدر",
@@ -846,6 +847,19 @@ const ar: Record<string, string> = {
   "modrinth.versions": "الإصدارات",
   "modrinth.noVersions": "لا يوجد إصدار يناسب هذه النسخة.",
   "modrinth.installThis": "استخدم هذا الإصدار",
+  "instances.memoryUnset": "الذاكرة غير محددة",
+  "editor.loadingList": "جارٍ قراءة المجلد…",
+  "memory.unset": "غير محددة — اسحب أحد المقبضين",
+  "memory.neededTitle": "حدّد الذاكرة أولاً",
+  "memory.neededHint": "لا يوجد حد أقصى للذاكرة لهذه النسخة بعد. افتحها واضبط شريط الذاكرة ثم أعد المحاولة.",
+  "memory.neededGo": "فتح إعدادات الذاكرة",
+  "editor.location": "الموقع",
+  "editor.gameDir": "مجلد اللعبة",
+  "editor.open": "فتح",
+  "editor.copied": "تم النسخ",
+  "editor.autoSaved": "حُفظ تلقائياً",
+  "editor.saveFailed": "لم يُحفظ",
+  "action.copy": "نسخ",
 };
 
 export default ar;

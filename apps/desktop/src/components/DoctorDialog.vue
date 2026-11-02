@@ -70,7 +70,9 @@ function copy() {
         <span class="chip">{{ report.game_version }}</span>
         <span class="chip">{{ loader }}</span>
         <span class="chip">{{ t("doctor.mods", { enabled: report.enabled_mods, total: report.mods }) }}</span>
-        <span class="chip">{{ t("doctor.memory", { memory: report.memory_mb }) }}</span>
+        <span class="chip">{{
+          report.memory_mb === null ? t("instances.memoryUnset") : t("doctor.memory", { memory: report.memory_mb })
+        }}</span>
         <span v-if="report.java_major" class="chip">{{ t("doctor.java", { major: report.java_major }) }}</span>
       </div>
 

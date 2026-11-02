@@ -10,11 +10,16 @@ import { t } from "../i18n";
  * installed RAM minus the OS reserve, so it can never promise the whole
  * machine.
  */
-const props = defineProps<{ min: number; max: number }>();
+const props = defineProps<{ min: number | null; max: number | null }>();
 const emit = defineEmits<{ update: [min_mb: number, max_mb: number] }>();
 
 const STEP_MB = 256;
 const FLOOR_MB = 256;
+/** Where the handles rest before the user picks a number. */
+const DEFAULT_MIN = 1024;
+const DEFAULT_MAX = 4096;
+/** No memory chosen yet: the instance page asks for one before Play. */
+const unset = computed(() => props.max === null);
 
 const advice = ref<MemoryAdvice | null>(null);
 onMounted(async () => {
@@ -48,8 +53,8 @@ function clampValue(value: number): number {
 }
 
 /** Values from older configs may sit above the cap; show and report the capped one. */
-const valueMin = computed(() => Math.min(clampValue(props.min), clampValue(props.max)));
-const valueMax = computed(() => Math.max(clampValue(props.min), clampValue(props.max)));
+const valueMin = computed(() => Math.min(clampValue(props.min ?? DEFAULT_MIN), clampValue(props.max ?? DEFAULT_MAX)));
+const valueMax = computed(() => Math.max(clampValue(props.min ?? DEFAULT_MIN), clampValue(props.max ?? DEFAULT_MAX)));
 const pctMin = computed(() => (valueMin.value / limit.value) * 100);
 const pctMax = computed(() => (valueMax.value / limit.value) * 100);
 
@@ -59,6 +64,9 @@ watch(
     // Before the real advice arrives the fallback cap is only a guess; do not
     // shrink a saved value against it.
     if (!advice.value) return;
+    // Nothing saved yet: emitting the resting handles would silently write a
+    // guessed value, which is the one thing this screen must not do.
+    if (unset.value) return;
     if (props.min !== valueMin.value || props.max !== valueMax.value) {
       emit("update", valueMin.value, valueMax.value);
     }
@@ -169,7 +177,7 @@ function onKey(which: "min" | "max", event: KeyboardEvent): void {
 </script>
 
 <template>
-  <div class="memory" :class="`zone-${zone}`">
+  <div class="memory" :class="[`zone-${zone}`, { unset }]">
     <div class="memory-head">
       <span>{{ t("memory.title") }}</span>
       <small class="mono">
@@ -220,7 +228,8 @@ function onKey(which: "min" | "max", event: KeyboardEvent): void {
         <span class="tag">{{ t("memory.min") }}</span>
         {{ valueMin }} MiB
       </span>
-      <span v-if="zone === 'ok'" class="zone-text ok">{{ t("memory.zoneOk") }}</span>
+      <span v-if="unset" class="zone-text unset-text">{{ t("memory.unset") }}</span>
+      <span v-else-if="zone === 'ok'" class="zone-text ok">{{ t("memory.zoneOk") }}</span>
       <span v-else-if="zone === 'warn'" class="zone-text warn">{{ t("memory.zoneWarn") }}</span>
       <span v-else class="zone-text danger">{{ t("memory.zoneDanger") }}</span>
       <span class="mono">
@@ -345,6 +354,14 @@ function onKey(which: "min" | "max", event: KeyboardEvent): void {
 
 .zone-text.danger {
   color: var(--danger);
+}
+
+.zone-text.unset-text {
+  color: var(--muted-2);
+}
+
+.memory.unset .thumb {
+  opacity: 0.55;
 }
 
 .memory-hint {

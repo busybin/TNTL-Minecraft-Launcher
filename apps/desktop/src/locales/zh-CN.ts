@@ -41,6 +41,7 @@ const zh: Record<string, string> = {
   "app.removedConfigIn": '启动器条目（仅配置）：{path}',
   "app.openConfigFolder": '配置目录',
   "app.removeConfirm": '把 {name} 从列表移除？文件会保留。',
+  "app.undoRemove": "撤销移除",
   "app.librarySubtitle": "一键进入你的世界",
   "app.install": "安装",
   "app.installSubtitle": "直接来自 Mojang 官方的正式版本",
@@ -846,6 +847,19 @@ const zh: Record<string, string> = {
   "modrinth.versions": "版本",
   "modrinth.noVersions": "没有适合本实例的构建。",
   "modrinth.installThis": "用这个版本",
+  "instances.memoryUnset": "未设置内存",
+  "editor.loadingList": "正在读取目录…",
+  "memory.unset": "未设置，拖动滑块选择",
+  "memory.neededTitle": "先设定内存",
+  "memory.neededHint": "这个实例还没设定最大内存。打开实例，拖动内存滑条后再启动。",
+  "memory.neededGo": "去设置内存",
+  "editor.location": "位置",
+  "editor.gameDir": "游戏目录",
+  "editor.open": "打开",
+  "editor.copied": "已复制",
+  "editor.autoSaved": "已自动保存",
+  "editor.saveFailed": "未保存",
+  "action.copy": "复制",
 };
 
 export default zh;

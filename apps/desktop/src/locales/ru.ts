@@ -41,6 +41,7 @@ const ru: Record<string, string> = {
   "app.removedConfigIn": 'Запись лаунчера (только настройки): {path}',
   "app.openConfigFolder": 'Папка лаунчера',
   "app.removeConfirm": 'Убрать {name} из списка? Файлы останутся.',
+  "app.undoRemove": "Отменить удаление",
   "app.librarySubtitle": "Ваши миры в один клик",
   "app.install": "Установка",
   "app.installSubtitle": "Официальные релизы Mojang — прямо из источника",
@@ -846,6 +847,19 @@ const ru: Record<string, string> = {
   "modrinth.versions": "Версии",
   "modrinth.noVersions": "Нет сборок для этого экземпляра.",
   "modrinth.installThis": "Использовать эту версию",
+  "instances.memoryUnset": "память не задана",
+  "editor.loadingList": "Чтение папки…",
+  "memory.unset": "Не задано — перетащите ползунок",
+  "memory.neededTitle": "Сначала задайте память",
+  "memory.neededHint": "У этого экземпляра ещё нет максимальной памяти. Откройте его, задайте память ползунком и повторите запуск.",
+  "memory.neededGo": "Открыть настройки памяти",
+  "editor.location": "Расположение",
+  "editor.gameDir": "Папка игры",
+  "editor.open": "Открыть",
+  "editor.copied": "Скопировано",
+  "editor.autoSaved": "Сохранено автоматически",
+  "editor.saveFailed": "Не сохранено",
+  "action.copy": "Копировать",
 };
 
 export default ru;

@@ -41,6 +41,7 @@ const en: Record<string, string> = {
   "app.removedConfigIn": 'Launcher entry (configuration only): {path}',
   "app.openConfigFolder": 'Launcher folder',
   "app.removeConfirm": 'Remove {name} from the list? Its files are kept.',
+  "app.undoRemove": "Undo remove",
   "app.librarySubtitle": "Your worlds, one click away",
   "app.install": "Install",
   "app.installSubtitle": "Official Mojang releases, straight from the source",
@@ -846,6 +847,19 @@ const en: Record<string, string> = {
   "modrinth.versions": "Builds",
   "modrinth.noVersions": "No build fits this instance.",
   "modrinth.installThis": "Use this build",
+  "instances.memoryUnset": "memory not set",
+  "editor.loadingList": "Reading the folder…",
+  "memory.unset": "Not set — drag a handle to choose",
+  "memory.neededTitle": "Set the memory first",
+  "memory.neededHint": "This instance has no maximum memory yet. Open the instance, drag the memory slider and try again.",
+  "memory.neededGo": "Open memory settings",
+  "editor.location": "Location",
+  "editor.gameDir": "Game folder",
+  "editor.open": "Open",
+  "editor.copied": "Copied",
+  "editor.autoSaved": "Saved automatically",
+  "editor.saveFailed": "Not saved",
+  "action.copy": "Copy",
 };
 
 export default en;

@@ -78,7 +78,7 @@ pub fn any_matches_series(version: &str, ranges: &[String]) -> Option<bool> {
             return Some(true);
         }
         understood = true;
-        if is_series_idiom(range) {
+        if is_series_idiom(range) || is_series_pin(range) {
             if series.is_some_and(|series| series_in(series, range)) {
                 return Some(true);
             }
@@ -114,6 +114,15 @@ fn is_series_idiom(range: &str) -> bool {
         return false;
     };
     low == high && low_patch.unwrap_or(0) == 0 && high_patch.is_none_or(|patch| patch <= 1)
+}
+
+/// `[1.21]` is how some Forge mods pin "this series" without naming a patch.
+/// A pinned patch such as `[1.21.1]` stays an exact comparison.
+fn is_series_pin(range: &str) -> bool {
+    let Some(body) = range.get(1..range.len().saturating_sub(1)) else {
+        return false;
+    };
+    !body.contains(',') && series_and_patch(body.trim()).is_some_and(|(_, patch)| patch.is_none())
 }
 
 fn series_and_patch(text: &str) -> Option<((u64, u64), Option<u64>)> {
@@ -523,6 +532,10 @@ mod tests {
         yes_series("1.21.1", "[1.21,1.21z)");
         yes_series("1.21.1", "1.21");
         yes_series("1.21.1", "[1.21.1,1.21.2)");
+        // `[1.21]` names the series without a patch: it covers 1.21.x.
+        yes_series("1.21.1", "[1.21]");
+        no_series("1.21.1", "[1.22]");
+        no_series("1.22", "[1.21]");
         no_series("1.21.4", "[1.21.1,1.21.2)");
         yes_series("1.21.1", "[1.20.5,)");
         no_series("1.21.1", "[1.20.1]");
