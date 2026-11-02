@@ -1,0 +1,10 @@
+[package]
+name = "tntl-bisect"
+version.workspace = true
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

@@ -106,6 +106,9 @@ pub struct ModInfo {
     /// Set when the instance's loader or game version cannot satisfy this jar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<BlockedReason>,
+    /// This exact build was part of a launch that reached the game.
+    #[serde(default)]
+    pub proven: bool,
 }
 
 pub fn mods_dir(game_dir: &Path) -> PathBuf {
@@ -399,6 +402,7 @@ fn parse_mod(entry: &PendingMod, neoforge_style: bool, loader: Option<ModLoader>
         fabric_dependency: metadata.fabric_depends,
         fabric_dependency_ranges: metadata.fabric_dependency_ranges,
         blocked: None,
+        proven: false,
     };
     ParsedMod {
         info,

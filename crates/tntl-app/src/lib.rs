@@ -22,7 +22,10 @@ use tntl_auth::{AccountStore, MsaSession, cape_path, read_skin, skin_path};
 use tntl_curseforge::{ContentSources, CurseForge, SourceEntry, strip_disabled};
 use tntl_instance::Instance;
 pub use tntl_instance::datapacks::DatapackInfo;
+use tntl_instance::launch_history::{self, LaunchOutcome};
 use tntl_instance::mods::ModLoader;
+mod bisect;
+pub use bisect::{BisectEvent, BisectModView, BisectPlanView, BisectReport, BisectTestView};
 use tntl_instance::worlds::WorldInfo;
 use tntl_java::JavaInstall;
 use tntl_model::{Environment, MavenName, VersionJson};
@@ -718,6 +721,17 @@ pub struct LoaderUpdate {
     pub newer: bool,
 }
 
+/// One category tag in the mod browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryView {
+    /// Value sent back to the search: slug for Modrinth, numeric id for
+    /// CurseForge.
+    pub key: String,
+    pub slug: String,
+    pub name: String,
+    pub icon: Option<String>,
+}
+
 /// One page of Modrinth search results, scoped to an instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModSearchPage {
@@ -919,6 +933,32 @@ impl Launcher {
         let launcher = Self { root };
         launcher.apply_network();
         launcher
+    }
+
+    /// A crash between a move and its commit leaves a journal under the
+    /// instance. Restore it before any command can see half-applied mods.
+    /// One-time startup recovery. Do not call this from `from_root`: every
+    /// command builds a launcher, and restoring a live bisect would fight it.
+    pub fn recover_transactions(&self) {
+        let Ok(instances) = fs::read_dir(self.instances_dir()) else {
+            return;
+        };
+        for entry in instances.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() || !dir.join("instance.json").is_file() || dir.join(RUNNING_FILE).is_file() {
+                continue;
+            }
+            let problems = tntl_store::transaction::recover(&dir.join(".txn"));
+            for problem in problems {
+                eprintln!("cannot recover an interrupted file transaction: {problem}");
+            }
+            if dir.join("bisect-state.json").is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Err(error) = self.recover_bisect_state(&name) {
+                    eprintln!("cannot restore an interrupted mod bisect: {error:#}");
+                }
+            }
+        }
     }
 
     /// Push the saved proxy settings into the shared HTTP stack.
@@ -4467,7 +4507,50 @@ impl Launcher {
         if let Some(status) = status {
             mark_blocked(&mut mods, &status);
         }
+        // "Proven" means a successful launch already included this exact
+        // build; the bisect starts with the jars that have not proved anything.
+        let history = launch_history::load(&self.instance_dir(name)?);
+        for module in &mut mods {
+            module.proven = history.is_proven(module);
+        }
         Ok(mods)
+    }
+
+    /// Persist the outcome of a normal launch. `snapshot` must be the scan
+    /// taken before the game started: the files may have changed since.
+    pub fn record_launch(
+        &self,
+        name: &str,
+        outcome: LaunchOutcome,
+        duration_ms: u64,
+        exit_code: Option<i32>,
+        summary: &str,
+        snapshot: &[tntl_instance::mods::ModInfo],
+    ) -> Result<()> {
+        let dir = self.instance_dir(name)?;
+        let mut history = launch_history::load(&dir);
+        match outcome {
+            LaunchOutcome::Ok => history.record_success(snapshot, duration_ms, exit_code),
+            LaunchOutcome::Crash => history.record_failure(duration_ms, exit_code, summary),
+            LaunchOutcome::Unknown => history.record_unknown(duration_ms, exit_code, summary),
+        }
+        launch_history::save(&dir, &history)
+            .with_context(|| format!("cannot save the launch history in {}", dir.display()))
+    }
+
+    /// Switch several jars at once. Every path is resolved before the first
+    /// rename, so a bad name cannot leave half a test set applied.
+    pub fn set_mods_enabled(&self, name: &str, desired: &BTreeMap<String, bool>) -> Result<()> {
+        self.ensure_not_running(name)?;
+        let mut operations = Vec::with_capacity(desired.len());
+        for (file, enabled) in desired {
+            operations.push((self.mod_path(name, file)?, *enabled));
+        }
+        for (path, enabled) in operations {
+            tntl_instance::mods::set_enabled(&path, enabled)
+                .with_context(|| format!("cannot switch {}", path.display()))?;
+        }
+        Ok(())
     }
 
     /// Check an instance without starting it and without touching the network.
@@ -4720,11 +4803,20 @@ impl Launcher {
     pub fn remove_mod(&self, name: &str, file: &str) -> Result<Vec<tntl_instance::mods::ModInfo>> {
         self.ensure_not_running(name)?;
         let path = self.mod_path(name, file)?;
-        fs::remove_file(&path).with_context(|| format!("failed to delete {}", path.display()))?;
+        let mut transaction = tntl_store::FileTransaction::new(
+            self.instance_dir(name)?
+                .join(".txn")
+                .join(format!("remove-{}", unix_millis())),
+        )?;
+        transaction.trash(&path)?;
         let mut record = ModrinthContent::load(&self.modrinth_content_path(name)?);
-        if record.remove(ProjectKind::Mod, file) {
-            record.save(&self.modrinth_content_path(name)?)?;
+        if record.remove(ProjectKind::Mod, file)
+            && let Err(error) = record.save(&self.modrinth_content_path(name)?)
+        {
+            let _ = transaction.rollback();
+            return Err(error);
         }
+        transaction.commit()?;
         self.mods(name)
     }
 
@@ -4747,6 +4839,7 @@ impl Launcher {
             offset,
             ContentSource::Modrinth,
             None,
+            None,
         )
     }
 
@@ -4759,6 +4852,54 @@ impl Launcher {
             .map(|tag| tag.version)
             .filter(|version| !version.is_empty())
             .collect())
+    }
+
+    /// Category tags for the mod browser. Modrinth labels them by slug
+    /// (`optimization`); CurseForge uses numeric ids and English names.
+    pub fn modrinth_categories(&self, kind: ProjectKind) -> Result<Vec<CategoryView>> {
+        let http = Http::new()?;
+        let wanted = kind.key();
+        let mut list: Vec<CategoryView> = Modrinth::new(&http)
+            .categories()?
+            .into_iter()
+            .filter(|category| category.project_type == wanted)
+            .filter(|category| {
+                !matches!(
+                    category.name.as_str(),
+                    "fabric" | "quilt" | "forge" | "neoforge" | "liteloader" | "rift"
+                )
+            })
+            .map(|category| CategoryView {
+                key: category.name.clone(),
+                slug: category.name.clone(),
+                name: if category.header.trim().is_empty() {
+                    category.name
+                } else {
+                    category.header
+                },
+                icon: category.icon,
+            })
+            .collect();
+        list.sort_by_key(|category| category.name.to_lowercase());
+        Ok(list)
+    }
+
+    pub fn curseforge_categories(&self, kind: ProjectKind) -> Result<Vec<CategoryView>> {
+        let http = Http::new()?;
+        let mut list: Vec<CategoryView> = self
+            .curseforge(&http)?
+            .categories(kind)?
+            .into_iter()
+            .filter(|category| !category.name.trim().is_empty())
+            .map(|category| CategoryView {
+                key: category.id.to_string(),
+                slug: category.slug,
+                name: category.name,
+                icon: category.icon_url,
+            })
+            .collect();
+        list.sort_by_key(|category| category.name.to_lowercase());
+        Ok(list)
     }
 
     /// Search for projects of `kind` that fit the instance. Resource packs and
@@ -4776,6 +4917,7 @@ impl Launcher {
         offset: u32,
         source: ContentSource,
         game_version: Option<&str>,
+        category: Option<&str>,
     ) -> Result<ModSearchPage> {
         let environment = self.environment(name)?;
         // Browsing MUST narrow to the instance's loader: anything looser would
@@ -4792,11 +4934,15 @@ impl Launcher {
             .map(str::trim)
             .map(str::to_string)
             .unwrap_or(environment.game_version);
-        let filter = if loader.is_empty() {
+        let mut filter = if loader.is_empty() {
             Filter::any_loader(&game_version)
         } else {
             mod_filter(&game_version, &loader)
         };
+        filter.category = category
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let http = Http::new()?;
         let mut page = match source {
             ContentSource::Modrinth => {
@@ -5106,6 +5252,11 @@ impl Launcher {
         let dir = tntl_instance::mods::mods_dir(&self.load_instance(name)?.game_dir(&self.instance_dir(name)?));
         let mut record = ModrinthContent::load(&self.modrinth_content_path(name)?);
         record.seed_hashes(ProjectKind::Mod, &dir);
+        let transaction_root = self
+            .instance_dir(name)?
+            .join(".txn")
+            .join(format!("mods-{}", unix_millis()));
+        let mut transaction = tntl_store::FileTransaction::new(transaction_root)?;
         for module in self.mods(name)? {
             if keep.contains(module.file.as_str()) {
                 continue;
@@ -5135,10 +5286,15 @@ impl Launcher {
                 continue;
             }
             let path = dir.join(&module.file);
-            fs::remove_file(&path).with_context(|| format!("failed to delete {}", path.display()))?;
+            transaction.trash(&path)?;
             record.remove(ProjectKind::Mod, &module.file);
         }
-        record.save(&self.modrinth_content_path(name)?)
+        if let Err(error) = record.save(&self.modrinth_content_path(name)?) {
+            let _ = transaction.rollback();
+            return Err(error);
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Remember which project published each freshly installed file.
@@ -7687,6 +7843,13 @@ pub fn list_instances(launcher: &Launcher) -> Result<Vec<Instance>> {
     Ok(instances)
 }
 
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
+}
+
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8000,7 +8163,129 @@ mod tests {
             fabric_dependency: Vec::new(),
             fabric_dependency_ranges: std::collections::BTreeMap::new(),
             blocked: None,
+            proven: false,
         }
+    }
+
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("tntl-app-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        root
+    }
+
+    fn write_mod_jar(path: &Path, id: &str) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let metadata = serde_json::json!({
+            "schemaVersion": 1,
+            "id": id,
+            "version": "1.0",
+            "depends": {},
+        });
+        zip.write_all(metadata.to_string().as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn bisect_plan_marks_new_jars_and_clears_after_a_successful_launch() {
+        let root = scratch_root("bisect-plan");
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.create_instance(&Instance::new("box", "1.20.1")).unwrap();
+        let mods_dir = launcher.instance_dir("box").unwrap().join("minecraft/mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+        write_mod_jar(&mods_dir.join("one.jar"), "one");
+        write_mod_jar(&mods_dir.join("two.jar"), "two");
+        let plan = launcher.bisect_plan("box").unwrap();
+        assert_eq!(plan.total, 2);
+        assert_eq!(plan.unproven, 2);
+        assert_eq!(plan.suspects.len(), 2);
+
+        let snapshot = launcher.mods("box").unwrap();
+        launcher
+            .record_launch("box", LaunchOutcome::Ok, 100, Some(0), "", &snapshot)
+            .unwrap();
+        let plan = launcher.bisect_plan("box").unwrap();
+        assert_eq!(plan.proven, 2);
+        assert_eq!(plan.unproven, 0);
+        assert!(plan.suspects.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_history_proves_enabled_builds_only() {
+        let root = scratch_root("history");
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.create_instance(&Instance::new("box", "1.20.1")).unwrap();
+        let mut enabled = test_mod("enabled", ModLoader::Fabric);
+        enabled.size = 10;
+        enabled.modified = 100;
+        let mut disabled = test_mod("disabled", ModLoader::Fabric);
+        disabled.file = "disabled.jar.disabled".to_string();
+        disabled.enabled = false;
+        disabled.size = 20;
+        disabled.modified = 200;
+        launcher
+            .record_launch(
+                "box",
+                LaunchOutcome::Ok,
+                1234,
+                Some(0),
+                "",
+                &[enabled.clone(), disabled.clone()],
+            )
+            .unwrap();
+        let history = launch_history::load(&launcher.instance_dir("box").unwrap());
+        assert!(history.is_proven(&enabled));
+        assert!(!history.is_proven(&disabled));
+        assert_eq!(history.launches.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_toggle_renames_every_jar_before_returning() {
+        let root = scratch_root("toggle");
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.create_instance(&Instance::new("box", "1.20.1")).unwrap();
+        let mods = launcher.instance_dir("box").unwrap().join("minecraft/mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("a.jar"), b"a").unwrap();
+        std::fs::write(mods.join("b.jar.disabled"), b"b").unwrap();
+        let mut desired = BTreeMap::new();
+        desired.insert("a.jar".to_string(), false);
+        desired.insert("b.jar".to_string(), true);
+        launcher.set_mods_enabled("box", &desired).unwrap();
+        assert!(!mods.join("a.jar").exists());
+        assert!(mods.join("a.jar.disabled").is_file());
+        assert!(mods.join("b.jar").is_file());
+        assert!(!mods.join("b.jar.disabled").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_bisect_restores_the_saved_switches() {
+        let root = scratch_root("bisect-recover");
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.create_instance(&Instance::new("box", "1.20.1")).unwrap();
+        let dir = launcher.instance_dir("box").unwrap();
+        let mods = dir.join("minecraft/mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("a.jar"), b"a").unwrap();
+        std::fs::write(mods.join("b.jar.disabled"), b"b").unwrap();
+        std::fs::write(
+            dir.join("bisect-state.json"),
+            r#"{"original":{"a.jar":false,"b.jar":true}}"#,
+        )
+        .unwrap();
+        launcher.recover_bisect_state("box").unwrap();
+        assert!(mods.join("a.jar.disabled").is_file());
+        assert!(mods.join("b.jar").is_file());
+        assert!(!dir.join("bisect-state.json").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

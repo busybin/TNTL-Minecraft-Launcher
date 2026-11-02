@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 tntl-auth = { path = "../tntl-auth" }
+tntl-bisect = { path = "../tntl-bisect" }
 tntl-doctor = { path = "../tntl-doctor" }
 tntl-curseforge = { path = "../tntl-curseforge" }
 tntl-forge = { path = "../tntl-forge" }
@@ -30,6 +31,10 @@ serde_json.workspace = true
 tempfile.workspace = true
 hex.workspace = true
 sha2.workspace = true
+ring = "0.17"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 sysinfo = { version = "0.35", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+zip.workspace = true

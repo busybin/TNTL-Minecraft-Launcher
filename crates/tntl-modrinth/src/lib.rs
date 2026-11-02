@@ -44,6 +44,8 @@ pub struct Filter {
     /// 1.20.1 is a Forge fork and loads Forge mods, which Modrinth tags
     /// `forge` only.
     pub accept: Vec<String>,
+    /// Modrinth category slug, e.g. `optimization`.
+    pub category: Option<String>,
 }
 
 impl Filter {
@@ -60,6 +62,7 @@ impl Filter {
             game_version: game_version.into(),
             loader,
             accept: Vec::new(),
+            category: None,
         }
     }
 
@@ -69,6 +72,7 @@ impl Filter {
             game_version: game_version.into(),
             loader: String::new(),
             accept: Vec::new(),
+            category: None,
         }
     }
 
@@ -204,6 +208,18 @@ pub struct SearchPage {
     pub limit: u32,
     #[serde(default)]
     pub total_hits: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CategoryTag {
+    /// Slug used in facets.
+    pub name: String,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub project_type: String,
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -418,6 +434,11 @@ pub struct Modrinth<'a> {
 impl<'a> Modrinth<'a> {
     pub fn new(http: &'a Http) -> Self {
         Self { http }
+    }
+
+    /// Category tags. `name` is the slug; `header` is the readable label.
+    pub fn categories(&self) -> Result<Vec<CategoryTag>, ModrinthError> {
+        self.get_json(&format!("{}/tag/category", endpoints::MODRINTH_API))
     }
 
     /// Search projects of `kind` that run on the filter's game version and,
@@ -1028,6 +1049,14 @@ fn search_url(query: &str, filter: &Filter, kind: ProjectKind, index: SearchInde
             "client_side:required".to_string(),
             "client_side:optional".to_string(),
         ]);
+    }
+    if let Some(category) = filter
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        facets.push(vec![format!("categories:{category}")]);
     }
     format!(
         "{}/search?query={}&limit={}&offset={}&index={}&facets={}",

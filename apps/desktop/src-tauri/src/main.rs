@@ -5,7 +5,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 mod store;
 mod update_apply;
@@ -15,6 +16,7 @@ use tauri::{Emitter, Manager, State};
 use tntl_app::{InstalledMod, InstalledVersion, InstanceView, JavaView, Launcher, ModSearchPage, VersionView};
 use tntl_instance::Instance;
 use tntl_launch::{GameHandle, GameProcess, LaunchOptions};
+use tntl_instance::launch_history::LaunchOutcome;
 use tntl_resolve::{MissingKind, VerifyMode};
 use tntl_source::InstallEvent;
 
@@ -29,6 +31,9 @@ struct AppState {
     /// Set by the frontend once it has mounted. The watchdog uses it to tell a
     /// slow first paint from a dead WebView.
     frontend_ready: std::sync::atomic::AtomicBool,
+    /// A bisect owns the instance and launches several games in a row.
+    bisect_running: Arc<AtomicBool>,
+    bisect_cancel: Arc<AtomicBool>,
 }
 
 struct RunningGame {
@@ -1140,6 +1145,30 @@ async fn remote_image(state: State<'_, AppState>, url: String) -> Result<tauri::
 }
 
 #[tauri::command]
+async fn modrinth_categories(
+    state: State<'_, AppState>,
+    kind: String,
+) -> Result<Vec<tntl_app::CategoryView>, String> {
+    let kind = tntl_app::ProjectKind::from_key(&kind).ok_or_else(|| format!("unknown project kind {kind}"))?;
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.modrinth_categories(kind).map_err(message))
+        .await
+        .map_err(message)?
+}
+
+#[tauri::command]
+async fn curseforge_categories(
+    state: State<'_, AppState>,
+    kind: String,
+) -> Result<Vec<tntl_app::CategoryView>, String> {
+    let kind = tntl_app::ProjectKind::from_key(&kind).ok_or_else(|| format!("unknown project kind {kind}"))?;
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.curseforge_categories(kind).map_err(message))
+        .await
+        .map_err(message)?
+}
+
+#[tauri::command]
 async fn search_projects(
     state: State<'_, AppState>,
     instance: String,
@@ -1148,6 +1177,7 @@ async fn search_projects(
     sort: String,
     source: String,
     game_version: Option<String>,
+    category: Option<String>,
     limit: u32,
     offset: u32,
 ) -> Result<ModSearchPage, String> {
@@ -1165,6 +1195,7 @@ async fn search_projects(
                 offset,
                 source,
                 game_version.as_deref(),
+                category.as_deref(),
             )
             .map_err(message)
     })
@@ -1368,12 +1399,83 @@ async fn update_pack(
 }
 
 #[tauri::command]
+async fn set_mods_enabled(
+    state: State<'_, AppState>,
+    name: String,
+    files: Vec<String>,
+    enabled: bool,
+) -> Result<Vec<tntl_instance::mods::ModInfo>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let desired: BTreeMap<String, bool> =
+            files.into_iter().map(|file| (file, enabled)).collect();
+        launcher.set_mods_enabled(&name, &desired).map_err(message)?;
+        launcher.mods(&name).map_err(message)
+    })
+    .await
+    .map_err(message)?
+}
+
+#[tauri::command]
+async fn bisect_plan(state: State<'_, AppState>, name: String) -> Result<tntl_app::BisectPlanView, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.bisect_plan(&name).map_err(message))
+        .await
+        .map_err(message)?
+}
+
+/// Run the whole bisect on a worker thread. Progress goes out as
+/// `bisect-progress`; the command itself returns the final report.
+#[tauri::command]
+async fn start_bisect(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    timeout_secs: u64,
+) -> Result<tntl_app::BisectReport, String> {
+    if state.bisect_running.swap(true, Ordering::SeqCst) {
+        return Err("a mod bisect is already running".to_string());
+    }
+    if state.game.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
+        state.bisect_running.store(false, Ordering::SeqCst);
+        return Err("close the running game before bisecting".to_string());
+    }
+    if state.launching.load(Ordering::SeqCst) {
+        state.bisect_running.store(false, Ordering::SeqCst);
+        return Err("the game is already starting".to_string());
+    }
+    state.bisect_cancel.store(false, Ordering::SeqCst);
+    let running = Arc::clone(&state.bisect_running);
+    let cancel = Arc::clone(&state.bisect_cancel);
+    let launcher = state_launcher(&state);
+    let app_for_progress = app.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let progress = move |event: tntl_app::BisectEvent| {
+            let _ = app_for_progress.emit("bisect-progress", &event);
+        };
+        launcher.bisect_mods(&name, std::time::Duration::from_secs(timeout_secs), &cancel, &progress)
+    })
+    .await;
+    running.store(false, Ordering::SeqCst);
+    joined.map_err(message)?.map_err(message)
+}
+
+#[tauri::command]
+fn stop_bisect(state: State<'_, AppState>) -> Result<(), String> {
+    state.bisect_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
 async fn launch_instance(app: tauri::AppHandle, state: State<'_, AppState>, name: String) -> Result<u32, String> {
     {
         let running = state.game.lock().unwrap_or_else(|poison| poison.into_inner());
         if let Some(game) = running.as_ref() {
             return Err(format!("instance {} is already running", game.name));
         }
+    }
+    if state.bisect_running.load(Ordering::SeqCst) {
+        return Err("a mod bisect is running; stop it before starting the game".to_string());
     }
     if state.launching.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err("another instance is already starting".to_string());
@@ -1463,13 +1565,16 @@ async fn launch_instance(app: tauri::AppHandle, state: State<'_, AppState>, name
                 .instance_dir(&name)
                 .map(|dir| instance.game_dir(&dir))
                 .unwrap_or_default();
-            Ok((process, settings.quit_on_launch, game_dir))
+            // Snapshot before spawning: the success record must describe the
+            // jars that actually ran, not whatever is on disk hours later.
+            let mod_snapshot = launcher.mods(&name).ok();
+            Ok((process, settings.quit_on_launch, game_dir, mod_snapshot))
         })
         .await
         .map_err(message)
     };
     state.launching.store(false, std::sync::atomic::Ordering::SeqCst);
-    let (process, quit_on_launch, game_dir) = prepared??;
+    let (process, quit_on_launch, game_dir, mod_snapshot) = prepared??;
     let pid = process.id();
     let handle = process.handle();
     {
@@ -1514,6 +1619,29 @@ async fn launch_instance(app: tauri::AppHandle, state: State<'_, AppState>, name
             let launcher = state_launcher(&state);
             launcher.clear_running(&name);
             let _ = launcher.record_playtime(&name, exit.duration_ms);
+            if let Some(snapshot) = mod_snapshot.as_ref() {
+                let outcome = match (exit.exit_code, exit.crash.as_ref()) {
+                    (Some(0), None) => LaunchOutcome::Ok,
+                    (_, Some(crash)) if crash.kind == "Terminated" => LaunchOutcome::Unknown,
+                    (_, Some(_)) => LaunchOutcome::Crash,
+                    _ => LaunchOutcome::Unknown,
+                };
+                let summary = exit
+                    .crash
+                    .as_ref()
+                    .map(|crash| crash.summary.clone())
+                    .unwrap_or_default();
+                if let Err(error) = launcher.record_launch(
+                    &name,
+                    outcome,
+                    exit.duration_ms as u64,
+                    exit.exit_code,
+                    &summary,
+                    snapshot,
+                ) {
+                    eprintln!("cannot record the launch history: {error:#}");
+                }
+            }
             let mut running = state.game.lock().unwrap_or_else(|poison| poison.into_inner());
             if running.as_ref().is_some_and(|game| game.name == name) {
                 *running = None;
@@ -2904,6 +3032,11 @@ fn main() {
     // the user never chose. Only the root actually in use may count.
     let env_root = env_root().filter(|path| path == &root);
     let configured = store::configured_root().is_some() || env_root.is_some();
+    if configured {
+        // Recover interrupted file transactions and a half-finished bisect
+        // exactly once, before any command builds its own Launcher.
+        Launcher::from_root(Some(root.clone())).recover_transactions();
+    }
     if let Some(path) = &env_root {
         let _ = store::remember_root(path);
         let mut bootstrap = store::load_bootstrap();
@@ -2990,6 +3123,8 @@ fn main() {
             game: Mutex::new(None),
             launching: std::sync::atomic::AtomicBool::new(false),
             frontend_ready: std::sync::atomic::AtomicBool::new(false),
+            bisect_running: Arc::new(AtomicBool::new(false)),
+            bisect_cancel: Arc::new(AtomicBool::new(false)),
         })
         .invoke_handler(tauri::generate_handler![
             roots,
@@ -3047,6 +3182,8 @@ fn main() {
             install_missing_deps,
             fix_dependency_versions,
             search_projects,
+            modrinth_categories,
+            curseforge_categories,
             mod_game_versions,
             install_projects,
             project_versions,
@@ -3095,6 +3232,10 @@ fn main() {
             read_crash_report,
             delete_crash_report,
             delete_crash_reports,
+            set_mods_enabled,
+            bisect_plan,
+            start_bisect,
+            stop_bisect,
             list_screenshots,
             read_screenshot,
             read_screenshot_thumbnail,

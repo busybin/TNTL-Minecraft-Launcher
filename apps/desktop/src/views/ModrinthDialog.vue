@@ -5,6 +5,7 @@ import {
   events,
   formatBytes,
   remoteImageUrl,
+  type CategoryView,
   type ContentSource,
   type ModProgress,
   type ModSearchHit,
@@ -41,6 +42,10 @@ const source = ref<ContentSource>("modrinth");
 /** CurseForge needs the user's own key, so the source is gated on it. */
 const hasCurseforgeKey = ref(false);
 const sort = ref<SearchIndex>("relevance");
+const category = ref("");
+const categories = ref<CategoryView[]>([]);
+const categoriesLoading = ref(false);
+const categoryCache: Record<string, CategoryView[]> = {};
 const hideInstalled = ref(false);
 const visibleHits = computed(() =>
   hideInstalled.value ? hits.value.filter((hit) => !hit.installed) : hits.value,
@@ -105,12 +110,56 @@ onMounted(async () => {
     .modGameVersions()
     .then((list) => (gameVersions.value = list))
     .catch(() => {});
-  await search(false);
+  await Promise.all([loadCategories(), search(false)]);
 });
 
 onBeforeUnmount(() => unlisten?.());
 
 let requestId = 0;
+let categoryRequest = 0;
+
+/** Category tags differ per source and project kind; cache them per pair. */
+async function loadCategories() {
+  const serial = ++categoryRequest;
+  if (source.value === "curseforge" && !hasCurseforgeKey.value) {
+    categories.value = [];
+    category.value = "";
+    return;
+  }
+  const cacheKey = `${source.value}:${kind.value}`;
+  if (categoryCache[cacheKey]) {
+    categories.value = categoryCache[cacheKey];
+    return;
+  }
+  categoriesLoading.value = true;
+  categories.value = [];
+  try {
+    const list =
+      source.value === "modrinth"
+        ? await api.modrinthCategories(kind.value)
+        : await api.curseforgeCategories(kind.value);
+    if (serial !== categoryRequest) return;
+    categoryCache[cacheKey] = list;
+    categories.value = list;
+    if (category.value && !list.some((entry) => entry.key === category.value)) category.value = "";
+  } catch {
+    if (serial === categoryRequest) categories.value = [];
+  } finally {
+    if (serial === categoryRequest) categoriesLoading.value = false;
+  }
+}
+
+const CATEGORY_KEYS: Record<string, string> = {
+  optimization: "optimization",
+  audio: "audio",
+  "game-mechanics": "gameMechanics",
+  gameplay: "gameplay",
+};
+
+function categoryLabel(entry: CategoryView): string {
+  const key = CATEGORY_KEYS[entry.slug.toLowerCase()] ?? CATEGORY_KEYS[entry.name.toLowerCase()];
+  return key ? t(`category.${key}`) : entry.name;
+}
 
 async function search(more: boolean) {
   if (more && (searching.value || loadingMore.value)) return;
@@ -130,6 +179,7 @@ async function search(more: boolean) {
       sort.value,
       source.value,
       versionChosen.value ? version.value : null,
+      category.value || null,
       20,
       offset,
     );
@@ -160,6 +210,8 @@ function pickKind(next: ProjectKind) {
   kind.value = next;
   hits.value = [];
   total.value = 0;
+  category.value = "";
+  void loadCategories();
   void search(false);
 }
 
@@ -168,13 +220,16 @@ function pickSource(next: ContentSource) {
   source.value = next;
   hits.value = [];
   total.value = 0;
+  category.value = "";
   error.value = null;
   // Without a key the backend can only fail; the panel below explains how to
   // get one instead of showing a network error.
   if (next === "curseforge" && !hasCurseforgeKey.value) {
     status.value = null;
+    void loadCategories();
     return;
   }
+  void loadCategories();
   void search(false);
 }
 
@@ -182,6 +237,14 @@ function pickVersion(next: string) {
   versionChosen.value = true;
   if (version.value === next || searching.value || loadingMore.value) return;
   version.value = next;
+  hits.value = [];
+  total.value = 0;
+  void search(false);
+}
+
+function pickCategory(next: string) {
+  if (category.value === next || searching.value || loadingMore.value) return;
+  category.value = next;
   hits.value = [];
   total.value = 0;
   void search(false);
@@ -391,6 +454,18 @@ function formatDownloads(value: number): string {
         >
           <option value="">{{ t("modrinth.allVersions") }}</option>
           <option v-for="entry in gameVersions" :key="entry" :value="entry">{{ entry }}</option>
+        </select>
+        <select
+          class="sort mono"
+          :value="category"
+          :disabled="searching || categoriesLoading || installing !== null"
+          :title="t('modrinth.category')"
+          @change="pickCategory(($event.target as HTMLSelectElement).value)"
+        >
+          <option value="">{{ t("modrinth.allCategories") }}</option>
+          <option v-for="entry in categories" :key="entry.key" :value="entry.key">
+            {{ categoryLabel(entry) }}
+          </option>
         </select>
         <select
           class="sort mono"
@@ -611,8 +686,10 @@ header .icon {
 
 .search {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+  row-gap: 6px;
   padding: 6px 6px 6px 12px;
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -626,7 +703,7 @@ header .icon {
 }
 
 .search input {
-  flex: 1;
+  flex: 1 1 160px;
   min-width: 0;
   border: 0;
   background: transparent;

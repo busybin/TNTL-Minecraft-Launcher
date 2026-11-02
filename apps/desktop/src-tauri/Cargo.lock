@@ -3809,12 +3809,14 @@ dependencies = [
  "anyhow",
  "dirs 6.0.0",
  "hex",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
  "sysinfo",
  "tempfile",
  "tntl-auth",
+ "tntl-bisect",
  "tntl-curseforge",
  "tntl-doctor",
  "tntl-forge",
@@ -3845,6 +3847,14 @@ dependencies = [
  "tntl-source",
  "tntl-store",
  "uuid",
+]
+
+[[package]]
+name = "tntl-bisect"
+version = "8.0.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -43,6 +43,7 @@ import UpdateList from "../components/UpdateList.vue";
 import ModrinthDialog from "./ModrinthDialog.vue";
 import DoctorDialog from "../components/DoctorDialog.vue";
 import ScreenshotAlbum from "../components/ScreenshotAlbum.vue";
+import BisectDialog from "../components/BisectDialog.vue";
 import FindingCard from "../components/FindingCard.vue";
 import { findingsReport } from "../findings";
 import MemorySlider from "../components/MemorySlider.vue";
@@ -202,6 +203,7 @@ const contentLoading = ref(false);
 const contentLoaded = ref(false);
 const modFilter = ref("");
 const modOnlyDisabled = ref(false);
+const modOnlyUnproven = ref(false);
 const modSort = ref<SortKey>("name");
 /** Narrow the list to the jars a check flagged; `issues` is the union. */
 type ModIssueFilter = "all" | "issues" | "duplicate" | "blocked" | "missing";
@@ -245,6 +247,7 @@ const toggling = ref<string | null>(null);
 const removing = ref<string | null>(null);
 const togglingContent = ref<string | null>(null);
 const browsing = ref(false);
+const bisectOpen = ref(false);
 const modUpdates = ref<ModUpdate[]>([]);
 const packUpdates = ref<ModUpdate[]>([]);
 const shaderUpdates = ref<ModUpdate[]>([]);
@@ -1523,6 +1526,11 @@ function openDoctor() {
   void runDoctor();
 }
 
+function onBisectChanged() {
+  void reloadMods();
+  emit("changed");
+}
+
 async function onDoctorAction(kind: "deps" | "versions" | "repair" | "mods" | "log") {
   if (kind === "mods") {
     openInGameDir("mods");
@@ -1776,6 +1784,7 @@ const filteredMods = computed(() => {
   const needle = modFilter.value.trim().toLowerCase();
   const list = mods.value.filter((mod) => {
     if (modOnlyDisabled.value && mod.enabled) return false;
+    if (modOnlyUnproven.value && (!mod.enabled || mod.proven)) return false;
     const tags = modTags(mod);
     if (modIssue.value === "issues" && !modHasProblem(mod)) return false;
     if (modIssue.value === "duplicate" && !tags.some((tag) => tag.kind === "duplicate")) return false;
@@ -2842,6 +2851,9 @@ async function openPath(path: string) {
             <button class="ghost small" :disabled="!config || updating !== null" @click="browsing = true">
               <Icon name="spark" :size="13" /> {{ t("editor.browseModrinth") }}
             </button>
+            <button class="ghost small" :disabled="running || !mods.length" @click="bisectOpen = true">
+              <Icon name="diagnosis" :size="13" /> {{ t("bisect.button") }}
+            </button>
             <button class="ghost small" :disabled="localBusy !== null" @click="addLocal('mod')">
               <Icon name="plus" :size="13" /> {{ localBusy === "mod" ? t("editor.working") : t("editor.addFile") }}
             </button>
@@ -2898,6 +2910,10 @@ async function openPath(path: string) {
               <input v-model="modOnlyDisabled" type="checkbox" />
               {{ t("editor.onlyDisabled") }}
             </label>
+            <label class="filter-toggle">
+              <input v-model="modOnlyUnproven" type="checkbox" />
+              {{ t("editor.onlyUnproven") }}
+            </label>
             <label v-if="ignoredModCount" class="filter-toggle">
               <input v-model="showIgnoredMods" type="checkbox" />
               {{ t("editor.showIgnored", { count: ignoredModCount }) }}
@@ -2914,7 +2930,7 @@ async function openPath(path: string) {
               <option value="size">{{ t("editor.sortSize") }}</option>
               <option value="modified">{{ t("editor.sortModified") }}</option>
             </select>
-            <span v-if="modFilter.trim() || modOnlyDisabled || showIgnoredMods || modIssue !== 'all'" class="count">
+            <span v-if="modFilter.trim() || modOnlyDisabled || modOnlyUnproven || showIgnoredMods || modIssue !== 'all'" class="count">
               {{ filteredMods.length }}/{{ mods.length }}
             </span>
           </div>
@@ -2942,7 +2958,12 @@ async function openPath(path: string) {
               <div class="mod-text">
                 <strong>{{ mod.name }}</strong>
                 <small class="mono">{{ mod.version }} · {{ mod.loader }} · {{ formatBytes(mod.size) }}</small>
-                <div v-if="modTags(mod).length" class="mod-tags">
+                <div v-if="modTags(mod).length || (mod.enabled && !mod.proven)" class="mod-tags">
+                  <span
+                    v-if="mod.enabled && !mod.proven"
+                    class="mod-tag new"
+                    :title="t('editor.notLaunchedHint')"
+                  >{{ t("editor.notLaunched") }}</span>
                   <span
                     v-for="tag in modTags(mod)"
                     :key="tag.kind"
@@ -3211,6 +3232,13 @@ async function openPath(path: string) {
         </div>
       </div>
     </div>
+
+    <BisectDialog
+      v-if="bisectOpen"
+      :instance="config?.name ?? props.name"
+      @close="bisectOpen = false"
+      @changed="onBisectChanged"
+    />
 
     <DoctorDialog
       v-if="doctorOpen"
@@ -3816,6 +3844,13 @@ textarea {
 
 .mod-tag.muted {
   color: var(--muted-2);
+}
+
+.mod-tag.new {
+  color: var(--accent);
+  border-color: rgba(111, 220, 111, 0.5);
+  background: rgba(111, 220, 111, 0.1);
+  cursor: help;
 }
 
 .mod-tag.danger {

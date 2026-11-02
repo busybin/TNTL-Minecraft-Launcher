@@ -14,6 +14,7 @@ pub mod archive;
 pub mod content;
 pub mod crashes;
 pub mod datapacks;
+pub mod launch_history;
 pub mod mods;
 pub mod nbt;
 pub mod playtime;

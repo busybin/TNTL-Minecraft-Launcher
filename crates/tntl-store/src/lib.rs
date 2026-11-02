@@ -10,6 +10,9 @@ use sha1::{Digest, Sha1};
 use sha2::Sha512;
 use thiserror::Error;
 
+pub mod transaction;
+pub use transaction::FileTransaction;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io error at {path}: {source}")]

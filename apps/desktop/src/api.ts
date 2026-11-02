@@ -102,6 +102,8 @@ export interface ModInfo {
   recognized: boolean;
   /** Set when the instance's loader or game version cannot satisfy this jar. */
   blocked?: BlockedReason;
+  /** A successful launch already included this exact build. */
+  proven: boolean;
 }
 
 export interface BlockedReason {
@@ -592,6 +594,57 @@ export interface CrashReport {
   modified_ms: number | null;
 }
 
+export interface CategoryView {
+  key: string;
+  slug: string;
+  name: string;
+  icon: string | null;
+}
+
+export interface BisectModView {
+  file: string;
+  id: string;
+  name: string;
+  version: string;
+  proven: boolean;
+  modified: number;
+}
+
+export interface BisectPlanView {
+  total: number;
+  proven: number;
+  unproven: number;
+  suspects: BisectModView[];
+  blocked: BisectModView[];
+  missing: string[];
+}
+
+export interface BisectTestView {
+  index: number;
+  kind: string;
+  enabled: number;
+  disabled: number;
+  crashed: boolean;
+  duration_ms: number;
+  summary: string;
+}
+
+export interface BisectReport {
+  outcome: "culprit" | "interaction" | "not_reproduced" | "inconclusive" | "cancelled";
+  culprit: BisectModView | null;
+  suspects: BisectModView[];
+  also_disabled: BisectModView[];
+  tests: BisectTestView[];
+  message: string;
+}
+
+export type BisectEvent =
+  | { type: "plan"; plan: BisectPlanView }
+  | { type: "test"; index: number; kind: string; enabled: number; disabled: number; total: number }
+  | { type: "result"; index: number; crashed: boolean; duration_ms: number; summary: string }
+  | { type: "restoring" }
+  | { type: "finished"; report: BisectReport };
+
 export interface Screenshot {
   file: string;
   bytes: number;
@@ -820,6 +873,12 @@ export const api = {
     invoke<void>("delete_crash_report", { name, file }),
   deleteCrashReports: (name: string, files: string[]) =>
     invoke<CrashReport[]>("delete_crash_reports", { name, files }),
+  setModsEnabled: (name: string, files: string[], enabled: boolean) =>
+    invoke<ModInfo[]>("set_mods_enabled", { name, files, enabled }),
+  bisectPlan: (name: string) => invoke<BisectPlanView>("bisect_plan", { name }),
+  startBisect: (name: string, timeoutSecs: number) =>
+    invoke<BisectReport>("start_bisect", { name, timeoutSecs }),
+  stopBisect: () => invoke<void>("stop_bisect"),
   listScreenshots: (name: string) => invoke<Screenshot[]>("list_screenshots", { name }),
   readScreenshot: (name: string, file: string) =>
     invoke<ArrayBuffer>("read_screenshot", { name, file }),
@@ -878,6 +937,7 @@ export const api = {
     sort: SearchIndex,
     source: ContentSource,
     gameVersion: string | null,
+    category: string | null,
     limit: number,
     offset: number,
   ) =>
@@ -888,9 +948,14 @@ export const api = {
       sort,
       source,
       gameVersion,
+      category,
       limit,
       offset,
     }),
+  modrinthCategories: (kind: ProjectKind) =>
+    invoke<CategoryView[]>("modrinth_categories", { kind }),
+  curseforgeCategories: (kind: ProjectKind) =>
+    invoke<CategoryView[]>("curseforge_categories", { kind }),
   installProjects: (
     instance: string,
     kind: ProjectKind,
@@ -1029,6 +1094,8 @@ export const events = {
     listen<JobEvent<PackProgress>>("pack-progress", (event) => handler(event.payload)),
   onJavaProgress: (handler: (event: RuntimeProgress) => void) =>
     listen<RuntimeProgress>("java-progress", (event) => handler(event.payload)),
+  onBisectProgress: (handler: (event: BisectEvent) => void) =>
+    listen<BisectEvent>("bisect-progress", (event) => handler(event.payload)),
   onGameExit: (handler: (payload: GameExit) => void) =>
     listen<GameExit>("game-exit", (event) => handler(event.payload)),
 };
@@ -1164,6 +1231,7 @@ export type UpdateAsset = {
   url: string;
   size: number;
   digest: string | null;
+  signature_url?: string | null;
 };
 
 export type UpdateStatus = {

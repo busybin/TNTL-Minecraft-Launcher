@@ -97,6 +97,7 @@ struct Envelope<T> {
 #[serde(rename_all = "camelCase", default)]
 struct Paged<T> {
     data: Vec<T>,
+    #[serde(default)]
     pagination: Pagination,
 }
 
@@ -144,9 +145,14 @@ pub struct Author {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Category {
+    pub id: u64,
     pub name: String,
+    pub slug: String,
+    pub class_id: u32,
+    pub parent_category_id: Option<u64>,
+    pub icon_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -314,6 +320,17 @@ impl<'a> CurseForge<'a> {
     }
 
     /// Search projects of `kind` for the filter's game version and loader.
+    /// Categories for one class id (mods, resource packs, shaders).
+    pub fn categories(&self, kind: ProjectKind) -> Result<Vec<Category>, CurseForgeError> {
+        let url = format!(
+            "{}/categories?gameId={GAME}&classId={}",
+            endpoints::CURSEFORGE_API,
+            class_id(kind)
+        );
+        let page: Paged<Category> = self.get_json(&url)?;
+        Ok(page.data)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -772,6 +789,14 @@ fn search_url(query: &str, filter: &Filter, kind: ProjectKind, index: SearchInde
     }
     if !query.trim().is_empty() {
         url.push_str(&format!("&searchFilter={}", encode(query.trim())));
+    }
+    if let Some(category) = filter
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        url.push_str(&format!("&categoryId={}", encode(category)));
     }
     url
 }

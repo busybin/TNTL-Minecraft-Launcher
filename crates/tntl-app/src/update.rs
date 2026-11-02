@@ -30,6 +30,9 @@ pub struct UpdateAsset {
     pub url: String,
     pub size: u64,
     pub digest: Option<String>,
+    /// Optional detached Ed25519 signature (`<asset>.sig`, hex).
+    #[serde(default)]
+    pub signature_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,11 +220,18 @@ fn pick_asset(assets: &[RawAsset], kind: InstallKind) -> Option<UpdateAsset> {
             asset.name.ends_with(suffix) && safe_url(&asset.browser_download_url) && !asset.name.is_empty()
         });
         if let Some(asset) = found {
+            let signature_url = assets
+                .iter()
+                .find(|candidate| {
+                    candidate.name == format!("{}.sig", asset.name) && safe_url(&candidate.browser_download_url)
+                })
+                .map(|candidate| candidate.browser_download_url.clone());
             return Some(UpdateAsset {
                 name: asset.name.clone(),
                 url: asset.browser_download_url.clone(),
                 size: asset.size,
                 digest: asset.digest.clone(),
+                signature_url,
             });
         }
     }
@@ -291,7 +301,53 @@ pub fn download(asset: &UpdateAsset, dir: &Path, progress: &mut dyn FnMut(u64)) 
     if asset.size > 0 && size != asset.size {
         bail!("downloaded update is {size} bytes, expected {}", asset.size);
     }
+    // Authenticity is opt-in: a build with TNTL_UPDATE_PUBKEY set refuses an
+    // update that has no valid detached signature. Without a key the SHA-256
+    // from GitHub still catches corruption, but not a compromised release.
+    if let Some(public_key) = update_public_key() {
+        let public_key = decode_hex(public_key.trim())?;
+        let Some(signature_url) = asset.signature_url.as_deref().filter(|url| !url.is_empty()) else {
+            bail!("this build requires a signed update, but the release has no .sig asset");
+        };
+        if !safe_url(signature_url) {
+            bail!("refusing to download the signature from {signature_url}");
+        }
+        let signature = Http::new()
+            .context("cannot create the HTTP client")?
+            .get_bytes_with(signature_url, 8 * 1024, &[("User-Agent", "TNTL")])
+            .context("cannot download the update signature")?;
+        verify_signature(&dest, &public_key, &signature)?;
+    }
     Ok(dest)
+}
+
+/// Signature is Ed25519 over the UTF-8 string `sha256:<hex digest>`.
+fn verify_signature(path: &Path, public_key: &[u8], signature: &[u8]) -> Result<()> {
+    use ring::signature::{ED25519, UnparsedPublicKey};
+    let signature = decode_hex(std::str::from_utf8(signature).context("signature is not UTF-8")?.trim())?;
+    let digest = format!("sha256:{}", sha256_file(path)?);
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(digest.as_bytes(), &signature)
+        .map_err(|_| anyhow::anyhow!("the update signature does not match this build's public key"))
+}
+
+/// The release build embeds the key; a developer can still override it while
+/// testing with the environment variable.
+fn update_public_key() -> Option<String> {
+    std::env::var("TNTL_UPDATE_PUBKEY")
+        .ok()
+        .or_else(|| option_env!("TNTL_UPDATE_PUBKEY").map(str::to_string))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        bail!("hex value has an odd length");
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(|error| anyhow::anyhow!("{error}")))
+        .collect()
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -321,6 +377,37 @@ mod tests {
         assert_eq!(parse_version("7"), Some(7));
         assert_eq!(parse_version("V5 (beta test)"), Some(5));
         assert_eq!(parse_version("nightly"), None);
+    }
+
+    #[test]
+    fn verifies_a_detached_ed25519_signature() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let path = std::env::temp_dir().join(format!("tntl-update-sig-{}", std::process::id()));
+        std::fs::write(&path, b"release bytes").unwrap();
+        let digest = format!("sha256:{}", sha256_file(&path).unwrap());
+        let signature = key.sign(digest.as_bytes());
+        verify_signature(
+            &path,
+            key.public_key().as_ref(),
+            hex::encode(signature.as_ref()).as_bytes(),
+        )
+        .unwrap();
+        // A different key must not verify.
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let other = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        assert!(
+            verify_signature(
+                &path,
+                other.public_key().as_ref(),
+                hex::encode(signature.as_ref()).as_bytes()
+            )
+            .is_err()
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

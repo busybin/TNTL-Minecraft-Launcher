@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use tntl_instance::launch_history::LaunchOutcome;
 use tntl_launch::{CrashKind, LaunchOptions};
 use tntl_modrinth::InstallEvent as ModEvent;
 use tntl_resolve::{LaunchPlan, MissingKind, VerifyMode};
@@ -230,6 +231,11 @@ enum Command {
         /// Also delete version files that no other instance uses.
         #[arg(long)]
         cleanup: bool,
+    },
+    /// Show which mods a crash bisect would test first.
+    BisectPlan {
+        /// Instance name.
+        instance: String,
     },
     /// List instances.
     List,
@@ -704,6 +710,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Rename { instance, name } => cmd_rename(&launcher, &instance, &name),
         Command::Delete { instance, yes, cleanup } => cmd_delete(&launcher, &instance, yes, cleanup),
         Command::Installed { delete, cleanup, json } => cmd_installed(&launcher, delete.as_deref(), cleanup, json),
+        Command::BisectPlan { instance } => cmd_bisect_plan(&launcher, &instance),
         Command::List => cmd_list(&launcher),
         Command::Plan { instance, json } => cmd_plan(&launcher, &instance, json),
         Command::Launch {
@@ -1677,6 +1684,28 @@ fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
+fn cmd_bisect_plan(launcher: &Launcher, instance: &str) -> Result<i32> {
+    let plan = launcher.bisect_plan(instance)?;
+    println!(
+        "{}: {} enabled, {} proven, {} unproven",
+        instance, plan.total, plan.proven, plan.unproven
+    );
+    if plan.suspects.is_empty() {
+        println!("no unproven mods; the whole set will be tested");
+    } else {
+        for module in &plan.suspects {
+            println!("  {} {} ({})", module.name, module.version, module.file);
+        }
+    }
+    for module in &plan.blocked {
+        println!("blocked: {} ({})", module.name, module.file);
+    }
+    for missing in &plan.missing {
+        println!("missing: {missing}");
+    }
+    Ok(0)
+}
+
 fn cmd_list(launcher: &Launcher) -> Result<i32> {
     let instances = list_instances(launcher)?;
     if instances.is_empty() {
@@ -1839,6 +1868,7 @@ fn cmd_launch(
     let log_path = instance_dir.join("logs").join(format!("{}.log", timestamp()));
     let mut options = LaunchOptions::new(&log_path);
     options.echo = echo;
+    let mod_snapshot = launcher.mods(name).ok();
     launcher.claim_running(name, std::process::id())?;
     let process = match tntl_launch::launch(&plan, &options) {
         Ok(process) => process,
@@ -1854,6 +1884,32 @@ fn cmd_launch(
     launcher.clear_running(name);
     if let Err(error) = launcher.record_playtime(name, outcome.duration_ms) {
         eprintln!("cannot record play time: {error:#}");
+    }
+    if let Some(snapshot) = mod_snapshot.as_ref() {
+        let reached = tntl_launch::reached_menu(&tntl_launch::read_tail(&outcome.log_path, 256 * 1024));
+        let record = match (outcome.exit_code, outcome.crash.as_ref()) {
+            (Some(0), None) => LaunchOutcome::Ok,
+            (_, Some(crash)) if crash.kind == CrashKind::Terminated && reached => LaunchOutcome::Ok,
+            (_, Some(crash)) if crash.kind == CrashKind::Terminated => LaunchOutcome::Unknown,
+            (_, Some(_)) => LaunchOutcome::Crash,
+            _ if reached => LaunchOutcome::Ok,
+            _ => LaunchOutcome::Unknown,
+        };
+        let summary = outcome
+            .crash
+            .as_ref()
+            .map(|crash| crash.summary.clone())
+            .unwrap_or_default();
+        if let Err(error) = launcher.record_launch(
+            name,
+            record,
+            outcome.duration_ms as u64,
+            outcome.exit_code,
+            &summary,
+            snapshot,
+        ) {
+            eprintln!("cannot record the launch history: {error:#}");
+        }
     }
     println!(
         "game exited with {:?} after {:.1}s",
@@ -2386,6 +2442,7 @@ fn cmd_search(launcher: &Launcher, args: SearchArgs<'_>) -> Result<i32> {
                 args.offset,
                 source,
                 args.version,
+                None,
             )?;
             (page.game_version, page.loader, page.hits, page.total_hits)
         }

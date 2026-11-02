@@ -445,6 +445,14 @@ pub fn read_tail(path: &Path, max_bytes: u64) -> String {
     String::from_utf8_lossy(&buffer).into_owned()
 }
 
+/// The client reached the main menu. This is the success criterion for a
+/// bisect launch: a crash after the menu (entering a world, a specific mod's
+/// UI) is not a startup failure. Both markers are logged by the vanilla sound
+/// engine after resource loading and mod construction.
+pub fn reached_menu(log: &str) -> bool {
+    log.contains("Sound engine started") || (log.contains("OpenAL initialized") && log.contains("Backend library:"))
+}
+
 pub fn diagnose(exit_code: Option<i32>, log: &str) -> Option<CrashReport> {
     if exit_code == Some(0) {
         return None;
@@ -571,6 +579,15 @@ mod tests {
     #[test]
     fn clean_exit_is_not_a_crash() {
         assert!(diagnose(Some(0), "anything").is_none());
+    }
+
+    #[test]
+    fn recognises_a_reached_menu() {
+        let log = "[12:00:00] [Render thread/INFO] [minecraft/SoundEngine]: Sound engine started\n";
+        assert!(reached_menu(log));
+        assert!(!reached_menu("Mod resolution failed"));
+        let openal = "Backend library: LWJGL version 3.3.1\nOpenAL initialized on device X\n";
+        assert!(reached_menu(openal));
     }
 
     #[test]

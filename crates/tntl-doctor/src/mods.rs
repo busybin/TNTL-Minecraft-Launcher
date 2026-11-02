@@ -548,6 +548,7 @@ mod tests {
             fabric_dependency: Vec::new(),
             fabric_dependency_ranges: BTreeMap::new(),
             blocked: None,
+            proven: false,
         }
     }
 
