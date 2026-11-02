@@ -28,6 +28,27 @@ struct SavedBisect {
     original: BTreeMap<String, bool>,
 }
 
+/// Puts the original switches back if the bisect unwinds before its normal
+/// restore step (panic in the launch path). A hard kill or power loss leaves
+/// `bisect-state.json` behind and the next start replays it.
+struct RestoreOnDrop<'a> {
+    launcher: &'a Launcher,
+    name: &'a str,
+    original: &'a BTreeMap<String, bool>,
+    state_path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl Drop for RestoreOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.launcher.set_mods_enabled(self.name, self.original);
+        let _ = std::fs::remove_file(&self.state_path);
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BisectModView {
     pub file: String,
@@ -240,6 +261,13 @@ impl Launcher {
                 original: original.clone(),
             },
         )?;
+        let mut restore_on_drop = RestoreOnDrop {
+            launcher: self,
+            name,
+            original: &original,
+            state_path: state_path.clone(),
+            armed: true,
+        };
 
         let mut session = Session::new(assembly);
         let mut test = session.start();
@@ -414,6 +442,7 @@ impl Launcher {
         };
 
         progress(BisectEvent::Restoring);
+        restore_on_drop.armed = false;
         let restore = self.set_mods_enabled(name, &original);
         if restore.is_ok() {
             let _ = std::fs::remove_file(&state_path);

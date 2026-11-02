@@ -80,7 +80,9 @@ about 10 launches for 100 mods. The UI shows the estimate before starting.
 ## Safety
 
 - The original enabled/disabled state is captured before the first test and
-  restored on success, error, cancel and launcher-side panic (Drop).
+  restored on success, error, cancel and launcher-side panic (Drop). A hard
+  kill or power loss leaves `bisect-state.json`; the next start replays it
+  once the stale `.running` marker is cleared.
 - Bisect launches are **not** written to `launch-history.json`: testing two jars
   is not proof that they work together.
 - `bisect-last.json` records the outcome, culprit file and launch count for
