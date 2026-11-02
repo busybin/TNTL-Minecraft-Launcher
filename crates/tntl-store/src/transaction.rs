@@ -235,11 +235,23 @@ pub fn recover(root: &Path, allowed: &[PathBuf]) -> Vec<String> {
         return problems;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // `file_type()` does not follow a symlink; a journal must be a real
+        // directory inside the transaction folder.
+        if !file_type.is_dir() {
             continue;
         }
+        let path = entry.path();
         let journal_path = path.join("journal.json");
+        let Ok(meta) = fs::metadata(&journal_path) else {
+            continue;
+        };
+        if meta.len() > 1024 * 1024 {
+            problems.push(format!("{} has an oversized journal", path.display()));
+            continue;
+        }
         let Ok(bytes) = fs::read(&journal_path) else {
             continue;
         };
@@ -248,6 +260,8 @@ pub fn recover(root: &Path, allowed: &[PathBuf]) -> Vec<String> {
             continue;
         };
         if journal.committed {
+            // Only the transaction folder itself (never a path from the
+            // journal) is removed here.
             let _ = fs::remove_dir_all(&path);
             continue;
         }

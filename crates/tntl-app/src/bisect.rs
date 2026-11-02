@@ -44,8 +44,11 @@ impl Drop for RestoreOnDrop<'_> {
         if !self.armed {
             return;
         }
-        let _ = self.launcher.set_mods_enabled(self.name, self.original);
-        let _ = std::fs::remove_file(&self.state_path);
+        // Keep the state file when the restore did not happen: `set_mods_enabled`
+        // refuses while the game is running, and the next start must retry.
+        if self.launcher.set_mods_enabled(self.name, self.original).is_ok() {
+            let _ = std::fs::remove_file(&self.state_path);
+        }
     }
 }
 

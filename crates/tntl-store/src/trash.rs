@@ -59,9 +59,13 @@ impl Trash {
         let (id, dir) = self.create_entry_dir(deleted_ms)?;
         let payload = dir.join("payload");
         // A cross-device move can fail after the copy but before the source is
-        // gone; that copy may be the only complete one. Keep it under `.trash`
-        // for manual recovery instead of deleting it.
-        move_path(path, &payload)?;
+        // gone; that copy may be the only complete one. Rename it to an
+        // unlisted orphan instead of deleting it, and keep "empty bin" away
+        // from names that start with a dot.
+        if let Err(error) = move_path(path, &payload) {
+            let _ = fs::rename(&dir, self.root.join(format!(".orphan-{id}")));
+            return Err(error);
+        }
         let bytes = size_of(&payload).unwrap_or(0);
         let record = Record {
             kind: kind.to_string(),
@@ -72,8 +76,10 @@ impl Trash {
         };
         if let Err(error) = atomic_write_json(&dir.join("entry.json"), &record) {
             // Only drop the entry when the payload is safely back at its
-            // original path; otherwise leave it for manual recovery.
-            if move_path(&payload, path).is_ok() {
+            // original path; otherwise leave it as an unlisted orphan.
+            if move_path(&payload, path).is_err() {
+                let _ = fs::rename(&dir, self.root.join(format!(".orphan-{id}")));
+            } else {
                 let _ = fs::remove_dir_all(&dir);
             }
             return Err(error);
@@ -156,6 +162,11 @@ impl Trash {
         let mut removed = 0;
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
+                continue;
+            }
+            // Hidden directories are unlisted orphans from a failed delete;
+            // clearing the bin must not destroy the only complete copy.
+            if entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
             fs::remove_dir_all(entry.path()).map_err(|source| StoreError::Io {
@@ -405,6 +416,18 @@ mod tests {
         trash.put(&base.join("b"), "mod", "B").unwrap();
         assert_eq!(trash.empty().unwrap(), 2);
         assert!(trash.list().is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn empty_keeps_unlisted_orphans() {
+        let base = dir("orphan");
+        let orphan = base.join(".trash/.orphan-1");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("payload"), b"only copy").unwrap();
+        let trash = Trash::new(base.join(".trash"));
+        assert_eq!(trash.empty().unwrap(), 0);
+        assert_eq!(fs::read(orphan.join("payload")).unwrap(), b"only copy");
         fs::remove_dir_all(base).unwrap();
     }
 }

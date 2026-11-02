@@ -90,9 +90,13 @@ fn io_err(path: &Path, source: io::Error) -> ArchiveError {
 
 fn skipped(relative: &Path) -> bool {
     relative.components().next().is_some_and(|part| match part {
-        Component::Normal(name) => name
-            .to_str()
-            .is_some_and(|name| SKIP.contains(&name.to_ascii_lowercase().as_str())),
+        Component::Normal(name) => {
+            // Win32 drops trailing dots and spaces from a name, so `.txn.`
+            // and `.txn ` land in `.txn`; strip them before matching.
+            let name = name.to_string_lossy();
+            let name = name.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+            SKIP.contains(&name.as_str())
+        }
         _ => false,
     })
 }
