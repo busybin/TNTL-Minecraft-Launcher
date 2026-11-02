@@ -848,7 +848,8 @@ mod tests {
         let game_dir = dir.join("game");
         let http = Http::new().unwrap();
         let mut seen = Vec::new();
-        pack.install(&http, &game_dir, None, &mut |event| seen.push(event)).unwrap();
+        pack.install(&http, &game_dir, None, &mut |event| seen.push(event))
+            .unwrap();
         server.join().unwrap();
         let last = seen
             .iter()
