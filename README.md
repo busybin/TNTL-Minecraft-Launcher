@@ -36,7 +36,8 @@ shell.
 - Architecture: [`docs/01-architecture.md`](docs/01-architecture.md)
 - Development workflow: [`docs/05-workflow.md`](docs/05-workflow.md)
 - Crash bisect: [`docs/04-bisect.md`](docs/04-bisect.md)
-- Signed updates: [`docs/06-update-signing.md`](docs/06-update-signing.md)
+- Signed updates: [`docs/06-update-signing.md`](docs/06-update-signing.md);
+  releases from V9 on ship a detached signature next to every asset.
 
 ## Screenshots
 

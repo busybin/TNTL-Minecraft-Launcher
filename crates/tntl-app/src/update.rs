@@ -331,13 +331,17 @@ fn verify_signature(path: &Path, public_key: &[u8], signature: &[u8]) -> Result<
         .map_err(|_| anyhow::anyhow!("the update signature does not match this build's public key"))
 }
 
-/// The release build embeds the key; a developer can still override it while
-/// testing with the environment variable.
+/// The release build embeds the key; debug builds may override it while
+/// testing. A shipped binary ignores the variable so a local process cannot
+/// swap the trust anchor of a published build.
 fn update_public_key() -> Option<String> {
-    std::env::var("TNTL_UPDATE_PUBKEY")
-        .ok()
-        .or_else(|| option_env!("TNTL_UPDATE_PUBKEY").map(str::to_string))
-        .filter(|value| !value.trim().is_empty())
+    let embedded = option_env!("TNTL_UPDATE_PUBKEY").map(str::to_string);
+    let configured = if cfg!(debug_assertions) {
+        std::env::var("TNTL_UPDATE_PUBKEY").ok().or(embedded)
+    } else {
+        embedded
+    };
+    configured.filter(|value| !value.trim().is_empty())
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
@@ -420,5 +424,42 @@ mod tests {
         assert!(!safe_url("https://evil.example/x.exe"));
         assert!(!safe_url("https://github.com.evil.example/x"));
         assert!(!safe_url("file:///etc/passwd"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_asset(name: &str, url: &str) -> RawAsset {
+        RawAsset {
+            name: name.to_string(),
+            browser_download_url: url.to_string(),
+            size: 1,
+            digest: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn picks_the_linux_asset_with_its_signature() {
+        let base = "https://github.com/busybin/TNTL-Minecraft-Launcher/releases/download/V9";
+        let asset = format!("{base}/TNTL_9_amd64.deb");
+        let signature = format!("{base}/TNTL_9_amd64.deb.sig");
+        let assets = vec![
+            linux_asset("TNTL_9_amd64.deb", &asset),
+            linux_asset("TNTL_9_amd64.deb.sig", &signature),
+        ];
+        let picked = pick_asset(&assets, InstallKind::Package).expect("deb asset");
+        assert_eq!(picked.name, "TNTL_9_amd64.deb");
+        assert_eq!(picked.signature_url.as_deref(), Some(signature.as_str()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ignores_a_signature_from_another_host() {
+        let base = "https://github.com/busybin/TNTL-Minecraft-Launcher/releases/download/V9";
+        let assets = vec![
+            linux_asset("TNTL_9_amd64.deb", &format!("{base}/TNTL_9_amd64.deb")),
+            linux_asset("TNTL_9_amd64.deb.sig", "https://evil.example/TNTL_9_amd64.deb.sig"),
+        ];
+        let picked = pick_asset(&assets, InstallKind::Package).expect("deb asset");
+        assert_eq!(picked.signature_url, None);
     }
 }
