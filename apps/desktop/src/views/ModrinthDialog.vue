@@ -124,6 +124,7 @@ async function loadCategories() {
   if (source.value === "curseforge" && !hasCurseforgeKey.value) {
     categories.value = [];
     category.value = "";
+    categoriesLoading.value = false;
     return;
   }
   const cacheKey = `${source.value}:${kind.value}`;

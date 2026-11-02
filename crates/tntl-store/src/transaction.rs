@@ -22,12 +22,15 @@ enum Entry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Journal {
     entries: Vec<Entry>,
+    #[serde(default)]
+    committed: bool,
 }
 
 pub struct FileTransaction {
     root: PathBuf,
     journal_path: PathBuf,
     entries: Vec<Entry>,
+    committed: bool,
     finished: bool,
 }
 
@@ -45,6 +48,7 @@ impl FileTransaction {
             root,
             journal_path,
             entries: Vec::new(),
+            committed: false,
             finished: false,
         };
         transaction.save_journal()?;
@@ -77,6 +81,11 @@ impl FileTransaction {
     }
 
     pub fn commit(mut self) -> Result<(), StoreError> {
+        // Mark the journal committed before deleting the backups. A crash
+        // between the two must not make recovery restore files that the new
+        // state already replaced.
+        self.committed = true;
+        self.save_journal()?;
         self.finished = true;
         fs::remove_dir_all(&self.root).map_err(|source| StoreError::Io {
             path: self.root.clone(),
@@ -131,6 +140,7 @@ impl FileTransaction {
             &self.journal_path,
             &Journal {
                 entries: self.entries.clone(),
+                committed: self.committed,
             },
         )
     }
@@ -164,10 +174,15 @@ pub fn recover(root: &Path) -> Vec<String> {
             problems.push(format!("{} has an unreadable journal", path.display()));
             continue;
         };
+        if journal.committed {
+            let _ = fs::remove_dir_all(&path);
+            continue;
+        }
         let mut transaction = FileTransaction {
             root: path.clone(),
             journal_path: journal_path.clone(),
             entries: journal.entries,
+            committed: false,
             finished: false,
         };
         if let Err(error) = transaction.restore() {
@@ -246,6 +261,26 @@ mod tests {
         assert!(!old.exists());
         assert!(!base.join("txn").exists());
         assert_eq!(fs::read(base.join("b.jar")).unwrap(), b"new");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_committed_journal_is_not_rolled_back() {
+        let base = dir("committed");
+        let old = base.join("a.jar");
+        fs::write(&old, b"old").unwrap();
+        let txn_root = base.join("txn");
+        {
+            let mut transaction = FileTransaction::new(txn_root.join("one")).unwrap();
+            transaction.trash(&old).unwrap();
+            transaction.committed = true;
+            transaction.save_journal().unwrap();
+            std::mem::forget(transaction);
+        }
+        let problems = recover(&txn_root);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!old.exists(), "a committed transaction must stay committed");
+        assert!(!txn_root.join("one").exists());
         fs::remove_dir_all(base).unwrap();
     }
 
