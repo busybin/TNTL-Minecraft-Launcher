@@ -162,6 +162,27 @@ fn modified_secs(meta: &fs::Metadata) -> Option<u64> {
         .map(|elapsed| elapsed.as_secs())
 }
 
+/// Inode/file index for the metadata cache. Atomic installs create a new file,
+/// so this catches a same-size rewrite even when the filesystem stores only
+/// two-second mtimes (FAT, exFAT, SMB).
+fn file_identity(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_index().unwrap_or_default()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
 /// Nanosecond mtime for the metadata cache; zero when the platform cannot say.
 fn modified_stamp(meta: &fs::Metadata) -> u128 {
     meta.modified()
@@ -211,6 +232,7 @@ pub fn scan_for(dir: &Path, loader: Option<ModLoader>, game_version: &str) -> io
             size: meta.as_ref().map(|meta| meta.len()).unwrap_or_default(),
             modified: meta.as_ref().and_then(modified_secs).unwrap_or_default(),
             stamp: meta.as_ref().map(modified_stamp).unwrap_or_default(),
+            identity: meta.as_ref().map(file_identity).unwrap_or_default(),
             cacheable: meta.is_some(),
         });
     }
@@ -257,6 +279,8 @@ struct PendingMod {
     /// Nanosecond mtime; part of the cache key so two writes in the same
     /// second are still told apart.
     stamp: u128,
+    /// Inode/file index; a same-size in-place rewrite can keep the mtime.
+    identity: u64,
     cacheable: bool,
 }
 
@@ -361,7 +385,14 @@ fn parse_all(pending: Vec<PendingMod>, neoforge_style: bool, loader: Option<ModL
 
 fn parse_mod(entry: &PendingMod, neoforge_style: bool, loader: Option<ModLoader>) -> ParsedMod {
     let (metadata, mut nested) = if entry.cacheable {
-        read_jar_cached(&entry.path, entry.size, entry.stamp, neoforge_style, loader)
+        read_jar_cached(
+            &entry.path,
+            entry.size,
+            entry.stamp,
+            entry.identity,
+            neoforge_style,
+            loader,
+        )
     } else {
         read_jar(&entry.path, neoforge_style, loader)
     };
@@ -417,6 +448,7 @@ struct JarKey {
     path: PathBuf,
     size: u64,
     stamp: u128,
+    identity: u64,
     neoforge: bool,
     loader: Option<ModLoader>,
 }
@@ -433,6 +465,7 @@ fn read_jar_cached(
     path: &Path,
     size: u64,
     stamp: u128,
+    identity: u64,
     neoforge_style: bool,
     loader: Option<ModLoader>,
 ) -> (Metadata, Vec<String>) {
@@ -440,6 +473,7 @@ fn read_jar_cached(
         path: path.to_path_buf(),
         size,
         stamp,
+        identity,
         neoforge: neoforge_style,
         loader,
     };

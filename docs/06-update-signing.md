@@ -41,6 +41,9 @@ openssl pkeyutl -sign -inkey update-key.pem -rawin -in /tmp/update-digest.txt \
   | xxd -p -c 256 > TNTL-9-win64.exe.sig
 ```
 
+Or run `scripts/sign-update.sh <asset> <key.pem>`, which also writes
+`<asset>.sig`.
+
 Upload the asset and its `.sig` to the same GitHub release. The launcher only
 accepts a `.sig` whose URL passes the same GitHub host/repository checks as the
 asset.

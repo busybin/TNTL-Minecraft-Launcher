@@ -2036,6 +2036,8 @@ impl Launcher {
         let mut files = self.curseforge_download(&http, &game_dir, &plans, pack_progress)?;
         // Install first, then drop files the new build no longer ships.
         let keep: HashSet<&str> = plans.iter().map(|plan| plan.path.as_str()).collect();
+        let mut transaction =
+            tntl_store::FileTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
         let mut removed = 0;
         for entry in &source.files {
             if keep.contains(entry.path.as_str()) {
@@ -2056,7 +2058,7 @@ impl Launcher {
             if !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1)) {
                 continue;
             }
-            if fs::remove_file(&path).is_ok() {
+            if transaction.trash(&path)? {
                 removed += 1;
             }
         }
@@ -2081,6 +2083,7 @@ impl Launcher {
         };
         tntl_store::atomic_write_json(&dir.join(CURSEFORGE_PACK_FILE), &updated)?;
         self.set_instance_version(&instance.name, &report.version_id)?;
+        transaction.commit()?;
 
         Ok(PackUpdateReport {
             instance: instance.name.clone(),
@@ -4130,7 +4133,9 @@ impl Launcher {
             // Install first, then drop files the new build no longer ships; a
             // failure halfway must not leave the instance without its mods.
             let files = pack.install(&http, &game_dir, &mut |event| pack_progress(event))?;
-            let removed = remove_stale_pack_files(&game_dir, &old_index, &pack.index);
+            let mut transaction =
+                tntl_store::FileTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
+            let removed = remove_stale_pack_files(&game_dir, &old_index, &pack.index, &mut transaction)?;
             tntl_store::atomic_write_json(&dir.join(PACK_FILE), &pack.index)?;
             tntl_store::atomic_write_json(
                 &dir.join(PACK_SOURCE_FILE),
@@ -4140,6 +4145,7 @@ impl Launcher {
                 },
             )?;
             self.set_instance_version(name, &report.version_id)?;
+            transaction.commit()?;
             Ok(PackUpdateReport {
                 instance: name.to_string(),
                 name: pack.name(),
@@ -4304,6 +4310,8 @@ impl Launcher {
         // Install first, then drop files the new build no longer ships; a
         // failure halfway must not leave the instance without its mods.
         let keep: HashSet<&str> = version.client_files().map(|file| file.path.as_str()).collect();
+        let mut transaction =
+            tntl_store::FileTransaction::new(dir.join(".txn").join(format!("pack-{}", unix_millis())))?;
         let mut removed = 0;
         for file in &source.files {
             if keep.contains(file.path.as_str()) {
@@ -4324,7 +4332,7 @@ impl Launcher {
             if !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1)) {
                 continue;
             }
-            if fs::remove_file(&path).is_ok() {
+            if transaction.trash(&path)? {
                 removed += 1;
             }
         }
@@ -4347,6 +4355,7 @@ impl Launcher {
         };
         tntl_store::atomic_write_json(&dir.join(FTB_FILE), &updated_source)?;
         self.set_instance_version(&instance.name, &report.version_id)?;
+        transaction.commit()?;
 
         Ok(PackUpdateReport {
             instance: instance.name.clone(),
@@ -4872,11 +4881,9 @@ impl Launcher {
             .map(|category| CategoryView {
                 key: category.name.clone(),
                 slug: category.name.clone(),
-                name: if category.header.trim().is_empty() {
-                    category.name
-                } else {
-                    category.header
-                },
+                // Modrinth's `header` is the group ("categories"), not a
+                // label. The slug is the only readable value it publishes.
+                name: category_label(&category.name),
                 icon: category.icon,
             })
             .collect();
@@ -6926,7 +6933,12 @@ fn pack_target(version: &tntl_modrinth::Version, in_place: bool) -> Option<PackT
 
 /// Remove files the previous pack build shipped and the new one dropped. Files
 /// the user changed are left alone.
-fn remove_stale_pack_files(game_dir: &Path, old: &PackIndex, new: &PackIndex) -> usize {
+fn remove_stale_pack_files(
+    game_dir: &Path,
+    old: &PackIndex,
+    new: &PackIndex,
+    transaction: &mut tntl_store::FileTransaction,
+) -> Result<usize> {
     let keep: HashSet<&str> = new
         .files
         .iter()
@@ -6952,11 +6964,11 @@ fn remove_stale_pack_files(game_dir: &Path, old: &PackIndex, new: &PackIndex) ->
         if !tntl_store::sha1_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(sha1)) {
             continue;
         }
-        if fs::remove_file(&path).is_ok() {
+        if transaction.trash(&path)? {
             removed += 1;
         }
     }
-    removed
+    Ok(removed)
 }
 
 /// Components Prism and MultiMC write into `mmc-pack.json`.
@@ -7843,6 +7855,22 @@ pub fn list_instances(launcher: &Launcher) -> Result<Vec<Instance>> {
     Ok(instances)
 }
 
+/// `game-mechanics` -> `Game mechanics`. Modrinth has no display name for a
+/// category, only the slug; its `header` field is the group heading.
+fn category_label(slug: &str) -> String {
+    slug.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn unix_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8286,6 +8314,14 @@ mod tests {
         assert!(mods.join("b.jar").is_file());
         assert!(!dir.join("bisect-state.json").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn category_slugs_get_readable_labels() {
+        assert_eq!(category_label("game-mechanics"), "Game Mechanics");
+        assert_eq!(category_label("optimization"), "Optimization");
+        assert_eq!(category_label("128x"), "128x");
+        assert_eq!(category_label(""), "");
     }
 
     #[test]
@@ -9469,7 +9505,9 @@ mod tests {
             files: vec![pack_file("mods/keep.jar", "aa")],
             ..PackIndex::default()
         };
-        assert_eq!(remove_stale_pack_files(&dir, &old, &new), 2);
+        let mut transaction = tntl_store::FileTransaction::new(dir.join(".txn/pack-test")).unwrap();
+        assert_eq!(remove_stale_pack_files(&dir, &old, &new, &mut transaction).unwrap(), 2);
+        transaction.commit().unwrap();
         assert!(!dir.join("mods/old.jar").exists());
         assert!(dir.join("mods/edited.jar").exists());
         assert!(!dir.join("mods/off.jar.disabled").exists());
