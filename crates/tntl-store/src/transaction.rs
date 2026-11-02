@@ -1,12 +1,12 @@
 //! Small crash-aware file transaction for destructive install/update steps.
 //!
-//! The pattern is: move the old file into a transaction folder, apply the new
-//! state, then either commit (delete the folder) or roll back (move the old
-//! file back). A journal is written after every move so a launcher crash
-//! between two steps can be recovered on the next start.
+//! The pattern is: record the move, move the old file into a transaction
+//! folder, apply the new state, then either commit (delete the folder) or roll
+//! back (move the old file back). The journal is written before every move so
+//! a crash between two steps can be recovered on the next start.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,20 @@ struct Journal {
     entries: Vec<Entry>,
     #[serde(default)]
     committed: bool,
+}
+
+impl Entry {
+    /// Journal entries are data, not commands: only paths inside the instance
+    /// (or the transaction folder) may be replayed. A journal planted by an
+    /// imported archive must not delete or move files elsewhere.
+    fn contained(&self, root: &Path, allowed: &[PathBuf]) -> bool {
+        match self {
+            Entry::Moved { original, backup } => {
+                within(original, allowed) && within(backup, std::slice::from_ref(&root.to_path_buf()))
+            }
+            Entry::Created { path } => within(path, allowed),
+        }
+    }
 }
 
 pub struct FileTransaction {
@@ -56,7 +70,10 @@ impl FileTransaction {
         Ok(transaction)
     }
 
-    /// Move an existing file into the transaction folder.
+    /// Move an existing file into the transaction folder. The journal records
+    /// the move before it happens, so a crash or a failed journal write never
+    /// loses the file: recovery sees a missing backup and leaves the original
+    /// alone.
     pub fn trash(&mut self, path: &Path) -> Result<bool, StoreError> {
         if !path.exists() {
             return Ok(false);
@@ -66,12 +83,19 @@ impl FileTransaction {
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
         let backup = self.root.join(format!("{}-{name}", self.entries.len()));
-        move_file(path, &backup)?;
         self.entries.push(Entry::Moved {
             original: path.to_path_buf(),
-            backup,
+            backup: backup.clone(),
         });
-        self.save_journal()?;
+        if let Err(error) = self.save_journal() {
+            self.entries.pop();
+            return Err(error);
+        }
+        if let Err(error) = move_file(path, &backup) {
+            self.entries.pop();
+            let _ = self.save_journal();
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -134,12 +158,10 @@ impl FileTransaction {
                 move_file(backup, original)?;
             }
         }
-        if self.root.exists() {
-            fs::remove_dir_all(&self.root).map_err(|source| StoreError::Io {
-                path: self.root.clone(),
-                source,
-            })?;
-        }
+        // Do not delete the whole folder: a failed journal write can leave a
+        // backup that no entry points at, and that file is the only copy.
+        let _ = fs::remove_file(&self.journal_path);
+        let _ = fs::remove_dir(&self.root);
         Ok(())
     }
 
@@ -204,8 +226,10 @@ impl Drop for FileTransaction {
 }
 
 /// Restore a transaction that did not reach commit (launcher crash, power
-/// loss). Called for every journal found under `root`.
-pub fn recover(root: &Path) -> Vec<String> {
+/// loss). Called for every journal found under `root`. `allowed` bounds the
+/// paths a journal may touch (the instance and its game directory); a journal
+/// with an entry outside them is left alone and reported.
+pub fn recover(root: &Path, allowed: &[PathBuf]) -> Vec<String> {
     let mut problems = Vec::new();
     let Ok(entries) = fs::read_dir(root) else {
         return problems;
@@ -227,6 +251,13 @@ pub fn recover(root: &Path) -> Vec<String> {
             let _ = fs::remove_dir_all(&path);
             continue;
         }
+        if let Some(outside) = journal.entries.iter().find(|entry| !entry.contained(&path, allowed)) {
+            problems.push(format!(
+                "{} points outside the instance and was not replayed: {outside:?}",
+                path.display()
+            ));
+            continue;
+        }
         let mut transaction = FileTransaction {
             root: path.clone(),
             journal_path: journal_path.clone(),
@@ -241,6 +272,29 @@ pub fn recover(root: &Path) -> Vec<String> {
     problems
 }
 
+/// A path may be replayed when it has no `..` and its parent resolves inside
+/// one of the roots. Checking the parent (not the file) also covers files that
+/// the transaction removed already.
+fn within(path: &Path, roots: &[PathBuf]) -> bool {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(parent) = parent.canonicalize() else {
+        return false;
+    };
+    roots.iter().any(|root| {
+        root.canonicalize()
+            .map(|root| parent.starts_with(root))
+            .unwrap_or(false)
+    })
+}
+
 fn move_file(from: &Path, to: &Path) -> Result<(), StoreError> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent).map_err(|source| StoreError::Io {
@@ -251,10 +305,29 @@ fn move_file(from: &Path, to: &Path) -> Result<(), StoreError> {
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
-            fs::copy(from, to).map_err(|source| StoreError::Io {
-                path: to.to_path_buf(),
-                source,
-            })?;
+            // Copy to a sibling first: a crash mid-copy must not leave a
+            // partial file at the path recovery will move back.
+            let partial = to.with_file_name(format!(
+                "{}.partial",
+                to.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "copy".to_string())
+            ));
+            let _ = fs::remove_file(&partial);
+            if let Err(source) = fs::copy(from, &partial) {
+                let _ = fs::remove_file(&partial);
+                return Err(StoreError::Io {
+                    path: to.to_path_buf(),
+                    source,
+                });
+            }
+            if let Err(source) = fs::rename(&partial, to) {
+                let _ = fs::remove_file(&partial);
+                return Err(StoreError::Io {
+                    path: to.to_path_buf(),
+                    source,
+                });
+            }
             fs::remove_file(from).map_err(|source| StoreError::Io {
                 path: from.to_path_buf(),
                 source,
@@ -367,7 +440,7 @@ mod tests {
             transaction.save_journal().unwrap();
             std::mem::forget(transaction);
         }
-        let problems = recover(&txn_root);
+        let problems = recover(&txn_root, std::slice::from_ref(&base));
         assert!(problems.is_empty(), "{problems:?}");
         assert!(!old.exists(), "a committed transaction must stay committed");
         assert!(!txn_root.join("one").exists());
@@ -386,9 +459,29 @@ mod tests {
             std::mem::forget(transaction);
         }
         assert!(!old.exists());
-        let problems = recover(&txn_root);
+        let problems = recover(&txn_root, std::slice::from_ref(&base));
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(fs::read(&old).unwrap(), b"old");
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn recover_refuses_a_journal_that_points_outside() {
+        let base = dir("outside-journal");
+        let outside = dir("outside-target");
+        let file = outside.join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        let txn_root = base.join("txn");
+        {
+            let mut transaction = FileTransaction::new(txn_root.join("one")).unwrap();
+            transaction.track_created(&file).unwrap();
+            std::mem::forget(transaction);
+        }
+        let problems = recover(&txn_root, std::slice::from_ref(&base));
+        assert!(!problems.is_empty(), "an outside entry must be reported");
+        assert!(file.exists(), "an outside file must not be removed");
+        assert!(txn_root.join("one").exists(), "the journal is kept for inspection");
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

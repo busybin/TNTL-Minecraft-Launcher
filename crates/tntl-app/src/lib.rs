@@ -945,18 +945,27 @@ impl Launcher {
         };
         for entry in instances.flatten() {
             let dir = entry.path();
-            if !dir.is_dir() || !dir.join("instance.json").is_file() || dir.join(RUNNING_FILE).is_file() {
+            if !dir.is_dir() || !dir.join("instance.json").is_file() {
                 continue;
             }
-            let problems = tntl_store::transaction::recover(&dir.join(".txn"));
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Only a live game skips recovery. A marker left behind by a
+            // killed launcher used to hide an unfinished transaction and an
+            // unfinished bisect forever; `running_pid` drops stale markers.
+            if dir.join(RUNNING_FILE).is_file() && self.running_pid(&name).is_some() {
+                continue;
+            }
+            let game_dir = Instance::load(&dir)
+                .map(|instance| instance.game_dir(&dir))
+                .unwrap_or_else(|_| dir.join("minecraft"));
+            let problems = tntl_store::transaction::recover(&dir.join(".txn"), &[dir.clone(), game_dir]);
             for problem in problems {
                 eprintln!("cannot recover an interrupted file transaction: {problem}");
             }
-            if dir.join("bisect-state.json").is_file() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if let Err(error) = self.recover_bisect_state(&name) {
-                    eprintln!("cannot restore an interrupted mod bisect: {error:#}");
-                }
+            if dir.join("bisect-state.json").is_file()
+                && let Err(error) = self.recover_bisect_state(&name)
+            {
+                eprintln!("cannot restore an interrupted mod bisect: {error:#}");
             }
         }
     }

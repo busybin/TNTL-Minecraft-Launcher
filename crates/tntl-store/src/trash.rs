@@ -56,17 +56,12 @@ impl Trash {
             source,
         })?;
         let deleted_ms = unix_millis();
-        let id = self.unique_id(deleted_ms);
-        let dir = self.root.join(&id);
-        fs::create_dir(&dir).map_err(|source| StoreError::Io {
-            path: dir.clone(),
-            source,
-        })?;
+        let (id, dir) = self.create_entry_dir(deleted_ms)?;
         let payload = dir.join("payload");
-        if let Err(error) = move_path(path, &payload) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(error);
-        }
+        // A cross-device move can fail after the copy but before the source is
+        // gone; that copy may be the only complete one. Keep it under `.trash`
+        // for manual recovery instead of deleting it.
+        move_path(path, &payload)?;
         let bytes = size_of(&payload).unwrap_or(0);
         let record = Record {
             kind: kind.to_string(),
@@ -76,8 +71,11 @@ impl Trash {
             deleted_ms,
         };
         if let Err(error) = atomic_write_json(&dir.join("entry.json"), &record) {
-            let _ = move_path(&payload, path);
-            let _ = fs::remove_dir_all(&dir);
+            // Only drop the entry when the payload is safely back at its
+            // original path; otherwise leave it for manual recovery.
+            if move_path(&payload, path).is_ok() {
+                let _ = fs::remove_dir_all(&dir);
+            }
             return Err(error);
         }
         Ok(TrashEntry {
@@ -125,12 +123,14 @@ impl Trash {
         let (dir, record) = self.load(id)?;
         let original = record.original.clone();
         if !restore_allowed(&original, allowed) {
+            let message = if original.parent().is_some_and(|parent| !parent.exists()) {
+                "the original folder no longer exists"
+            } else {
+                "restore target is outside the instance"
+            };
             return Err(StoreError::Io {
                 path: original,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "restore target is outside the instance",
-                ),
+                source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, message),
             });
         }
         if original.exists() {
@@ -186,14 +186,20 @@ impl Trash {
         Ok((dir, record))
     }
 
-    fn unique_id(&self, millis: u64) -> String {
+    /// Create the entry directory, retrying when a concurrent delete claimed
+    /// the same millisecond. `create_dir` is the atomic test.
+    fn create_entry_dir(&self, millis: u64) -> Result<(String, PathBuf), StoreError> {
         let mut attempt = 0u32;
         loop {
             let id = format!("{millis:x}-{attempt:x}");
-            if !self.root.join(&id).exists() {
-                return id;
+            let dir = self.root.join(&id);
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok((id, dir)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    attempt += 1;
+                }
+                Err(source) => return Err(StoreError::Io { path: dir, source }),
             }
-            attempt += 1;
         }
     }
 }

@@ -40,6 +40,13 @@ const SKIP: &[&str] = &[
     "options.txt.tntl-bak",
     ".tntl-skin.sha1",
     "tntl-skin.zip",
+    // Launcher-owned state. Import must not recreate it: a journal, a running
+    // marker or a bisect state file from an archive would be replayed.
+    ".running",
+    "bisect-state.json",
+    "bisect-last.json",
+    "launch-history.json",
+    "mod-problems.json",
 ];
 const GAME_PREFIX: &str = "minecraft";
 
@@ -360,6 +367,9 @@ fn extract(zip: &mut zip::ZipArchive<File>, prefix: &str, target: &Path) -> Resu
         if path.as_os_str().is_empty() || path.components().any(|part| !matches!(part, Component::Normal(_))) {
             return Err(ArchiveError::UnsafeEntry(name));
         }
+        if skipped(&path) {
+            continue;
+        }
         let destination = target.join(&path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| io_err(parent, error))?;
@@ -429,6 +439,36 @@ mod tests {
 
         assert!(import(&archive, &target, "Test").is_err());
         assert!(import(&archive, &target, "../escape").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn import_drops_launcher_state_files() {
+        let dir = temp_dir("state");
+        let archive = dir.join("state.zip");
+        {
+            let mut zip = zip::ZipWriter::new(BufWriter::new(File::create(&archive).unwrap()));
+            let options = SimpleFileOptions::default();
+            zip.start_file("instance.json", options).unwrap();
+            zip.write_all(br#"{"name":"Test","version_id":"1.20.1"}"#).unwrap();
+            for name in [
+                ".txn/one/journal.json",
+                ".running",
+                "bisect-state.json",
+                "launch-history.json",
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(b"{}").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let target = dir.join("imported");
+        fs::create_dir_all(&target).unwrap();
+        let imported = import(&archive, &target, "Test").unwrap();
+        assert!(!imported.join(".txn").exists());
+        assert!(!imported.join(".running").exists());
+        assert!(!imported.join("bisect-state.json").exists());
+        assert!(!imported.join("launch-history.json").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
