@@ -4,10 +4,6 @@
   <img src="assets/logo.png" alt="TNTL" width="180">
 </p>
 
-<p align="center">
-  <a href="https://buymeacoffee.com/busybin"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="56"></a>
-</p>
-
 TNTL stands for **TNT Launcher**. It is a Minecraft launcher for **Windows and
 Linux**, built from scratch: a Rust core, a headless CLI and a Tauri 2 desktop
 shell. It is in beta, and the current release is a test build.
