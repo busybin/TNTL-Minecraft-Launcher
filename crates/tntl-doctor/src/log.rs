@@ -594,6 +594,29 @@ fn mod_runtime_findings(lines: &[&str], lower: &[String]) -> Vec<Finding> {
         findings.push(finding);
     }
 
+    if let Some(index) = first(lower, &["did not modify any bytecode"]) {
+        let rule = between(lines[index], "rule '", "'")
+            .or_else(|| between(lines[index], "rule \"", "\""))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // CustomSkinLoader has a known flag for this; naming it saves the
+        // user from hunting through the log.
+        let code = if rule.to_ascii_lowercase().contains("customskinloader") {
+            "skin_patch_failed"
+        } else {
+            "mod_patch_failed"
+        };
+        let mut finding = Finding::new(Severity::Error, code)
+            .param("rule", rule.clone())
+            .evidence(lines[index])
+            .line(index);
+        if let Some((mod_id, _)) = rule.split_once(':') {
+            finding = finding.subject(mod_id.to_string());
+        }
+        findings.push(finding);
+    }
+
     let modded = platform
         || lower
             .iter()

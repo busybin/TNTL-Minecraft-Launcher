@@ -270,6 +270,18 @@ const packStatus = ref<string | null>(null);
 const shaderStatus = ref<string | null>(null);
 const bundleStatus = ref<string | null>(null);
 const modFile = ref("");
+/** Files finished out of the number picked for a bulk update. */
+const modBatchDone = ref(0);
+const modBatchTotal = ref(0);
+/** Per-file byte counters while several updates download at once. */
+const modInflight = new Map<string, { done: number; total: number | null }>();
+/** Catalogue tags of the installed mods, used by the category filter. */
+const modCategories = ref<Record<string, string[]>>({});
+const modCategory = ref("");
+let categoriesInstance: string | null = null;
+const modUpdateBar = ref<HTMLElement | null>(null);
+const packUpdateBar = ref<HTMLElement | null>(null);
+const shaderUpdateBar = ref<HTMLElement | null>(null);
 const {
   bytes: modBytes,
   total: modTotal,
@@ -859,13 +871,38 @@ function onCheckProgress(event: { kind: ProjectKind; done: number; total: number
 }
 
 function onProgress(event: ModProgress) {
+  if (event.stage === "batch") {
+    if (event.total > 1 && modBatchTotal.value === 0) modInflight.clear();
+    modBatchDone.value = event.done;
+    modBatchTotal.value = event.total;
+    return;
+  }
   if (event.stage === "downloading") {
     const size = event.total ? `${formatBytes(event.done)} / ${formatBytes(event.total)}` : formatBytes(event.done);
     modFile.value = event.file;
-    trackMod(event.done, event.total);
+    if (modBatchTotal.value > 1) {
+      // Several downloads share the bar: count them together so the byte
+      // figure and the rate stay meaningful.
+      modInflight.set(event.file, { done: event.done, total: event.total });
+      let done = 0;
+      let total = 0;
+      for (const entry of modInflight.values()) {
+        done += entry.done;
+        if (entry.total === null) total = -1;
+        else if (total >= 0) total += entry.total;
+      }
+      trackMod(done, total > 0 ? total : null);
+    } else {
+      trackMod(event.done, event.total);
+    }
     modStatus.value = t("modrinth.progress", { name: event.project, size });
   } else if (event.stage === "resolving") {
-    resetMod();
+    // Parallel workers resolve one after another; resetting the shared byte
+    // counter here would wipe the downloads still running.
+    if (modBatchTotal.value <= 1) {
+      resetMod();
+      modInflight.clear();
+    }
     modStatus.value = t("modrinth.resolving", { name: event.project });
   }
 }
@@ -896,6 +933,7 @@ async function reloadMods() {
     const instance = config.value?.name ?? props.name;
     mods.value = await api.listMods(instance);
     modsLoaded.value = true;
+    void loadCategories();
     await nextTick();
     observeModRows();
   } catch (cause) {
@@ -1475,18 +1513,54 @@ async function checkKind(kind: ProjectKind) {
 
 async function applyUpdates(kind: ProjectKind, files: string[]) {
   updating.value = files.length === 1 ? files[0] : "*";
+  modBatchDone.value = 0;
+  modBatchTotal.value = 0;
+  modInflight.clear();
   if (kind === "mod") resetMod();
   error.value = null;
+  // Bring the bar into view: a long mod list used to leave the progress above
+  // the fold, so a bulk update looked frozen.
+  void scrollToUpdateBar(kind);
   try {
     const applied = await api.updateContent(props.name, kind, files);
     setStatus(kind, applied.length ? t("editor.updated", { count: applied.length }) : t("editor.nothingToUpdate"));
     setUpdates(kind, files.length ? updatesOf(kind).filter((update) => !files.includes(update.file)) : []);
-    if (kind === "mod") await reloadMods();
-    else await reloadContent();
+    if (kind === "mod") {
+      categoriesInstance = null;
+      await reloadMods();
+    } else await reloadContent();
   } catch (cause) {
     error.value = String(cause);
+    // A parallel batch can fail one file and still install the rest; show
+    // what is actually on disk instead of the pre-update list.
+    if (kind === "mod") {
+      categoriesInstance = null;
+      await reloadMods();
+    }
   } finally {
     updating.value = null;
+    modBatchTotal.value = 0;
+    modBatchDone.value = 0;
+  }
+}
+
+async function scrollToUpdateBar(kind: ProjectKind) {
+  await nextTick();
+  const bar =
+    kind === "mod" ? modUpdateBar.value : kind === "resourcepack" ? packUpdateBar.value : shaderUpdateBar.value;
+  bar?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+/** Catalogue tags arrive late; the filter simply stays hidden until then. */
+async function loadCategories() {
+  const instance = config.value?.name ?? props.name;
+  if (categoriesInstance === instance) return;
+  categoriesInstance = instance;
+  try {
+    const tags = await api.modCategories(instance);
+    if (categoriesInstance === instance) modCategories.value = tags;
+  } catch {
+    if (categoriesInstance === instance) categoriesInstance = null;
   }
 }
 
@@ -1851,6 +1925,12 @@ const filteredMods = computed(() => {
     if (modIssue.value === "duplicate" && !tags.some((tag) => tag.kind === "duplicate")) return false;
     if (modIssue.value === "blocked" && !tags.some((tag) => tag.kind === "blocked")) return false;
     if (modIssue.value === "missing" && !tags.some((tag) => tag.kind === "missing")) return false;
+    if (modCategory.value) {
+      const categories = modCategories.value[mod.file] ?? [];
+      if (modCategory.value === "__none" ? categories.length > 0 : !categories.includes(modCategory.value)) {
+        return false;
+      }
+    }
     if (!needle) return true;
     return (
       mod.name.toLowerCase().includes(needle) ||
@@ -1863,6 +1943,19 @@ const filteredMods = computed(() => {
 });
 
 watch(filteredMods, () => void nextTick(observeModRows), { flush: "post" });
+
+/** Categories present in this instance, most-used first. */
+const categoryOptions = computed(() => {
+  const counts = new Map<string, number>();
+  for (const mod of mods.value) {
+    for (const tag of modCategories.value[mod.file] ?? []) {
+      counts.set(tag, (counts.get(tag) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+});
 
 const filteredPacks = computed(() => {
   const list = matchFiles(resourcePacks.value, packFilter.value);
@@ -2993,14 +3086,22 @@ async function openPath(path: string) {
             :busy="updating"
             @apply="(files) => applyUpdates('mod', files)"
           />
-          <TransferBar
-            v-if="updating !== null || depsBusy"
-            :label="t('editor.updating')"
-            :done="modBytes"
-            :total="modTotal"
-            :speed="modSpeed"
-            :detail="modFile"
-          />
+          <div ref="modUpdateBar">
+            <TransferBar
+              v-if="updating !== null || depsBusy"
+              :label="
+                modBatchTotal > 1
+                  ? t('editor.updatingCount', { done: modBatchDone, total: modBatchTotal })
+                  : t('editor.updating')
+              "
+              :done="modBytes"
+              :total="modBatchTotal > 1 ? null : modTotal"
+              :speed="modSpeed"
+              :detail="modFile"
+              :files-done="modBatchTotal ? modBatchDone : null"
+              :files-total="modBatchTotal || null"
+            />
+          </div>
           <p v-if="!modUpdates.length && modStatus" class="hint">{{ modStatus }}</p>
           <div v-if="mods.length" class="filter-row">
             <input
@@ -3028,12 +3129,24 @@ async function openPath(path: string) {
               <option value="blocked">{{ t("editor.filterBlocked", { count: modIssueCounts.blocked }) }}</option>
               <option value="missing">{{ t("editor.filterMissing", { count: modIssueCounts.missing }) }}</option>
             </select>
+            <select v-if="categoryOptions.length" v-model="modCategory" class="sort" :title="t('editor.categoryFilter')">
+              <option value="">{{ t("editor.categoryAll") }}</option>
+              <option value="__none">{{ t("editor.categoryNone") }}</option>
+              <option v-for="option in categoryOptions" :key="option.name" :value="option.name">
+                {{ option.name }} · {{ option.count }}
+              </option>
+            </select>
             <select v-model="modSort" class="sort" :title="t('editor.sort')">
               <option value="name">{{ t("editor.sortName") }}</option>
               <option value="size">{{ t("editor.sortSize") }}</option>
               <option value="modified">{{ t("editor.sortModified") }}</option>
             </select>
-            <span v-if="modFilter.trim() || modOnlyDisabled || modOnlyUnproven || showIgnoredMods || modIssue !== 'all'" class="count">
+            <span
+              v-if="
+                modFilter.trim() || modOnlyDisabled || modOnlyUnproven || showIgnoredMods || modIssue !== 'all' || modCategory
+              "
+              class="count"
+            >
               {{ filteredMods.length }}/{{ mods.length }}
             </span>
           </div>
@@ -3136,6 +3249,22 @@ async function openPath(path: string) {
             :busy="updating"
             @apply="(files) => applyUpdates('resourcepack', files)"
           />
+          <div ref="packUpdateBar">
+            <TransferBar
+              v-if="updating !== null"
+              :label="
+                modBatchTotal > 1
+                  ? t('editor.updatingCount', { done: modBatchDone, total: modBatchTotal })
+                  : t('editor.updating')
+              "
+              :done="modBytes"
+              :total="modBatchTotal > 1 ? null : modTotal"
+              :speed="modSpeed"
+              :detail="modFile"
+              :files-done="modBatchTotal ? modBatchDone : null"
+              :files-total="modBatchTotal || null"
+            />
+          </div>
           <p v-if="!packUpdates.length && packStatus" class="hint">{{ packStatus }}</p>
           <div v-if="resourcePacks.length" class="filter-row">
             <input v-model="packFilter" class="filter" spellcheck="false" :placeholder="t('editor.filterFiles')" />
@@ -3226,6 +3355,22 @@ async function openPath(path: string) {
             :busy="updating"
             @apply="(files) => applyUpdates('shader', files)"
           />
+          <div ref="shaderUpdateBar">
+            <TransferBar
+              v-if="updating !== null"
+              :label="
+                modBatchTotal > 1
+                  ? t('editor.updatingCount', { done: modBatchDone, total: modBatchTotal })
+                  : t('editor.updating')
+              "
+              :done="modBytes"
+              :total="modBatchTotal > 1 ? null : modTotal"
+              :speed="modSpeed"
+              :detail="modFile"
+              :files-done="modBatchTotal ? modBatchDone : null"
+              :files-total="modBatchTotal || null"
+            />
+          </div>
           <p v-if="!shaderUpdates.length && shaderStatus" class="hint">{{ shaderStatus }}</p>
           <div v-if="shaders.length" class="filter-row">
             <input v-model="shaderFilter" class="filter" spellcheck="false" :placeholder="t('editor.filterFiles')" />

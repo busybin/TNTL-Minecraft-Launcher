@@ -197,17 +197,42 @@ function holdToast() {
   }
 }
 
-function pushLine(line: string) {
-  consoleLines.value.push(line);
-  if (consoleLines.value.length > 4000) {
-    consoleLines.value.splice(0, consoleLines.value.length - 4000);
+/** Lines the game emitted since the last paint; see `flushLines`. */
+let lineBuffer: string[] = [];
+let lineTimer: number | null = null;
+
+function flushLines() {
+  if (lineTimer !== null) {
+    window.clearTimeout(lineTimer);
+    lineTimer = null;
   }
+  if (!lineBuffer.length) return;
+  const lines = consoleLines.value;
+  lines.push(...lineBuffer);
+  lineBuffer = [];
+  if (lines.length > 4000) lines.splice(0, lines.length - 4000);
+}
+
+/** A running game emits lines faster than the view can paint them; collect
+ *  them for a moment so one batch costs one render instead of hundreds. */
+function pushLine(line: string) {
+  lineBuffer.push(line);
+  if (lineTimer === null) lineTimer = window.setTimeout(flushLines, 120);
+}
+
+function clearLines() {
+  if (lineTimer !== null) {
+    window.clearTimeout(lineTimer);
+    lineTimer = null;
+  }
+  lineBuffer = [];
+  consoleLines.value = [];
 }
 
 async function launch(name: string) {
   busy.value = name;
   error.value = null;
-  consoleLines.value = [];
+  clearLines();
   consoleExit.value = null;
   consoleTitle.value = name;
   consoleInstance.value = name;
@@ -297,7 +322,7 @@ async function showLog(name: string) {
   consoleTitle.value = t("app.lastLog", { name });
   consoleInstance.value = name;
   consoleExit.value = null;
-  consoleLines.value = [];
+  clearLines();
   logLoading.value = true;
   consoleOpen.value = true;
   try {
@@ -769,6 +794,9 @@ onMounted(async () => {
       }),
     () =>
       events.onGameExit(async (exit) => {
+        // Paint the final lines before showing the window again: a long tail
+        // used to keep the launcher unresponsive right after a crash.
+        flushLines();
         consoleExit.value = exit;
         if (running.value === exit.instance) running.value = null;
         await getCurrentWindow().show();

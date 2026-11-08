@@ -2516,6 +2516,7 @@ fn cmd_add(
                     println!("already installed {title} ({})", role(dependency, kind))
                 }
                 ModEvent::Downloading { .. } => {}
+                ModEvent::Batch { .. } => {}
             })?
         }
         None => launcher.install_projects(
@@ -2537,6 +2538,7 @@ fn cmd_add(
                     println!("already installed {title} ({})", role(dependency, kind))
                 }
                 ModEvent::Downloading { .. } => {}
+                ModEvent::Batch { .. } => {}
             },
         )?,
     };
@@ -2563,6 +2565,7 @@ fn cmd_updates(
                 title, version, file, ..
             } => println!("updated {title} to {version} ({file})"),
             ModEvent::Skipped { .. } | ModEvent::Downloading { .. } => {}
+            ModEvent::Batch { done, total } => println!("{done} / {total}"),
         })?;
         if json {
             println!("{}", serde_json::to_string_pretty(&applied)?);

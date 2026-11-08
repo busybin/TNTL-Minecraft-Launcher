@@ -74,6 +74,22 @@ const visible = computed(() => {
   return items;
 });
 
+/** Rows the webview can paint without a stall. A crash log can hold tens of
+ *  thousands of lines; the tail is what the user reads anyway. */
+const RENDER_CAP = 1500;
+const shown = computed(() => {
+  const items = visible.value;
+  if (items.length <= RENDER_CAP) return items;
+  let start = items.length - RENDER_CAP;
+  // Keep a jump target reachable even when it is far above the tail.
+  if (highlighted.value !== null) {
+    const at = items.findIndex((item) => item.index === highlighted.value);
+    if (at >= 0 && at < start) start = Math.max(0, at - 100);
+  }
+  return items.slice(start);
+});
+const hiddenBefore = computed(() => visible.value.length - shown.value.length);
+
 const filteredFindings = computed<Finding[]>(() => {
   const needle = search.value.trim().toLowerCase();
   if (!needle) return findings.value;
@@ -204,12 +220,13 @@ watch(tab, async (next) => {
 
     <div v-else ref="body" class="log scroll" @scroll="onScroll">
       <p v-if="loading" class="empty">{{ t("log.loading") }}</p>
-      <p v-else-if="!visible.length" class="empty">
+      <p v-else-if="!shown.length" class="empty">
         {{ tab === "problems" && !search.trim() ? t("log.noProblems") : t("log.noMatch") }}
       </p>
       <template v-else>
+        <p v-if="hiddenBefore" class="empty hidden-before">{{ t("log.hiddenOlder", { count: hiddenBefore }) }}</p>
         <div
-          v-for="item in visible"
+          v-for="item in shown"
           :key="item.index"
           class="row"
           :class="[lineClass(item.level), { hit: highlighted === item.index }]"

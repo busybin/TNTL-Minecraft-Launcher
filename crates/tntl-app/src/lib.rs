@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -183,6 +184,10 @@ pub const CURSEFORGE_PACK_FILE: &str = "curseforge.pack.json";
 /// or shader came from. Modrinth files are otherwise recognised by sha1, but
 /// search results carry no hashes, so the browser needs this to mark them.
 pub const MODRINTH_CONTENT_FILE: &str = "modrinth.content.json";
+
+/// `<instance>/mod-categories.json`: catalogue tags of the installed mods so
+/// the mod list can filter by them without asking Modrinth on every visit.
+pub const MOD_CATEGORY_FILE: &str = "mod-categories.json";
 
 /// Launcher-wide settings kept next to `instances/`.
 pub const SETTINGS_FILE: &str = "launcher.json";
@@ -5517,6 +5522,111 @@ impl Launcher {
         Ok(ContentSources::load(&self.content_sources_path(name)?))
     }
 
+    /// Catalogue tags (Modrinth categories) of the instance's mods,
+    /// `file -> tags`. Answers are cached per file and invalidated when the jar
+    /// changes; jars no catalogue knows come back with an empty list.
+    pub fn mod_categories(&self, name: &str) -> Result<BTreeMap<String, Vec<String>>> {
+        let instance = self.load_instance(name)?;
+        let instance_dir = self.instance_dir(name)?;
+        let dir = tntl_instance::mods::mods_dir(&instance.game_dir(&instance_dir));
+        let mods = self.mods(name)?;
+        let cache_path = instance_dir.join(MOD_CATEGORY_FILE);
+        let mut cache = ModCategoryCache::load(&cache_path);
+        let sidecar = ModrinthContent::load(&self.modrinth_content_path(name)?);
+        let mut result = BTreeMap::new();
+        let mut by_project: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut hashes: Vec<String> = Vec::new();
+        let mut hash_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for module in &mods {
+            if let Some(entry) = cache.files.get(&module.file)
+                && entry.size == module.size
+                && entry.modified == module.modified
+            {
+                result.insert(module.file.clone(), entry.categories.clone());
+                continue;
+            }
+            let key = ModrinthContent::key(ProjectKind::Mod, &module.file);
+            let project = sidecar.files.get(&key).or_else(|| {
+                let plain = ModrinthContent::key(ProjectKind::Mod, strip_disabled(&module.file));
+                sidecar.files.get(&plain)
+            });
+            if let Some(project) = project {
+                by_project.entry(project.clone()).or_default().push(module.file.clone());
+                continue;
+            }
+            if let Ok(sha1) = tntl_store::sha1_file(&dir.join(&module.file)) {
+                let sha1 = sha1.to_ascii_lowercase();
+                hash_files.entry(sha1.clone()).or_default().push(module.file.clone());
+                hashes.push(sha1);
+            }
+        }
+        let http = Http::new()?;
+        let modrinth = Modrinth::new(&http);
+        let mut looked_up: HashSet<String> = HashSet::new();
+        for chunk in hashes.chunks(100) {
+            let Ok(versions) = modrinth.versions_by_hashes(chunk) else {
+                continue;
+            };
+            looked_up.extend(chunk.iter().cloned());
+            for (hash, version) in versions {
+                if version.project_id.is_empty() {
+                    continue;
+                }
+                if let Some(files) = hash_files.get(&hash.to_ascii_lowercase()) {
+                    by_project
+                        .entry(version.project_id.clone())
+                        .or_default()
+                        .extend(files.iter().cloned());
+                }
+            }
+        }
+        let ids: Vec<String> = by_project.keys().cloned().collect();
+        let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut read: HashSet<String> = HashSet::new();
+        for chunk in ids.chunks(50) {
+            let Ok(projects) = modrinth.projects(chunk) else {
+                continue;
+            };
+            read.extend(chunk.iter().cloned());
+            for project in projects {
+                let list = project
+                    .categories
+                    .into_iter()
+                    .filter(|tag| !is_loader_tag(tag))
+                    .collect();
+                tags.insert(project.id, list);
+            }
+        }
+        let resolved: HashSet<&str> = by_project.values().flatten().map(String::as_str).collect();
+        for (project, files) in &by_project {
+            if !read.contains(project) {
+                continue;
+            }
+            let project_tags = tags.get(project).cloned().unwrap_or_default();
+            for file in files {
+                result.insert(file.clone(), project_tags.clone());
+                remember_category(&mut cache, &mods, file, project_tags.clone());
+            }
+        }
+        // A jar Modrinth has no build for will not gain tags later; remember
+        // the miss so the next visit skips reading and hashing it.
+        for hash in &looked_up {
+            if let Some(files) = hash_files.get(hash) {
+                for file in files.iter().filter(|file| !resolved.contains(file.as_str())) {
+                    result.insert(file.clone(), Vec::new());
+                    remember_category(&mut cache, &mods, file, Vec::new());
+                }
+            }
+        }
+        cache
+            .files
+            .retain(|file, _| mods.iter().any(|module| &module.file == file));
+        if let Err(error) = cache.save(&cache_path) {
+            eprintln!("{error:#}");
+        }
+        Ok(result)
+    }
+
     fn modrinth_content_path(&self, name: &str) -> Result<PathBuf> {
         Ok(self.instance_dir(name)?.join(MODRINTH_CONTENT_FILE))
     }
@@ -6062,28 +6172,66 @@ impl Launcher {
                 .map(|entry| entry.file)
                 .collect()
         };
+        let total = selected.len();
+        progress(tntl_modrinth::InstallEvent::Batch { done: 0, total });
         let mut touched = false;
         let mut applied = Vec::new();
-        for update in &selected {
-            let keep_on = switched_on.contains(&update.file);
-            if keep_on {
-                // Clear the old name before the file disappears.
-                self.set_content_enabled(name, kind, &update.file, false)?;
+        if kind == ProjectKind::Mod {
+            // Updates are independent downloads: run several at once so a
+            // batch of hundreds does not crawl. Sidecar edits wait until every
+            // file has landed.
+            let results = download_updates(&modrinth, &dir, &selected, self.settings().concurrency, progress);
+            // Keep going on a failure: the other files are already on disk and
+            // their CurseForge records still have to be written before the
+            // first error is reported.
+            let mut failure: Option<anyhow::Error> = None;
+            for (update, result) in selected.iter().zip(results) {
+                let installed = match result {
+                    Ok(installed) => installed,
+                    Err(error) => {
+                        if failure.is_none() {
+                            failure = Some(anyhow::anyhow!("{}: {error}", update.name));
+                        }
+                        continue;
+                    }
+                };
+                if let Some((_, entry)) = curseforge.iter().find(|(candidate, _)| candidate.file == update.file) {
+                    sources.remove(kind, &update.file);
+                    sources.record(kind, &installed.file, entry.clone());
+                    touched = true;
+                }
+                applied.push(installed);
             }
-            let installed = modrinth.apply_update(&dir, update, &mut |event| progress(event))?;
-            if keep_on {
-                self.set_content_enabled(name, kind, &installed.file, true)?;
+            if let Some(error) = failure {
+                if touched {
+                    sources.save(&self.content_sources_path(name)?)?;
+                }
+                return Err(error);
             }
-            if let Some((_, entry)) = curseforge.iter().find(|(candidate, _)| candidate.file == update.file) {
-                sources.remove(kind, &update.file);
-                sources.record(kind, &installed.file, entry.clone());
-                touched = true;
-            }
-            if kind != ProjectKind::Mod {
+        } else {
+            for update in &selected {
+                let keep_on = switched_on.contains(&update.file);
+                if keep_on {
+                    // Clear the old name before the file disappears.
+                    self.set_content_enabled(name, kind, &update.file, false)?;
+                }
+                let installed = modrinth.apply_update(&dir, update, &mut |event| progress(event))?;
+                progress(tntl_modrinth::InstallEvent::Batch {
+                    done: applied.len() + 1,
+                    total,
+                });
+                if keep_on {
+                    self.set_content_enabled(name, kind, &installed.file, true)?;
+                }
+                if let Some((_, entry)) = curseforge.iter().find(|(candidate, _)| candidate.file == update.file) {
+                    sources.remove(kind, &update.file);
+                    sources.record(kind, &installed.file, entry.clone());
+                    touched = true;
+                }
                 modrinth_record.rename(kind, &update.file, &installed.file);
                 record_touched = true;
+                applied.push(installed);
             }
-            applied.push(installed);
         }
         if touched {
             sources.save(&self.content_sources_path(name)?)?;
@@ -6606,6 +6754,36 @@ pub struct ContentFile {
     pub min_format: Option<u32>,
     #[serde(default)]
     pub max_format: Option<u32>,
+}
+
+/// Sidecar of [`MOD_CATEGORY_FILE`]: per mod file, the size and date it was
+/// looked up at plus the catalogue tags that came back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModCategoryCache {
+    #[serde(default)]
+    pub files: BTreeMap<String, ModCategoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModCategoryEntry {
+    pub size: u64,
+    pub modified: u64,
+    #[serde(default)]
+    pub categories: Vec<String>,
+}
+
+impl ModCategoryCache {
+    fn load(path: &Path) -> Self {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        tntl_store::atomic_write_json(path, self)?;
+        Ok(())
+    }
 }
 
 /// Sidecar of [`MODRINTH_CONTENT_FILE`]: `resourcepacks/x.zip` -> project id.
@@ -7569,6 +7747,85 @@ fn existing_locals(dir: &Path, entries: Vec<(String, SourceEntry)>) -> Vec<(Stri
                 None
             }
         })
+        .collect()
+}
+
+/// Tags Modrinth stores next to the real categories; they say nothing about
+/// what the mod does, so the category filter ignores them.
+fn is_loader_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "fabric" | "forge" | "neoforge" | "quilt" | "liteloader" | "rift" | "datapack"
+    )
+}
+
+fn remember_category(
+    cache: &mut ModCategoryCache,
+    mods: &[tntl_instance::mods::ModInfo],
+    file: &str,
+    categories: Vec<String>,
+) {
+    if let Some(module) = mods.iter().find(|module| module.file == file) {
+        cache.files.insert(
+            file.to_string(),
+            ModCategoryEntry {
+                size: module.size,
+                modified: module.modified,
+                categories,
+            },
+        );
+    }
+}
+
+/// Apply updates in order, several at a time. Results line up with `updates`.
+fn download_updates(
+    modrinth: &Modrinth<'_>,
+    dir: &Path,
+    updates: &[ModUpdate],
+    concurrency: usize,
+    progress: &(dyn Fn(tntl_modrinth::InstallEvent) + Send + Sync),
+) -> Vec<Result<InstalledMod, String>> {
+    let total = updates.len();
+    let workers = concurrency.clamp(1, 16).min(total.max(1));
+    if workers <= 1 {
+        return updates
+            .iter()
+            .enumerate()
+            .map(|(index, update)| {
+                let result = modrinth
+                    .apply_update(dir, update, &mut |event| progress(event))
+                    .map_err(|error| error.to_string());
+                progress(tntl_modrinth::InstallEvent::Batch { done: index + 1, total });
+                result
+            })
+            .collect();
+    }
+    let next = AtomicUsize::new(0);
+    let finished = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<Result<InstalledMod, String>>>> = Mutex::new((0..total).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if index >= total {
+                        break;
+                    }
+                    let result = modrinth
+                        .apply_update(dir, &updates[index], &mut |event| progress(event))
+                        .map_err(|error| error.to_string());
+                    let done = finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    progress(tntl_modrinth::InstallEvent::Batch { done, total });
+                    slots.lock().unwrap_or_else(|poison| poison.into_inner())[index] = Some(result);
+                }
+            });
+        }
+    });
+    slots
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| Err("no download result".to_string())))
         .collect()
 }
 

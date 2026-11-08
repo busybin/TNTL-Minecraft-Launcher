@@ -521,6 +521,7 @@ export interface DependencyFixReport {
 }
 
 export type ModProgress =
+  | { stage: "batch"; done: number; total: number }
   | { stage: "resolving"; project: string }
   | { stage: "downloading"; project: string; file: string; done: number; total: number | null }
   | {
@@ -933,6 +934,7 @@ export const api = {
   importInstance: (path: string, name: string | null, version: string | null) =>
     invoke<string>("import_instance", { path, name, version }),
   listMods: (name: string) => invoke<ModInfo[]>("list_mods", { name }),
+  modCategories: (name: string) => invoke<Record<string, string[]>>("mod_categories", { name }),
   diagnoseInstance: (name: string) => invoke<DiagnosticReport>("diagnose_instance", { name }),
   analyzeLog: (text: string) => invoke<LogAnalysis>("analyze_log", { text }),
   modProblemIgnores: (name: string) =>

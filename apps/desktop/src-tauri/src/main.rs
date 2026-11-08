@@ -841,6 +841,18 @@ async fn list_mods(state: State<'_, AppState>, name: String) -> Result<Vec<tntl_
         .map_err(message)?
 }
 
+/// Catalogue tags of the installed mods, for the category filter.
+#[tauri::command]
+async fn mod_categories(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || launcher.mod_categories(&name).map_err(message))
+        .await
+        .map_err(message)?
+}
+
 #[tauri::command]
 async fn mod_problem_ignores(
     state: State<'_, AppState>,
@@ -3225,6 +3237,7 @@ fn main() {
             import_candidates,
             import_instance,
             list_mods,
+            mod_categories,
             diagnose_instance,
             analyze_log,
             set_mod_enabled,

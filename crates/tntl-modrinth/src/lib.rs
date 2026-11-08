@@ -255,6 +255,9 @@ pub struct Project {
     pub title: String,
     #[serde(default)]
     pub project_type: String,
+    /// Catalogue tags; loaders and game versions are tagged here as well.
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -323,6 +326,11 @@ pub struct VersionFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum InstallEvent {
+    /// Progress of a multi-file run: files finished out of the batch size.
+    Batch {
+        done: usize,
+        total: usize,
+    },
     Resolving {
         project: String,
     },
@@ -459,6 +467,16 @@ impl<'a> Modrinth<'a> {
 
     pub fn project(&self, id: &str) -> Result<Project, ModrinthError> {
         let url = format!("{}/project/{}", endpoints::MODRINTH_API, encode(id));
+        self.get_json(&url)
+    }
+
+    /// Several projects in one request. Unknown ids are simply left out.
+    pub fn projects(&self, ids: &[String]) -> Result<Vec<Project>, ModrinthError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string());
+        let url = format!("{}/projects?ids={}", endpoints::MODRINTH_API, encode(&list));
         self.get_json(&url)
     }
 
