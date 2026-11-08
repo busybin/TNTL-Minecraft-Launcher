@@ -3018,6 +3018,12 @@ fn restore_instance(state: State<'_, AppState>, name: String) -> Result<(), Stri
     state_launcher(&state).restore_instance(&name).map_err(message)
 }
 
+/// Stop listing a removed entry for good. Files are left where they are.
+#[tauri::command]
+fn dismiss_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    state_launcher(&state).dismiss_instance(&name).map_err(message)
+}
+
 /// Instance folders the library cannot read, so the user can open or drop them.
 #[tauri::command]
 async fn broken_instances(state: State<'_, AppState>) -> Result<Vec<tntl_app::BrokenInstance>, String> {
@@ -3185,6 +3191,7 @@ fn main() {
             unregister_version,
             restore_version,
             restore_instance,
+            dismiss_instance,
             broken_instances,
             removed_instances,
             forget_instance_dir,

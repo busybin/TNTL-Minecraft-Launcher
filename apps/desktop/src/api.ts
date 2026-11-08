@@ -832,6 +832,8 @@ export const api = {
   // Removal only hides the entry; the files stay where they are.
   deleteInstance: (name: string) => invoke<InstanceLocation>("delete_instance", { name }),
   restoreInstance: (name: string) => invoke<void>("restore_instance", { name }),
+  // Drops a removed entry for good; its files are still left alone.
+  dismissInstance: (name: string) => invoke<void>("dismiss_instance", { name }),
   brokenInstances: () => invoke<BrokenInstance[]>("broken_instances"),
   removedInstances: () => invoke<RemovedInstance[]>("removed_instances"),
   forgetInstanceDir: (name: string) => invoke<string>("forget_instance_dir", { name }),

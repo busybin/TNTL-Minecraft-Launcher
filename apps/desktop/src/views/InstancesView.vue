@@ -21,6 +21,7 @@ defineEmits<{
   remove: [name: string];
   forgetDir: [name: string];
   restore: [name: string];
+  dismiss: [name: string];
   openPath: [path: string];
   new: [];
   importMc: [];
@@ -386,6 +387,9 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
         >{{ t("app.openConfigFolder") }}</button>
         <button class="ghost small" @click="$emit('restore', entry.name)">
           <Icon name="refresh" :size="13" />{{ t("instances.restore") }}
+        </button>
+        <button class="ghost small" @click="$emit('dismiss', entry.name)">
+          <Icon name="close" :size="13" />{{ t("instances.dismiss") }}
         </button>
       </div>
     </section>

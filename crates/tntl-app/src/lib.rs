@@ -264,11 +264,14 @@ pub struct Hidden {
     pub schema: u32,
     pub instances: Vec<String>,
     pub versions: Vec<String>,
+    /// Entries the user dismissed for good. They stay out of the library and
+    /// the maintenance list even while their files remain on disk.
+    pub dismissed: Vec<String>,
 }
 
 impl Hidden {
     pub fn hides_instance(&self, name: &str) -> bool {
-        self.instances.iter().any(|entry| entry == name)
+        self.instances.iter().any(|entry| entry == name) || self.dismissed.iter().any(|entry| entry == name)
     }
 
     pub fn hides_version(&self, id: &str) -> bool {
@@ -338,7 +341,7 @@ impl Default for LauncherSettings {
     fn default() -> Self {
         Self {
             concurrency: 8,
-            hide_on_launch: true,
+            hide_on_launch: false,
             quit_on_launch: false,
             theme: "dark".to_string(),
             background: None,
@@ -2252,10 +2255,37 @@ impl Launcher {
     /// Entries the user removed from the library. A missing or broken file
     /// means "nothing is hidden", which only makes entries reappear.
     pub fn hidden(&self) -> Hidden {
-        fs::read(self.hidden_path())
+        let mut hidden: Hidden = fs::read(self.hidden_path())
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Names whose folder is gone can never come back; leaving them in the
+        // file only makes it grow. A directory that cannot be read at all is
+        // left alone: a transient permission or mount problem must not erase
+        // the list.
+        if self.prune_hidden(&mut hidden) {
+            let _ = self.save_hidden(&hidden);
+        }
+        hidden
+    }
+
+    fn prune_hidden(&self, hidden: &mut Hidden) -> bool {
+        let mut changed = false;
+        let instances = self.instances_dir();
+        if fs::read_dir(&instances).is_ok() {
+            for list in [&mut hidden.instances, &mut hidden.dismissed] {
+                let before = list.len();
+                list.retain(|name| instances.join(name).is_dir());
+                changed |= list.len() != before;
+            }
+        }
+        let versions = self.layout().versions_dir();
+        if fs::read_dir(&versions).is_ok() {
+            let before = hidden.versions.len();
+            hidden.versions.retain(|id| versions.join(id).is_dir());
+            changed |= hidden.versions.len() != before;
+        }
+        changed
     }
 
     fn save_hidden(&self, hidden: &Hidden) -> Result<()> {
@@ -2276,7 +2306,10 @@ impl Launcher {
         self.ensure_not_running(name)?;
         let location = self.instance_location(name)?;
         let mut hidden = self.hidden();
-        if !hidden.hides_instance(name) {
+        // A new entry replaced a dismissed one: the hide list, not the
+        // tombstone, now decides its visibility.
+        hidden.dismissed.retain(|entry| entry != name);
+        if !hidden.instances.iter().any(|entry| entry == name) {
             hidden.instances.push(name.to_string());
             hidden.instances.sort();
         }
@@ -2288,6 +2321,21 @@ impl Launcher {
         validate_name(name)?;
         let mut hidden = self.hidden();
         hidden.instances.retain(|entry| entry != name);
+        hidden.dismissed.retain(|entry| entry != name);
+        self.save_hidden(&hidden)
+    }
+
+    /// Stop listing a removed entry for good. Files are left alone; the name
+    /// is remembered so neither the maintenance list nor a rescan brings it
+    /// back.
+    pub fn dismiss_instance(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        let mut hidden = self.hidden();
+        hidden.instances.retain(|entry| entry != name);
+        if !hidden.dismissed.iter().any(|entry| entry == name) {
+            hidden.dismissed.push(name.to_string());
+            hidden.dismissed.sort();
+        }
         self.save_hidden(&hidden)
     }
 
@@ -2344,6 +2392,7 @@ impl Launcher {
         let Ok(entries) = fs::read_dir(layout.versions_dir()) else {
             return false;
         };
+        let wanted_loader = split_loader_version(&instance.version_id);
         let mut found = None;
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
@@ -2356,7 +2405,17 @@ impl Launcher {
             let Ok(json) = serde_json::from_slice::<VersionJson>(&bytes) else {
                 continue;
             };
-            if json.id != instance.version_id {
+            let matches = json.id == instance.version_id
+                || wanted_loader.as_ref().is_some_and(|(kind, build)| {
+                    let game = environment_from_chain(&id, std::slice::from_ref(&json)).game_version;
+                    installed_loader(std::slice::from_ref(&json), &game).is_some_and(|(found_kind, found_build)| {
+                        // Forge reports `1.20.1-47.1.106`, the JSON id often
+                        // only says `47.1.106`.
+                        found_kind == *kind
+                            && (found_build == build.as_str() || found_build.ends_with(&format!("-{build}")))
+                    })
+                });
+            if !matches {
                 continue;
             }
             if found.is_some() {
@@ -2754,9 +2813,13 @@ impl Launcher {
             }
         };
         let mut hidden = self.hidden();
-        if !hidden.hides_instance(name) {
-            hidden.instances.push(name.to_string());
-            hidden.instances.sort();
+        // Forgetting a broken folder is final: putting it in the removed list
+        // would offer "restore" for something that cannot be loaded, and the
+        // row would come straight back.
+        hidden.instances.retain(|entry| entry != name);
+        if !hidden.dismissed.iter().any(|entry| entry == name) {
+            hidden.dismissed.push(name.to_string());
+            hidden.dismissed.sort();
         }
         self.save_hidden(&hidden)?;
         Ok(dir)
@@ -7178,6 +7241,30 @@ pub fn supports_quick_play(game_version: &str) -> bool {
         .is_some_and(|minor| minor >= 20)
 }
 
+/// Loader build a version id names (`neoforge-21.1.244`,
+/// `fabric-loader-0.16.10`). Launchers name the patch folder after the build
+/// while the JSON inside may carry another id, so this gives a renamed folder
+/// a way back to its instance.
+fn split_loader_version(id: &str) -> Option<(LoaderKind, String)> {
+    let id = id.trim();
+    let lower = id.to_ascii_lowercase();
+    for (prefix, kind) in [
+        ("neoforge-", LoaderKind::NeoForge),
+        ("forge-", LoaderKind::Forge),
+        ("fabric-loader-", LoaderKind::Fabric),
+        ("quilt-loader-", LoaderKind::Quilt),
+    ] {
+        // `1.20.1-forge-47.1.106` puts the game version first.
+        if let Some(position) = lower.find(prefix) {
+            let build = &id[position + prefix.len()..];
+            if build.starts_with(|c: char| c.is_ascii_digit()) {
+                return Some((kind, build.to_string()));
+            }
+        }
+    }
+    None
+}
+
 /// Loader build an instance chain carries, in the version form
 /// `loader_versions` reports (Forge keeps its `<game>-<build>` text).
 fn installed_loader(chain: &[VersionJson], game: &str) -> Option<(LoaderKind, String)> {
@@ -8848,11 +8935,64 @@ mod tests {
         let dir = launcher.forget_instance_dir("broken").unwrap();
         assert!(dir.join(tntl_instance::INSTANCE_FILE).is_file());
         assert!(launcher.broken_instances().iter().all(|entry| entry.name != "broken"));
-        assert_eq!(launcher.removed_instances().len(), 1);
-        assert_eq!(launcher.removed_instances()[0].name, "broken");
+        // Forgetting is final: the row must not move into the removed list
+        // where it can only be "restored" to a broken state again.
+        assert!(launcher.removed_instances().is_empty());
+        assert!(
+            list_instances(&launcher)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.name != "broken")
+        );
 
         launcher.restore_instance("broken").unwrap();
         assert!(launcher.broken_instances().iter().any(|entry| entry.name == "broken"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removed_entries_can_be_dismissed_and_stale_names_are_pruned() {
+        let root = std::env::temp_dir().join(format!("tntl-dismiss-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        launcher.create_instance(&Instance::new("gone", "1.20.1")).unwrap();
+        launcher.unregister_instance("gone").unwrap();
+        assert_eq!(launcher.removed_instances().len(), 1);
+
+        launcher.dismiss_instance("gone").unwrap();
+        assert!(launcher.removed_instances().is_empty());
+        assert!(list_instances(&launcher).unwrap().is_empty());
+        // Dismissing only forgets the entry; every file stays.
+        let dir = launcher.instance_dir("gone").unwrap();
+        assert!(dir.join(tntl_instance::INSTANCE_FILE).is_file());
+
+        // A name whose folder is gone is dropped from the file, so the list
+        // cannot keep growing with entries that can never return.
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(launcher.hidden().dismissed.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn instance_finds_a_profile_renamed_after_its_loader_build() {
+        let root = std::env::temp_dir().join(format!("tntl-adopt-loader-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let json = launcher.layout().version_json("1.21.1-NeoForge");
+        fs::create_dir_all(json.parent().unwrap()).unwrap();
+        fs::write(
+            &json,
+            r#"{"id":"1.21.1-NeoForge","libraries":[{"name":"net.neoforged:neoforge:21.1.244"}]}"#,
+        )
+        .unwrap();
+        launcher
+            .create_instance(&Instance::new("neo", "neoforge-21.1.244"))
+            .unwrap();
+
+        let loaded = launcher.load_instance("neo").unwrap();
+        assert_eq!(loaded.version_id, "1.21.1-NeoForge");
         let _ = fs::remove_dir_all(&root);
     }
 

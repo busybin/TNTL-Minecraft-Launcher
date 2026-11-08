@@ -100,7 +100,7 @@ const modpackOpen = ref(false);
 const modpackPath = ref<string | null>(null);
 const settings = ref<LauncherSettings>({
   concurrency: 8,
-  hide_on_launch: true,
+  hide_on_launch: false,
   quit_on_launch: false,
   theme: "dark",
   background: null,
@@ -219,8 +219,16 @@ async function launch(name: string) {
     await refresh();
     running.value = name;
     consoleOpen.value = true;
+    const window = getCurrentWindow();
     if (settings.value.hide_on_launch) {
-      await getCurrentWindow().hide().catch(() => undefined);
+      await window.hide().catch(() => undefined);
+    } else {
+      // Stay in front so the live log and its diagnosis are readable while
+      // the game boots. A user who wants the old behaviour turns the setting
+      // on; it no longer happens silently.
+      await window.unminimize().catch(() => undefined);
+      await window.show().catch(() => undefined);
+      await window.setFocus().catch(() => undefined);
     }
   } catch (cause) {
     const message = String(cause);
@@ -370,6 +378,18 @@ async function restoreRemoved(name: string) {
   try {
     await api.restoreInstance(name);
     notify(t("instances.restored", { name }));
+    await refresh();
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+/** Drop a removed entry for good; its folder and files are kept. */
+async function dismissRemoved(name: string) {
+  if (!window.confirm(t("instances.dismissConfirm", { name }))) return;
+  try {
+    await api.dismissInstance(name);
+    notify(t("instances.dismissed", { name }));
     await refresh();
   } catch (cause) {
     error.value = String(cause);
@@ -909,6 +929,7 @@ onUnmounted(() => {
             @remove="remove"
             @forget-dir="forgetDir"
             @restore="restoreRemoved"
+            @dismiss="dismissRemoved"
             @open-path="openAnyPath"
             @new="goPage('install')"
             @import-mc="openImport()"
