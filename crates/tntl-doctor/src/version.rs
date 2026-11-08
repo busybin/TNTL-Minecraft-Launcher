@@ -406,7 +406,10 @@ enum Part {
 
 impl Version {
     fn parse(text: &str) -> Option<Self> {
-        let text = text.trim();
+        // Semver build metadata (`0.8.13+mc1.21.1`) is not part of
+        // precedence. Keeping it made the whole string sort below `0.8.13`
+        // because the `mc1` chunk became a text pre-release.
+        let text = text.split_once('+').map_or(text, |(base, _)| base).trim();
         if text.is_empty() {
             return None;
         }
@@ -628,6 +631,17 @@ mod tests {
         yes("1.1.25a", "[1.1.25a,)");
         // A dotted pre-release keeps sorting below the release itself.
         no("1.20-pre1", ">=1.20");
+    }
+
+    #[test]
+    fn build_metadata_is_ignored() {
+        // Sodium and Eunomia publish `+mc1.21.1`; the health check used to
+        // report a dependency mismatch because that suffix sorted below the
+        // base version.
+        yes("0.8.13+mc1.21.1", "[0.8.13,0.9)");
+        yes("0.3.15+mc-1.21.0-1", "[0.3.15,)");
+        yes("1.21.1-3.7.2+build.5", "[1.21-3.1.0c,]");
+        no("0.8.12+mc1.21.1", "[0.8.13,)");
     }
 
     #[test]

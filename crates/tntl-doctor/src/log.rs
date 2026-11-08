@@ -252,14 +252,22 @@ fn collect(lines: &[&str], lower: &[String], counts: &Counts) -> Vec<Finding> {
     findings.extend(missing_dependencies(lines, lower));
     findings.extend(mod_file_findings(lines, lower));
     findings.extend(mod_runtime_findings(lines, lower));
+    // The report is appended at the end of the log, so the last header wins and
+    // only exceptions below it belong to the crash. Scanning from the top used
+    // to return unrelated noise from earlier in the run.
     if findings.iter().all(|finding| finding.code != "mod_crash")
-        && lower
+        && let Some(header) = lower
             .iter()
-            .any(|line| line.contains("---- minecraft crash report ----"))
-        && let Some(index) = lines.iter().position(|line| {
-            let text = line.trim_start();
-            text.starts_with("java.") && (text.contains("Exception") || text.contains("Error"))
-        })
+            .rposition(|line| line.contains("---- minecraft crash report ----"))
+        && let Some(index) = lines
+            .iter()
+            .enumerate()
+            .skip(header + 1)
+            .find(|(_, line)| {
+                let text = line.trim_start();
+                text.starts_with("java.") && (text.contains("Exception") || text.contains("Error"))
+            })
+            .map(|(index, _)| index)
     {
         let culprit = failing_mod(lines);
         let message = culprit
@@ -597,12 +605,16 @@ fn mod_runtime_findings(lines: &[&str], lower: &[String]) -> Vec<Finding> {
     if let Some(index) = first(lower, &["did not modify any bytecode"]) {
         let rule = between(lines[index], "rule '", "'")
             .or_else(|| between(lines[index], "rule \"", "\""))
+            // Mixin 0.8.7 reports the rule as `Patch '<rule>' matched ...`.
+            .or_else(|| between(lines[index], "Patch '", "'"))
             .unwrap_or_default()
             .trim()
             .to_string();
         // CustomSkinLoader has a known flag for this; naming it saves the
         // user from hunting through the log.
-        let code = if rule.to_ascii_lowercase().contains("customskinloader") {
+        let code = if rule.to_ascii_lowercase().contains("customskinloader")
+            || lines[index].to_ascii_lowercase().contains("customskinloader")
+        {
             "skin_patch_failed"
         } else {
             "mod_patch_failed"
@@ -921,5 +933,50 @@ mod tests {
                     .get("exception")
                     .is_some_and(|value| value.contains("NullPointerException"))
         }));
+    }
+
+    #[test]
+    fn crash_report_wins_over_earlier_noise() {
+        // The real 102 log had an unrelated `java.` line thousands of lines
+        // before the appended report; the doctor reported that line instead of
+        // the actual failure.
+        let text = "[10:00:00] [Worker/INFO] [some.Mod/]: java.lang.IllegalStateException: benign probe\n\
+                    [10:30:00] [Render thread/INFO]: ---- Minecraft Crash Report ----\n\
+                    Description: mouseClicked event handler\n\
+                    java.lang.NullPointerException: the real cause\n\
+                    \tat com.example.Mod.call(Mod.java:1)";
+        let analysis = analyze(text);
+        let finding = analysis
+            .findings
+            .iter()
+            .find(|finding| finding.code == "mod_crash")
+            .expect("expected a mod crash");
+        assert!(
+            finding
+                .params
+                .get("exception")
+                .is_some_and(|value| value.contains("NullPointerException")),
+            "{:?}",
+            finding.params
+        );
+    }
+
+    #[test]
+    fn xml_skin_patch_failure_names_the_rule() {
+        let text = "java.lang.IllegalStateException: Patch 'customskinloader:skin-manager-patch:skin-manager.<init>.v1' matched protocol 0 but did not modify any bytecode.";
+        let analysis = analyze(text);
+        let finding = analysis
+            .findings
+            .iter()
+            .find(|finding| finding.code == "skin_patch_failed")
+            .expect("expected a skin patch failure");
+        assert!(
+            finding
+                .params
+                .get("rule")
+                .is_some_and(|value| value.contains("skin-manager")),
+            "{:?}",
+            finding.params
+        );
     }
 }

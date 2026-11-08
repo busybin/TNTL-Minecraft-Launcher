@@ -517,6 +517,35 @@ pub fn diagnose(exit_code: Option<i32>, log: &str) -> Option<CrashReport> {
             &["Open the mod list and read the missing dependency message."],
         ));
     }
+    // A patch that matched but changed nothing is a loader/mod conflict, and
+    // CustomSkinLoader documents the exact switch that turns it into a warning.
+    if log.contains("did not modify any bytecode") {
+        let rule = between(log, "Patch '", "'")
+            .or_else(|| between(log, "rule '", "'"))
+            .unwrap_or("unknown patch");
+        let custom = rule.to_ascii_lowercase().contains("customskinloader")
+            || log.to_ascii_lowercase().contains("customskinloader");
+        if custom {
+            return Some(report(
+                CrashKind::Unknown,
+                &format!("CustomSkinLoader could not apply its skin patch ({rule})."),
+                &[
+                    "Add -Dcustomskinloader.ignorePatchFailure=true to the instance's JVM arguments, or use a build made for this loader.",
+                ],
+            ));
+        }
+        return Some(report(
+            CrashKind::Unknown,
+            &format!("A mod patch did not apply ({rule})."),
+            &["Update or disable the mod whose patch failed."],
+        ));
+    }
+    // The crash report is written at the end of the log and names the real
+    // failure. The last line is often a shutdown watchdog or a secondary
+    // thread, so prefer the report whenever one is present.
+    if let Some(summary) = crash_report_summary(log) {
+        return Some(report(CrashKind::Unknown, &summary, &[]));
+    }
     let last = log
         .lines()
         .rev()
@@ -528,6 +557,32 @@ pub fn diagnose(exit_code: Option<i32>, log: &str) -> Option<CrashReport> {
         &format!("Game exited with {exit_code:?}: {last}"),
         &[],
     ))
+}
+
+fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let rest = text.split_once(start)?.1;
+    let value = rest.split_once(end)?.0.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// `Description:` plus the first exception line of the last crash report.
+fn crash_report_summary(log: &str) -> Option<String> {
+    let start = log.rfind("---- Minecraft Crash Report ----")?;
+    let report = &log[start..];
+    let description = report
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Description:").map(str::trim))
+        .filter(|text| !text.is_empty());
+    let exception = report.lines().skip(1).map(str::trim).find(|line| {
+        (line.starts_with("java.") || line.starts_with("net.") || line.starts_with("com.") || line.starts_with("org."))
+            && (line.contains("Exception") || line.contains("Error"))
+    });
+    match (description, exception) {
+        (Some(description), Some(exception)) => Some(format!("{description}: {exception}")),
+        (Some(description), None) => Some(description.to_string()),
+        (None, Some(exception)) => Some(exception.to_string()),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -602,6 +657,33 @@ mod tests {
         assert_eq!(java.kind, CrashKind::UnsupportedJava);
         let unknown = diagnose(Some(2), "boom").unwrap();
         assert_eq!(unknown.kind, CrashKind::Unknown);
+    }
+
+    #[test]
+    fn crash_report_beats_the_last_line() {
+        let log = "---- Minecraft Crash Report ----\n\
+                   // Ouch.\n\
+                   Time: 2026-11-08 10:30:01\n\
+                   Description: mouseClicked event handler\n\
+                   java.lang.NullPointerException: the real cause\n\
+                   \tat com.example.Mod.call(Mod.java:1)\n\
+                   [10:30:11] [Railways watchdog/INFO]: force-killing pid 1\n";
+        let crash = diagnose(Some(255), log).unwrap();
+        assert!(crash.summary.contains("mouseClicked"), "{}", crash.summary);
+        assert!(crash.summary.contains("the real cause"), "{}", crash.summary);
+    }
+
+    #[test]
+    fn skin_patch_failure_points_at_the_flag() {
+        let log = "[x] java.lang.IllegalStateException: Patch 'customskinloader:skin-manager-patch:skin-manager.<init>.v1' \
+                   matched protocol 0 but did not modify any bytecode.";
+        let crash = diagnose(Some(255), log).unwrap();
+        assert!(crash.summary.contains("CustomSkinLoader"), "{}", crash.summary);
+        assert!(
+            crash.hints.iter().any(|hint| hint.contains("ignorePatchFailure")),
+            "{:?}",
+            crash.hints
+        );
     }
 
     #[test]

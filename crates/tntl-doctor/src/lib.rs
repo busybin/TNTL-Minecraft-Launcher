@@ -85,12 +85,9 @@ impl Finding {
 pub fn tidy(mut findings: Vec<Finding>) -> Vec<Finding> {
     let mut seen = std::collections::HashSet::new();
     findings.retain(|finding| {
-        seen.insert((
-            finding.code.clone(),
-            finding.subject.clone(),
-            finding.params.clone(),
-            finding.evidence.clone(),
-        ))
+        // Evidence differs for repeated log lines; the same finding is still
+        // the same finding once the code, subject and values match.
+        seen.insert((finding.code.clone(), finding.subject.clone(), finding.params.clone()))
     });
     findings.sort_by(|left, right| {
         left.severity
@@ -123,5 +120,14 @@ mod tests {
         let findings = tidy(vec![warn.clone(), error.clone(), warn]);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn tidy_keeps_one_copy_of_a_repeated_finding() {
+        // Distant Horizons repeats the same queue error thousands of times
+        // with different timestamps in the evidence.
+        let first = Finding::new(Severity::Warning, "mod_log_error").evidence("line one");
+        let second = Finding::new(Severity::Warning, "mod_log_error").evidence("line two");
+        assert_eq!(tidy(vec![first, second]).len(), 1);
     }
 }
