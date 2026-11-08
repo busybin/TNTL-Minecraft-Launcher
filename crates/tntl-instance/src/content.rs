@@ -58,7 +58,14 @@ pub fn list(dir: &Path) -> io::Result<Vec<String>> {
         .flatten()
         .filter(|entry| {
             let path = entry.path();
-            path.is_file() || path.is_dir()
+            // Error logs, notes and images sit next to the packs. The game
+            // only loads folders and `.zip` archives, so anything else is not
+            // a pack and must not show up in the list or in update checks.
+            path.is_dir()
+                || (path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip")))
         })
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .filter(|name| !name.starts_with('.'))
@@ -1000,6 +1007,22 @@ mod tests {
     fn missing_directory_lists_nothing() {
         let dir = temp_dir("missing");
         assert!(list(&dir.join("resourcepacks")).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn list_keeps_only_folders_and_zip_archives() {
+        // EuphoriaPatcher writes `_0EUPHORIA_PATCHES_ERROR_LOGS.txt` into
+        // `shaderpacks/`; it is not a pack and must not be listed as one.
+        let dir = temp_dir("list");
+        fs::write(dir.join("pack.zip"), b"zip").unwrap();
+        fs::write(dir.join("PACK.ZIP"), b"zip").unwrap();
+        fs::write(dir.join("error-logs.txt"), b"txt").unwrap();
+        fs::create_dir_all(dir.join("unzipped")).unwrap();
+        assert_eq!(
+            list(&dir).unwrap(),
+            vec!["PACK.ZIP".to_string(), "pack.zip".to_string(), "unzipped".to_string()]
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

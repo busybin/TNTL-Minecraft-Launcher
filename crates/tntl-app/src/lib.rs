@@ -7830,21 +7830,10 @@ fn download_updates(
 }
 
 fn content_files(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<String> = entries
-        .flatten()
-        .filter(|entry| {
-            let path = entry.path();
-            path.is_file() || path.is_dir()
-        })
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        // `.DS_Store`, `.index` and other hidden bookkeeping files are not packs.
-        .filter(|name| !name.starts_with('.'))
-        .collect();
-    files.sort();
-    files
+    // One definition of "what counts as a pack": folders and `.zip` archives.
+    // Shader packs drop error logs and notes next to the archives, and those
+    // used to show up as packs the game could switch on.
+    tntl_instance::content::list(dir).unwrap_or_default()
 }
 
 /// Enabled resource packs in loading order with the most important one first:
