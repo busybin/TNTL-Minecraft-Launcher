@@ -1,6 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { api, formatDate, formatPlaytime, imageUrl, type BrokenInstance, type InstanceView, type RemovedInstance } from "../api";
+import {
+  api,
+  formatDate,
+  formatPlaytime,
+  imageUrl,
+  type BrokenInstance,
+  type InstanceView,
+  type RemovedInstance,
+  type SourceView,
+} from "../api";
 import CoverArt from "../components/CoverArt.vue";
 import Icon from "../components/Icon.vue";
 import { t } from "../i18n";
@@ -11,27 +20,40 @@ const props = defineProps<{
   removedEntries: RemovedInstance[];
   running: string | null;
   busy: string | null;
+  sources: SourceView[];
+  /** Empty selects every game directory. */
+  activeSource: string;
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   launch: [name: string];
   stop: [];
   log: [name: string];
   open: [name: string];
   remove: [name: string];
-  forgetDir: [name: string];
-  restore: [name: string];
-  dismiss: [name: string];
+  forgetDir: [name: string, dir: string];
+  restore: [name: string, dir: string];
+  dismiss: [name: string, dir: string];
   openPath: [path: string];
   new: [];
   importMc: [];
   importArchive: [];
   modpack: [];
   refresh: [];
+  selectSource: [path: string];
+  addSource: [];
+  removeSource: [path: string];
 }>();
 
 const query = ref("");
 const activeGroup = ref("*");
+
+/** Short label for a game directory: its last two components. */
+function sourceLabel(path: string): string {
+  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts.slice(-2).join("/") || path;
+}
+
 type IconEntry = { path: string; url: string };
 
 const iconCache = ref<Record<string, IconEntry>>({});
@@ -116,6 +138,7 @@ const visible = computed(() => {
   const needle = query.value.trim().toLowerCase();
   return props.instances.filter((instance) => {
     if (activeGroup.value !== "*" && instance.group !== activeGroup.value) return false;
+    if (props.activeSource && (instance.source ?? "") !== props.activeSource) return false;
     if (!needle) return true;
     return (
       instance.name.toLowerCase().includes(needle) ||
@@ -167,6 +190,9 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
         <button class="primary small" @click="$emit('new')">
           <Icon name="plus" :size="14" /> {{ t("instances.newInstance") }}
         </button>
+        <button class="ghost small" @click="$emit('addSource')">
+          <Icon name="folder" :size="14" /> {{ t("instances.addGameDir") }}
+        </button>
         <button class="ghost small" @click="$emit('modpack')">
           <Icon name="package" :size="14" /> {{ t("instances.modpack") }}
         </button>
@@ -176,6 +202,28 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
         <button class="ghost small" @click="$emit('importArchive')">
           <Icon name="package" :size="13" /> {{ t("instances.importArchive") }}
         </button>
+      </div>
+
+      <div v-if="sources.length" class="source-bar">
+        <button :class="{ active: !activeSource }" @click="$emit('selectSource', '')">
+          {{ t("instances.allSources") }}
+        </button>
+        <div
+          v-for="source in sources"
+          :key="source.path"
+          class="source-chip"
+          :class="{ active: activeSource === source.path, missing: !source.available }"
+        >
+          <button class="source-pick" :title="source.path" @click="$emit('selectSource', source.path)">
+            <Icon name="folder" :size="13" />
+            {{ sourceLabel(source.path) }}
+            <span class="count">{{ source.instances }}</span>
+            <span v-if="!source.available" class="missing-tag">{{ t("instances.sourceMissing") }}</span>
+          </button>
+          <button class="source-drop" :title="t('instances.removeSource')" @click="$emit('removeSource', source.path)">
+            <Icon name="close" :size="12" />
+          </button>
+        </div>
       </div>
 
       <div class="library-bar">
@@ -364,7 +412,7 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
         <button class="ghost small" @click="$emit('openPath', entry.dir)">
           <Icon name="folder" :size="13" />{{ t("instances.openFolder") }}
         </button>
-        <button class="ghost small" @click="$emit('forgetDir', entry.name)">
+        <button class="ghost small" @click="$emit('forgetDir', entry.name, entry.dir)">
           <Icon name="close" :size="13" />{{ t("instances.forget") }}
         </button>
       </div>
@@ -385,10 +433,10 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
           class="ghost small"
           @click="$emit('openPath', entry.dir)"
         >{{ t("app.openConfigFolder") }}</button>
-        <button class="ghost small" @click="$emit('restore', entry.name)">
+        <button class="ghost small" @click="$emit('restore', entry.name, entry.dir)">
           <Icon name="refresh" :size="13" />{{ t("instances.restore") }}
         </button>
-        <button class="ghost small" @click="$emit('dismiss', entry.name)">
+        <button class="ghost small" @click="$emit('dismiss', entry.name, entry.dir)">
           <Icon name="close" :size="13" />{{ t("instances.dismiss") }}
         </button>
       </div>
@@ -481,6 +529,81 @@ const rest = computed(() => visible.value.filter((instance) => instance !== feat
   margin: 0;
   color: var(--muted);
   font-size: 13px;
+}
+
+.source-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin: 0 0 12px;
+}
+
+.source-bar > button {
+  padding: 5px 11px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--muted);
+  background: transparent;
+}
+
+.source-bar > button.active {
+  color: var(--accent);
+  border-color: rgba(111, 220, 111, 0.4);
+  background: rgba(111, 220, 111, 0.12);
+}
+
+.source-chip {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.source-chip.active {
+  border-color: rgba(111, 220, 111, 0.4);
+  background: rgba(111, 220, 111, 0.12);
+}
+
+.source-chip.missing {
+  border-color: rgba(233, 150, 122, 0.5);
+}
+
+.source-pick,
+.source-drop {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 5px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.source-drop {
+  padding: 5px 7px;
+  border-left: 1px solid var(--line);
+}
+
+.source-chip.active .source-pick {
+  color: var(--accent);
+}
+
+.source-pick .count {
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.source-pick .missing-tag {
+  color: #e9967a;
+}
+
+.source-error {
+  margin: 0 0 10px;
+  color: #e9967a;
+  font-size: 12px;
 }
 
 .hero-art img,

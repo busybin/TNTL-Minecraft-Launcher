@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tntl_model::GpuPreference;
 use tntl_store::{RootLayout, StoreError};
 
 pub mod archive;
@@ -22,7 +23,17 @@ pub mod screenshots;
 pub mod servers;
 pub mod worlds;
 
+/// Legacy per-instance configuration, kept under the launcher data directory
+/// (`instances/<name>/`). Still read so instances created before the move keep
+/// working.
 pub const INSTANCE_FILE: &str = "instance.json";
+
+/// Per-instance configuration stored **inside the game directory**, so it
+/// travels with the folder: move, copy or re-attach the disk and the launcher
+/// still finds the instance with its settings. Nothing about where the game
+/// data lives needs to be recorded, which removes the whole class of bugs
+/// where a stored path points at the wrong disk.
+pub const PORTABLE_FILE: &str = "tntl-instance.json";
 
 #[derive(Debug, Error)]
 pub enum InstanceError {
@@ -65,6 +76,10 @@ pub struct Instance {
     /// Extra environment variables for the game process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Which GPU to render on. Only Linux splits the screen and the renderer
+    /// across two cards, so this is inert elsewhere.
+    #[serde(default)]
+    pub gpu: GpuPreference,
     /// Join this server right after the world loads.
     pub server: Option<ServerAddress>,
     pub username: String,
@@ -89,6 +104,15 @@ pub struct Instance {
     /// was merely detected as another launcher's.
     #[serde(default)]
     pub in_place: bool,
+    /// True when the configuration was read from [`PORTABLE_FILE`]. Such an
+    /// instance *is* its game directory: `root` and `game_dir` are derived from
+    /// the folder and never stored, so they cannot drift to another disk.
+    #[serde(skip)]
+    pub portable: bool,
+    /// Directory the configuration was loaded from. Filled in by [`Self::load`]
+    /// and only used to derive paths for a portable instance.
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
 }
 
 /// A server address to join on launch.
@@ -155,6 +179,7 @@ impl Default for Instance {
             jvm_args: Vec::new(),
             game_args: Vec::new(),
             env: BTreeMap::new(),
+            gpu: GpuPreference::default(),
             server: None,
             username: "Player".to_string(),
             demo: false,
@@ -165,6 +190,8 @@ impl Default for Instance {
             notes: String::new(),
             icon: None,
             in_place: false,
+            portable: false,
+            dir: None,
         }
     }
 }
@@ -202,7 +229,9 @@ impl Instance {
     }
 
     pub fn load(dir: &Path) -> Result<Self, InstanceError> {
-        let path = dir.join(INSTANCE_FILE);
+        let portable = dir.join(PORTABLE_FILE);
+        let full = portable.is_file();
+        let path = if full { portable } else { dir.join(INSTANCE_FILE) };
         let bytes = fs::read(&path).map_err(|error| InstanceError::Io {
             path: path.clone(),
             source: error,
@@ -211,6 +240,16 @@ impl Instance {
             path: path.clone(),
             source,
         })?;
+        instance.portable = full;
+        instance.dir = Some(dir.to_path_buf());
+        if full {
+            // A portable instance is its own game directory and finds the
+            // version chain from the folder layout. Values a converted file may
+            // still carry would point at whatever disk the conversion ran on.
+            instance.root = None;
+            instance.game_dir = None;
+            instance.in_place = false;
+        }
         if instance.version_id.is_empty() {
             return Err(InstanceError::Invalid("version_id is empty".to_string()));
         }
@@ -272,17 +311,62 @@ impl Instance {
         Ok(instance)
     }
 
+    /// Write the configuration back where it came from. A portable instance
+    /// keeps its file inside the game directory; a legacy one keeps its file in
+    /// the launcher data directory.
     pub fn save(&self, dir: &Path) -> Result<(), InstanceError> {
         fs::create_dir_all(dir).map_err(|error| InstanceError::Io {
             path: dir.to_path_buf(),
             source: error,
         })?;
-        tntl_store::atomic_write_json(&dir.join(INSTANCE_FILE), self)?;
+        // The file that is already there decides. `portable` and `dir` are
+        // `#[serde(skip)]`, so a payload that came from the UI carries neither
+        // and writing by those fields put a second `instance.json` beside the
+        // portable file: every edit was then ignored on the next read, because
+        // loading prefers the portable file.
+        let name = if self.portable || dir.join(PORTABLE_FILE).is_file() {
+            PORTABLE_FILE
+        } else {
+            INSTANCE_FILE
+        };
+        tntl_store::atomic_write_json(&dir.join(name), self)?;
+        // One configuration per folder: a stale legacy file would take over again
+        // the day the portable one is renamed or deleted.
+        if name == PORTABLE_FILE {
+            let legacy = dir.join(INSTANCE_FILE);
+            if legacy.is_file() {
+                let _ = fs::remove_file(&legacy);
+            }
+        }
+        Ok(())
+    }
+
+    /// Register `dir` as a portable instance: the configuration is written
+    /// beside the game files and the legacy file, if any, is removed so the two
+    /// cannot disagree.
+    pub fn save_portable(&mut self, dir: &Path) -> Result<(), InstanceError> {
+        self.portable = true;
+        self.dir = Some(dir.to_path_buf());
+        self.root = None;
+        self.game_dir = None;
+        self.in_place = false;
+        self.save(dir)?;
+        let legacy = dir.join(INSTANCE_FILE);
+        if legacy.is_file() {
+            let _ = fs::remove_file(&legacy);
+        }
         Ok(())
     }
 
     /// Shared root for this instance, given the launcher root.
     pub fn shared_root(&self, launcher_root: &Path) -> PathBuf {
+        if self.portable {
+            return self
+                .dir
+                .as_deref()
+                .and_then(|dir| portable_root(dir, &self.version_id))
+                .unwrap_or_else(|| launcher_root.to_path_buf());
+        }
         match &self.root {
             Some(root) => root.clone(),
             None => launcher_root.to_path_buf(),
@@ -290,6 +374,17 @@ impl Instance {
     }
 
     pub fn game_dir(&self, instance_dir: &Path) -> PathBuf {
+        if self.portable {
+            // A Prism/MultiMC folder wraps the game in `minecraft/`; a plain
+            // game folder is the game directory itself.
+            let nested = instance_dir.join("minecraft");
+            let wrapped = instance_dir.join("instance.cfg").is_file() || instance_dir.join("mmc-pack.json").is_file();
+            return if wrapped && nested.is_dir() {
+                nested
+            } else {
+                instance_dir.to_path_buf()
+            };
+        }
         match &self.game_dir {
             Some(dir) => dir.clone(),
             None => instance_dir.join("minecraft"),
@@ -303,6 +398,30 @@ impl Instance {
     pub fn layout(&self, launcher_root: &Path) -> RootLayout {
         RootLayout::new(self.shared_root(launcher_root))
     }
+}
+
+/// Root that holds `versions/`, `libraries/` and `assets/` for a portable
+/// instance, derived from where the folder sits.
+///
+/// A folder reached as `<source>/versions/<id>` belongs to a Minecraft
+/// installation whose own `libraries/` and `assets/` should be used; anything
+/// else (a plain game folder, a pack directory, a folder moved somewhere else)
+/// falls back to the launcher's shared store. The version JSON has to exist in
+/// the source, otherwise a folder that merely happens to sit under a `versions`
+/// directory would claim a chain it cannot launch.
+fn portable_root(instance_dir: &Path, version_id: &str) -> Option<PathBuf> {
+    let versions = instance_dir.parent()?;
+    if versions.file_name()? != "versions" {
+        return None;
+    }
+    let source = versions.parent()?;
+    if !versions.join(version_id).join(format!("{version_id}.json")).is_file() {
+        return None;
+    }
+    if !source.join("libraries").is_dir() && !source.join("assets").is_dir() {
+        return None;
+    }
+    Some(source.to_path_buf())
 }
 
 fn now() -> String {

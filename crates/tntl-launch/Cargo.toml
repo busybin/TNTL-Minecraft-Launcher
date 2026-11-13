@@ -6,6 +6,7 @@ publish = false
 license.workspace = true
 
 [dependencies]
+tntl-model = { path = "../tntl-model" }
 tntl-resolve = { path = "../tntl-resolve" }
 tntl-store = { path = "../tntl-store" }
 thiserror.workspace = true

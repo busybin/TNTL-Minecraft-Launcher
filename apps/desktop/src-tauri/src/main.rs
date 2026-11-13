@@ -54,6 +54,9 @@ fn emit_tagged<T: Serialize>(app: &tauri::AppHandle, channel: &str, job: &str, e
 #[derive(Serialize)]
 struct Bootstrap {
     root: String,
+    /// `std::env::consts::OS`. The instance editor hides the GPU picker on
+    /// platforms where a screen and its renderer are never split.
+    os: &'static str,
     instances: Vec<InstanceView>,
     installed_versions: Vec<String>,
     java: Vec<JavaView>,
@@ -442,6 +445,7 @@ async fn bootstrap(state: State<'_, AppState>) -> Result<Bootstrap, String> {
     tauri::async_runtime::spawn_blocking(move || {
         Ok(Bootstrap {
             root: launcher.root.display().to_string(),
+            os: std::env::consts::OS,
             instances: launcher.instance_views().map_err(message)?,
             installed_versions: launcher.installed_versions(),
             java: launcher.java_list(),
@@ -458,6 +462,60 @@ async fn list_instances(state: State<'_, AppState>) -> Result<Vec<InstanceView>,
     tauri::async_runtime::spawn_blocking(move || launcher.instance_views().map_err(message))
         .await
         .map_err(message)?
+}
+
+/// A game directory the user added, with how many instances were found in it.
+#[derive(Clone, Serialize)]
+struct SourceView {
+    path: String,
+    available: bool,
+    instances: usize,
+}
+
+fn source_views(launcher: &Launcher) -> Vec<SourceView> {
+    launcher
+        .sources()
+        .paths
+        .into_iter()
+        .map(|path| SourceView {
+            available: path.is_dir(),
+            instances: tntl_app::sources::scan_source(&path).len(),
+            path: path.display().to_string(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn list_sources(state: State<'_, AppState>) -> Result<Vec<SourceView>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || source_views(&launcher))
+        .await
+        .map_err(message)
+}
+
+/// Register a game directory. The instances inside it join the library on the
+/// next list, and each keeps its settings beside its own game files.
+#[tauri::command]
+async fn add_source(state: State<'_, AppState>, path: String) -> Result<Vec<SourceView>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher.add_source(std::path::Path::new(&path)).map_err(message)?;
+        Ok(source_views(&launcher))
+    })
+    .await
+    .map_err(message)?
+}
+
+/// Remove a game directory from the library; the files stay on disk.
+#[tauri::command]
+async fn remove_source(state: State<'_, AppState>, path: String) -> Result<Vec<SourceView>, String> {
+    let launcher = state_launcher(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher.remove_source(std::path::Path::new(&path)).map_err(message)?;
+        Ok(source_views(&launcher))
+    })
+    .await
+    .map_err(message)?
 }
 
 #[tauri::command]
@@ -540,12 +598,17 @@ async fn install_version(
     instance_name: Option<String>,
     loader: Option<String>,
     loader_version: Option<String>,
+    game_dir: Option<String>,
 ) -> Result<(), String> {
     let _cancel = tntl_source::cancel::begin();
     let launcher = state_launcher(&state);
     let mut request = tntl_app::InstallRequest::new(&version);
     request.assets = assets;
     request.instance = instance_name.clone();
+    request.game_dir = game_dir
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
     if let Some(loader) = loader.as_deref() {
         let kind = tntl_source::LoaderKind::from_key(loader).ok_or_else(|| format!("unknown loader {loader}"))?;
         request.loader = Some(kind);
@@ -723,6 +786,7 @@ fn create_instance(
     version_id: String,
     username: Option<String>,
     max_memory_mb: Option<u32>,
+    game_dir: Option<String>,
 ) -> Result<(), String> {
     let launcher = state_launcher(&state);
     let mut instance = Instance::new(&name, &version_id);
@@ -732,7 +796,17 @@ fn create_instance(
     if let Some(memory) = max_memory_mb {
         instance.max_memory_mb = Some(memory.clamp(512, 65536));
     }
-    launcher.create_instance(&instance).map_err(message)?;
+    let target = game_dir
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    if target.is_some() {
+        launcher
+            .create_instance_at(&name, &version_id, target.as_deref())
+            .map_err(message)?;
+    } else {
+        launcher.create_instance(&instance).map_err(message)?;
+    }
     Ok(())
 }
 
@@ -800,9 +874,14 @@ fn create_instance_from_version(
     state: State<'_, AppState>,
     version_id: String,
     name: String,
+    game_dir: Option<String>,
 ) -> Result<String, String> {
+    let target = game_dir
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
     state_launcher(&state)
-        .create_instance_from_version(&version_id, &name)
+        .create_instance_at(&name, &version_id, target.as_deref())
         .map(|dir| dir.display().to_string())
         .map_err(message)
 }
@@ -1545,6 +1624,7 @@ async fn launch_instance(app: tauri::AppHandle, state: State<'_, AppState>, name
                 .join(format!("{}.log", timestamp()));
             let settings = launcher.settings();
             let mut options = LaunchOptions::new(&log_path);
+            options.gpu = instance.gpu;
             if settings.quit_on_launch {
                 // Nothing reads the pipes once this process is gone, so hand
                 // the log file straight to the game.
@@ -2598,10 +2678,24 @@ async fn pick_file(title: String, extensions: Vec<String>) -> Option<String> {
 }
 
 #[tauri::command]
-async fn pick_folder(title: String) -> Option<String> {
+async fn pick_folder(title: String, start: Option<String>) -> Option<String> {
     tauri::async_runtime::spawn_blocking(move || {
-        rfd::FileDialog::new()
-            .set_title(title)
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        // Opening at the folder the user last used beats making them walk down
+        // from `$HOME` every time. A path that no longer exists is ignored
+        // rather than shown as an error.
+        if let Some(start) = start.filter(|path| !path.trim().is_empty()) {
+            let start = PathBuf::from(start);
+            let dir = if start.is_dir() {
+                Some(start)
+            } else {
+                start.parent().filter(|parent| parent.is_dir()).map(Path::to_path_buf)
+            };
+            if let Some(dir) = dir {
+                dialog = dialog.set_directory(dir);
+            }
+        }
+        dialog
             .pick_folder()
             .map(|path| path.display().to_string())
     })
@@ -2653,6 +2747,14 @@ fn open_instance_folder(state: State<'_, AppState>, name: String, relative: Opti
             return Err(format!("{relative:?} is not a subfolder of the instance"));
         }
         target.push(relative);
+    }
+    // `minecraft`, `screenshots` and `saves/<world>` only appear once the game
+    // or a command writes them, so "open the instance folder" right after
+    // creating an instance used to fail on a folder that was simply never
+    // created. The target here is always a folder, so make it.
+    if !target.exists() {
+        std::fs::create_dir_all(&target)
+            .map_err(|error| format!("cannot create {}: {error}", target.display()))?;
     }
     open_path(target.display().to_string())
 }
@@ -3026,14 +3128,21 @@ fn restore_version(state: State<'_, AppState>, id: String) -> Result<(), String>
 }
 
 #[tauri::command]
-fn restore_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
-    state_launcher(&state).restore_instance(&name).map_err(message)
+fn restore_instance(state: State<'_, AppState>, name: String, dir: Option<String>) -> Result<(), String> {
+    // `dir` names the exact folder when two instances share a name.
+    let dir = dir.map(PathBuf::from);
+    state_launcher(&state)
+        .restore_instance_at(&name, dir.as_deref())
+        .map_err(message)
 }
 
 /// Stop listing a removed entry for good. Files are left where they are.
 #[tauri::command]
-fn dismiss_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
-    state_launcher(&state).dismiss_instance(&name).map_err(message)
+fn dismiss_instance(state: State<'_, AppState>, name: String, dir: Option<String>) -> Result<(), String> {
+    let dir = dir.map(PathBuf::from);
+    state_launcher(&state)
+        .dismiss_instance_at(&name, dir.as_deref())
+        .map_err(message)
 }
 
 /// Instance folders the library cannot read, so the user can open or drop them.
@@ -3056,11 +3165,12 @@ async fn removed_instances(state: State<'_, AppState>) -> Result<Vec<tntl_app::R
 
 /// Forget a folder even when its `instance.json` is broken or missing.
 #[tauri::command]
-async fn forget_instance_dir(state: State<'_, AppState>, name: String) -> Result<String, String> {
+async fn forget_instance_dir(state: State<'_, AppState>, name: String, dir: Option<String>) -> Result<String, String> {
     let launcher = state_launcher(&state);
+    let dir = dir.map(PathBuf::from);
     tauri::async_runtime::spawn_blocking(move || {
         launcher
-            .forget_instance_dir(&name)
+            .forget_instance_dir_at(&name, dir.as_deref())
             .map(|dir| dir.display().to_string())
             .map_err(message)
     })
@@ -3213,6 +3323,9 @@ fn main() {
             update_apply,
             bootstrap,
             list_instances,
+            list_sources,
+            add_source,
+            remove_source,
             list_versions,
             list_loaders,
             loader_status,

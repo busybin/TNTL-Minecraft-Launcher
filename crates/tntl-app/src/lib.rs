@@ -48,6 +48,7 @@ pub use tntl_source::Http;
 
 /// System total memory read on Linux; the desktop shell overrides Windows.
 pub mod memory;
+pub mod sources;
 pub mod update;
 
 /// Launchable band sizes the memory slider is drawn from.
@@ -149,10 +150,16 @@ fn cached_java_installs(managed: &Path) -> Option<Vec<JavaInstall>> {
     (cached_path == managed && at.elapsed() < JAVA_SCAN_TTL).then(|| installs.clone())
 }
 
-/// A launcher data directory: `instances/`, `versions/`, `libraries/`, `assets/`.
+/// A launcher data directory: settings, accounts, runtimes, plus the game
+/// directories the user added.
 #[derive(Clone)]
 pub struct Launcher {
     pub root: PathBuf,
+    /// Instances found under the registered game directories, scanned on first
+    /// use. Resolving an instance name happens many times per command and
+    /// walking a game folder is not free, so the result is kept until something
+    /// changes it.
+    registry: std::sync::Arc<Mutex<Option<Vec<sources::Discovered>>>>,
 }
 
 /// Copy of the pack index an instance was installed from.
@@ -268,15 +275,29 @@ impl Default for RootMarker {
 pub struct Hidden {
     pub schema: u32,
     pub instances: Vec<String>,
+    /// Removals remembered by folder. Two game directories may hold an instance
+    /// of the same name, and removing one must not make the other disappear;
+    /// entries written by older builds are still honoured by name.
+    pub paths: Vec<String>,
     pub versions: Vec<String>,
     /// Entries the user dismissed for good. They stay out of the library and
     /// the maintenance list even while their files remain on disk.
     pub dismissed: Vec<String>,
+    /// Dismissals remembered by folder, for the same reason as `paths`: the
+    /// same name may belong to two game directories.
+    pub dismissed_paths: Vec<String>,
 }
 
 impl Hidden {
     pub fn hides_instance(&self, name: &str) -> bool {
         self.instances.iter().any(|entry| entry == name) || self.dismissed.iter().any(|entry| entry == name)
+    }
+
+    /// Whether this exact folder was removed. Names are not enough on their own:
+    /// the same name may belong to two different game directories.
+    pub fn hides_dir(&self, dir: &Path) -> bool {
+        let key = dir_key(dir);
+        self.paths.iter().any(|entry| entry == &key) || self.dismissed_paths.iter().any(|entry| entry == &key)
     }
 
     pub fn hides_version(&self, id: &str) -> bool {
@@ -616,6 +637,9 @@ pub struct InstanceView {
     pub imported: bool,
     pub dir: PathBuf,
     pub game_dir: PathBuf,
+    /// Game directory this instance belongs to, when it lives inside one.
+    /// `None` for an instance stored in the launcher's own folder.
+    pub source: Option<PathBuf>,
     pub installed: bool,
     pub last_log: Option<PathBuf>,
     /// Name of the Modrinth modpack the instance came from, if any.
@@ -764,6 +788,10 @@ pub struct InstallRequest {
     pub assets: bool,
     /// Register the result as an instance under this name.
     pub instance: Option<String>,
+    /// Game directory for the new instance; `None` keeps the default
+    /// `<instance>/minecraft`. The user picks this so a 6 GB modpack does not
+    /// land on whichever disk the launcher data lives on.
+    pub game_dir: Option<PathBuf>,
 }
 
 impl InstallRequest {
@@ -938,7 +966,10 @@ impl Launcher {
         // Windows callers may hand over a `\\?\` verbatim path; stored paths
         // and the UI always use the plain form.
         let root = tntl_store::simplify_path(&root);
-        let launcher = Self { root };
+        let launcher = Self {
+            root,
+            registry: std::sync::Arc::new(Mutex::new(None)),
+        };
         launcher.apply_network();
         launcher
     }
@@ -948,19 +979,14 @@ impl Launcher {
     /// One-time startup recovery. Do not call this from `from_root`: every
     /// command builds a launcher, and restoring a live bisect would fight it.
     pub fn recover_transactions(&self) {
-        let Ok(instances) = fs::read_dir(self.instances_dir()) else {
-            return;
-        };
-        for entry in instances.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() || !dir.join("instance.json").is_file() {
+        for (name, dir) in self.instance_dirs_on_disk() {
+            if !instance_config_present(&dir) {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
             // Only a live game skips recovery. A marker left behind by a
             // killed launcher used to hide an unfinished transaction and an
             // unfinished bisect forever; `running_pid` drops stale markers.
-            if dir.join(RUNNING_FILE).is_file() && self.running_pid(&name).is_some() {
+            if dir.join(RUNNING_FILE).is_file() && self.running_pid_at(&dir).is_some() {
                 continue;
             }
             let game_dir = Instance::load(&dir)
@@ -2129,7 +2155,7 @@ impl Launcher {
         let dir = self.instance_dir(name)?;
         // The instance may have been deleted while the game was running; do not
         // resurrect a directory that no longer exists.
-        if !dir.join(tntl_instance::INSTANCE_FILE).exists() {
+        if !instance_config_present(&dir) {
             return Ok(());
         }
         tntl_instance::playtime::Playtime::record(&dir, duration_ms)?;
@@ -2138,6 +2164,38 @@ impl Launcher {
 
     pub fn instances_dir(&self) -> PathBuf {
         self.root.join("instances")
+    }
+
+    /// Every instance directory on disk, visible or not: the library folder
+    /// plus the ones found inside the registered game directories. A name is
+    /// resolved by [`Self::instance_dir`]; everything that has to see *all* of
+    /// them (version protection, running markers, crash recovery) enumerates
+    /// here, so the two layouts cannot drift apart.
+    fn instance_dirs_on_disk(&self) -> Vec<(String, PathBuf)> {
+        let library = self.instances_dir();
+        let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&library) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && instance_config_present(&path) {
+                    dirs.push((entry.file_name().to_string_lossy().to_string(), path));
+                }
+            }
+        }
+        for found in self.discovered() {
+            if found.dir.starts_with(&library) {
+                continue;
+            }
+            let name = found
+                .dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            dirs.push((name, found.dir));
+        }
+        dirs.sort();
+        dirs.dedup_by(|left, right| left.1 == right.1);
+        dirs
     }
 
     pub fn root_marker_path(&self) -> PathBuf {
@@ -2182,11 +2240,7 @@ impl Launcher {
             return true;
         }
         fs::read_dir(self.instances_dir())
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .any(|entry| entry.path().join(tntl_instance::INSTANCE_FILE).is_file())
-            })
+            .map(|entries| entries.flatten().any(|entry| instance_config_present(&entry.path())))
             .unwrap_or(false)
     }
 
@@ -2276,13 +2330,43 @@ impl Launcher {
 
     fn prune_hidden(&self, hidden: &mut Hidden) -> bool {
         let mut changed = false;
+        // Pruning is only safe when every place an instance could live is
+        // readable right now. A hidden portable instance sits on a disk that may
+        // be unplugged, and forgetting its name would make it reappear as a new
+        // library entry the moment the disk comes back.
         let instances = self.instances_dir();
-        if fs::read_dir(&instances).is_ok() {
-            for list in [&mut hidden.instances, &mut hidden.dismissed] {
-                let before = list.len();
-                list.retain(|name| instances.join(name).is_dir());
-                changed |= list.len() != before;
-            }
+        let sources = self.sources();
+        if fs::read_dir(&instances).is_err() || !sources.paths.iter().all(|path| path.is_dir()) {
+            return false;
+        }
+        let on_disk = self.instance_dirs_on_disk();
+        // Name entries were written by builds that only knew the library, so a
+        // name stands for `<library>/<name>` and nothing else. Keeping it alive
+        // because some game directory happens to use the same name would hide an
+        // unrelated instance.
+        let library_names: Vec<&str> = on_disk
+            .iter()
+            .filter(|(_, dir)| dir.starts_with(&instances))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        for list in [&mut hidden.instances, &mut hidden.dismissed] {
+            let before = list.len();
+            list.retain(|name| library_names.iter().any(|known| known == name));
+            changed |= list.len() != before;
+        }
+        // A folder counts as long as it is still there, even when its
+        // configuration is unreadable: the maintenance list has to be able to
+        // forget such a folder for good, and a folder without any configuration
+        // is exactly the case where that matters.
+        let library = self.instances_dir();
+        for list in [&mut hidden.paths, &mut hidden.dismissed_paths] {
+            let before = list.len();
+            list.retain(|key| {
+                let dir = Path::new(key);
+                dir.is_dir()
+                    && (on_disk.iter().any(|(_, candidate)| same_dir(candidate, dir)) || dir.starts_with(&library))
+            });
+            changed |= list.len() != before;
         }
         let versions = self.layout().versions_dir();
         if fs::read_dir(&versions).is_ok() {
@@ -2305,28 +2389,48 @@ impl Launcher {
     pub fn unregister_instance(&self, name: &str) -> Result<InstanceLocation> {
         validate_name(name)?;
         let dir = self.instance_dir(name)?;
-        if !dir.join(tntl_instance::INSTANCE_FILE).exists() {
+        if !instance_config_present(&dir) {
             bail!("instance {name} does not exist");
         }
         self.ensure_not_running(name)?;
-        let location = self.instance_location(name)?;
+        let location = match self.instance_location(name) {
+            Ok(location) => location,
+            // A configuration the launcher cannot read still names a folder;
+            // dropping the entry must not depend on reading it.
+            Err(_) => InstanceLocation::new(name, &dir, None, &self.root),
+        };
         let mut hidden = self.hidden();
         // A new entry replaced a dismissed one: the hide list, not the
         // tombstone, now decides its visibility.
         hidden.dismissed.retain(|entry| entry != name);
-        if !hidden.instances.iter().any(|entry| entry == name) {
-            hidden.instances.push(name.to_string());
-            hidden.instances.sort();
+        // Remember the folder, not just the name: another game directory may
+        // hold an instance of the same name, and removing this one must leave
+        // that one alone.
+        let key = dir_key(&dir);
+        if !hidden.paths.iter().any(|entry| entry == &key) {
+            hidden.paths.push(key);
+            hidden.paths.sort();
         }
         self.save_hidden(&hidden)?;
         Ok(location)
     }
 
+    /// Put a removed instance back. `dir` names the exact folder when two
+    /// instances share a name; without it the name is resolved the usual way.
     pub fn restore_instance(&self, name: &str) -> Result<()> {
+        self.restore_instance_at(name, None)
+    }
+
+    pub fn restore_instance_at(&self, name: &str, dir: Option<&Path>) -> Result<()> {
         validate_name(name)?;
         let mut hidden = self.hidden();
         hidden.instances.retain(|entry| entry != name);
         hidden.dismissed.retain(|entry| entry != name);
+        if let Some(dir) = dir.map(Path::to_path_buf).or_else(|| self.instance_dir(name).ok()) {
+            let key = dir_key(&dir);
+            hidden.paths.retain(|entry| entry != &key);
+            hidden.dismissed_paths.retain(|entry| entry != &key);
+        }
         self.save_hidden(&hidden)
     }
 
@@ -2334,12 +2438,31 @@ impl Launcher {
     /// is remembered so neither the maintenance list nor a rescan brings it
     /// back.
     pub fn dismiss_instance(&self, name: &str) -> Result<()> {
+        self.dismiss_instance_at(name, None)
+    }
+
+    pub fn dismiss_instance_at(&self, name: &str, dir: Option<&Path>) -> Result<()> {
         validate_name(name)?;
         let mut hidden = self.hidden();
         hidden.instances.retain(|entry| entry != name);
-        if !hidden.dismissed.iter().any(|entry| entry == name) {
-            hidden.dismissed.push(name.to_string());
-            hidden.dismissed.sort();
+        // A folder-level dismissal keeps the other instance of the same name
+        // alive; without a folder the name has to stand for all of them.
+        let dir = dir.map(Path::to_path_buf).or_else(|| self.instance_dir(name).ok());
+        match dir {
+            Some(dir) => {
+                let key = dir_key(&dir);
+                hidden.paths.retain(|entry| entry != &key);
+                if !hidden.dismissed_paths.iter().any(|entry| entry == &key) {
+                    hidden.dismissed_paths.push(key);
+                    hidden.dismissed_paths.sort();
+                }
+            }
+            None => {
+                if !hidden.dismissed.iter().any(|entry| entry == name) {
+                    hidden.dismissed.push(name.to_string());
+                    hidden.dismissed.sort();
+                }
+            }
         }
         self.save_hidden(&hidden)
     }
@@ -2362,9 +2485,64 @@ impl Launcher {
         hidden.versions.retain(|entry| entry != id);
         self.save_hidden(&hidden)
     }
+    /// Every instance found under the registered game directories, scanned once
+    /// per launcher value.
+    pub fn discovered(&self) -> Vec<sources::Discovered> {
+        let mut guard = self.registry.lock().unwrap_or_else(|poison| poison.into_inner());
+        if guard.is_none() {
+            *guard = Some(sources::discover(self));
+        }
+        guard.clone().unwrap_or_default()
+    }
+
+    /// Forget the cached scan: the user added or removed a game directory, or
+    /// an instance was created or deleted.
+    pub fn reload_instances(&self) {
+        *self.registry.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+
+    /// Registry of game directories the user added.
+    pub fn sources(&self) -> sources::GameSources {
+        sources::GameSources::load(&self.root)
+    }
+
+    /// Register another game directory and drop the cached scan.
+    pub fn add_source(&self, path: &Path) -> Result<bool> {
+        let mut store = self.sources();
+        let added = store.add(path)?;
+        if added {
+            store.save(&self.root)?;
+            self.reload_instances();
+        }
+        Ok(added)
+    }
+
+    pub fn remove_source(&self, path: &Path) -> Result<bool> {
+        let mut store = self.sources();
+        let removed = store.remove(path);
+        if removed {
+            store.save(&self.root)?;
+            self.reload_instances();
+        }
+        Ok(removed)
+    }
+
     pub fn instance_dir(&self, name: &str) -> Result<PathBuf> {
         valid_component(name)?;
-        Ok(self.instances_dir().join(name))
+        let legacy = self.instances_dir().join(name);
+        if instance_config_present(&legacy) {
+            return Ok(legacy);
+        }
+        // An instance living inside a game directory carries no stored path, so
+        // the name is matched against the directory name found there.
+        for found in self.discovered() {
+            if found.dir.file_name().and_then(|entry| entry.to_str()) == Some(name) {
+                return Ok(found.dir);
+            }
+        }
+        // Unknown name: keep the library path so creation and error messages
+        // behave as they always did.
+        Ok(legacy)
     }
 
     pub fn load_instance(&self, name: &str) -> Result<Instance> {
@@ -2438,6 +2616,44 @@ impl Launcher {
         }
     }
 
+    /// Game directory used when the caller does not name one: the only
+    /// registered game directory, or the launcher root when none is registered
+    /// yet (first run, before the user added a disk).
+    pub fn default_source(&self) -> Result<PathBuf> {
+        let paths = self.sources().paths;
+        match paths.len() {
+            0 => Ok(self.root.clone()),
+            1 => Ok(paths[0].clone()),
+            _ => bail!("several game directories are registered; name the one to use"),
+        }
+    }
+
+    /// Create an instance inside a game directory: `<source>/instances/<name>/`,
+    /// with its settings stored beside its own game files.
+    ///
+    /// Nothing about where the game data lives is written down, so moving the
+    /// folder, re-attaching the disk or copying it to another machine keeps the
+    /// instance working.
+    pub fn create_portable_instance(&self, source: &Path, mut instance: Instance) -> Result<PathBuf> {
+        validate_name(&instance.name)?;
+        let dir = source.join("instances").join(&instance.name);
+        // Leftover data belongs to someone: refusing is the only safe answer,
+        // and a failed install must never wipe it.
+        if dir.exists() {
+            bail!(
+                "{} already exists; pick another name (nothing in it was touched)",
+                dir.display()
+            );
+        }
+        fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        instance.save_portable(&dir)?;
+        self.reload_instances();
+        // A name the user removed earlier is free now that the directory is
+        // gone; without this the fresh instance would be invisible forever.
+        let _ = self.restore_instance(&instance.name);
+        Ok(dir)
+    }
+
     pub fn create_instance(&self, instance: &Instance) -> Result<PathBuf> {
         self.ensure_owned_root()?;
         let dir = self.instance_dir(&instance.name)?;
@@ -2451,6 +2667,17 @@ impl Launcher {
             );
         }
         instance.save(&dir)?;
+        // Materialize the game directory now. Everything that reads it
+        // (`open_instance_folder`, the screenshots shortcut, the file browser)
+        // used to fail on a fresh instance with "does not exist" until the
+        // first launch created it. A directory that lives outside the library
+        // entry (`game_dir` pointing into another launcher's root, or a path
+        // the user picked) is left alone: creating it there would mean writing
+        // into someone else's tree before we know it is ours.
+        let game_dir = instance.game_dir(&dir);
+        if game_dir.starts_with(&dir) && !game_dir.exists() {
+            fs::create_dir_all(&game_dir).with_context(|| format!("cannot create {}", game_dir.display()))?;
+        }
         // A name the user removed earlier is free now that the directory is
         // gone; without this the fresh instance would be invisible forever.
         let _ = self.restore_instance(&instance.name);
@@ -2466,6 +2693,30 @@ impl Launcher {
             bail!("version {version_id} is not installed");
         }
         self.create_instance(&Instance::new(name.trim(), version_id))
+    }
+
+    /// Create an instance inside a game directory the user picked.
+    ///
+    /// The folder is registered as a game directory and the instance lands in
+    /// `<folder>/instances/<name>`, so the version chain, the libraries and the
+    /// game data all live together on the disk the user chose. The launcher's
+    /// own folder keeps settings only.
+    pub fn create_instance_at(&self, name: &str, version_id: &str, game_dir: Option<&Path>) -> Result<PathBuf> {
+        let source = match game_dir {
+            Some(dir) => {
+                let dir = tntl_store::simplify_path(dir);
+                if !dir.is_absolute() {
+                    bail!("{} is not an absolute path", dir.display());
+                }
+                if !dir.is_dir() {
+                    fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+                }
+                self.add_source(&dir)?;
+                dir
+            }
+            None => self.default_source()?,
+        };
+        self.create_portable_instance(&source, Instance::new(name.trim(), version_id))
     }
 
     pub fn save_instance(&self, instance: &Instance) -> Result<PathBuf> {
@@ -2559,7 +2810,12 @@ impl Launcher {
 
     /// Pid of a game still running from this instance, if any.
     pub fn running_pid(&self, name: &str) -> Option<u32> {
-        let dir = self.instance_dir(name).ok()?;
+        self.running_pid_at(&self.instance_dir(name).ok()?)
+    }
+
+    /// [`Self::running_pid`] for an already resolved directory, so a sweep can
+    /// read the markers it enumerated instead of resolving every name again.
+    fn running_pid_at(&self, dir: &Path) -> Option<u32> {
         let path = dir.join(RUNNING_FILE);
         let bytes = fs::read(&path).ok()?;
         let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -2598,18 +2854,11 @@ impl Launcher {
     /// Every instance with a live marker, including games this launcher
     /// process did not start (it was restarted while the game kept running).
     pub fn running_instances(&self) -> Vec<(String, u32)> {
-        let Ok(entries) = fs::read_dir(self.instances_dir()) else {
-            return Vec::new();
-        };
-        let mut running = Vec::new();
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if let Some(pid) = self.running_pid(&name) {
-                running.push((name, pid));
-            }
-        }
+        let mut running: Vec<(String, u32)> = self
+            .instance_dirs_on_disk()
+            .into_iter()
+            .filter_map(|(name, dir)| self.running_pid_at(&dir).map(|pid| (name, pid)))
+            .collect();
         running.sort();
         running
     }
@@ -2638,14 +2887,29 @@ impl Launcher {
         self.ensure_owned_root()?;
         self.ensure_not_running(old)?;
         let old_dir = self.instance_dir(old)?;
-        let new_dir = self.instance_dir(new)?;
+        // A portable instance lives inside its game directory and is renamed
+        // there. Resolving the new name through the library would move the
+        // whole game folder into `instances/`, off the disk it was put on.
+        let library = self.instances_dir();
+        let new_dir = if old_dir.starts_with(&library) {
+            self.instance_dir(new)?
+        } else {
+            old_dir.parent().unwrap_or(&library).join(new)
+        };
         if old == new {
             return Ok(old_dir);
         }
-        if !old_dir.join(tntl_instance::INSTANCE_FILE).exists() {
+        if !instance_config_present(&old_dir) {
             bail!("instance {old} does not exist");
         }
-        if new_dir.exists() {
+        // Renaming the folder a game directory points at would leave
+        // `sources.json` aiming at a path that no longer exists.
+        if self.sources().paths.iter().any(|path| same_dir(path, &old_dir)) {
+            bail!("{old} is the game directory itself; rename the folder in a file manager instead");
+        }
+        if new_dir.exists() || instance_config_present(&self.instance_dir(new)?) {
+            // Commands address an instance by name, so a name another instance
+            // already answers to cannot be handed to a second folder.
             bail!("instance {new} already exists; pick another name");
         }
         fs::rename(&old_dir, &new_dir).with_context(|| format!("cannot rename {old} to {new}"))?;
@@ -2658,6 +2922,8 @@ impl Launcher {
         // The new name may belong to an entry removed earlier; the folder is
         // this instance's now, so it must be visible.
         let _ = self.restore_instance(new);
+        // Discovery caches the folder names of portable instances.
+        self.reload_instances();
         Ok(new_dir)
     }
 
@@ -2709,32 +2975,49 @@ impl Launcher {
     }
 
     /// Instance directories the library cannot load. They are listed so the
-    /// user can open the folder or drop the entry; a broken `instance.json`
-    /// used to make a directory invisible with no way to remove it.
+    /// user can open the folder or drop the entry; a broken configuration used
+    /// to make a directory invisible with no way to remove it. Both layouts are
+    /// scanned: a portable instance is no less breakable than a library one.
     pub fn broken_instances(&self) -> Vec<BrokenInstance> {
         let hidden = self.hidden();
-        let Ok(entries) = fs::read_dir(self.instances_dir()) else {
-            return Vec::new();
-        };
         let mut broken = Vec::new();
-        for entry in entries.flatten() {
-            if !entry.path().is_dir() {
-                continue;
+        // Everything inside the library folder is looked at, including a folder
+        // with no configuration at all: it cannot be launched, so it is broken
+        // too and has to be droppable.
+        let library = self.instances_dir();
+        if let Ok(entries) = fs::read_dir(&library) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if hidden.hides_instance(&name) || hidden.hides_dir(&dir) {
+                    continue;
+                }
+                // A folder name that is not valid UTF-8 cannot be addressed by a
+                // command, so it never appears in the library; listing it here at
+                // least offers "remove from the list".
+                if entry.file_name().to_str().is_none() {
+                    broken.push(BrokenInstance {
+                        name,
+                        dir,
+                        error: "folder name is not valid UTF-8".to_string(),
+                    });
+                    continue;
+                }
+                if let Err(error) = Instance::load(&dir) {
+                    broken.push(BrokenInstance {
+                        name,
+                        dir,
+                        error: format!("{error:#}"),
+                    });
+                }
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if hidden.hides_instance(&name) {
-                continue;
-            }
-            let dir = entry.path();
-            // A folder name that is not valid UTF-8 cannot be addressed by a
-            // command, so it never appears in the library; listing it here at
-            // least offers "remove from the list".
-            if entry.file_name().to_str().is_none() {
-                broken.push(BrokenInstance {
-                    name,
-                    dir,
-                    error: "folder name is not valid UTF-8".to_string(),
-                });
+        }
+        // A portable instance is no less breakable than a library one.
+        for (name, dir) in self.instance_dirs_on_disk() {
+            if dir.starts_with(&library) || hidden.hides_dir(&dir) {
                 continue;
             }
             if let Err(error) = Instance::load(&dir) {
@@ -2745,6 +3028,46 @@ impl Launcher {
                 });
             }
         }
+        // Two folders with the same name cannot both be listed: every command
+        // addresses an instance by name, so the first one keeps it. The others
+        // are reported instead of silently vanishing, and renaming the folder
+        // brings them back.
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&library) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if instance_config_present(&path)
+                    && !hidden.hides_instance(&name)
+                    && !hidden.hides_dir(&path)
+                    && Instance::load(&path).is_ok()
+                {
+                    names.push(name);
+                }
+            }
+        }
+        for found in self.discovered() {
+            if found.dir.starts_with(&library) {
+                continue;
+            }
+            let Some(name) = found.dir.file_name().and_then(|name| name.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if hidden.hides_dir(&found.dir) || Instance::load(&found.dir).is_err() {
+                continue;
+            }
+            if names.contains(&name) {
+                broken.push(BrokenInstance {
+                    name: name.clone(),
+                    dir: found.dir.clone(),
+                    error: format!("another instance is already called {name}; rename one of the folders to use both"),
+                });
+                continue;
+            }
+            names.push(name);
+        }
         broken.sort_by(|left, right| left.name.cmp(&right.name));
         broken
     }
@@ -2753,21 +3076,11 @@ impl Launcher {
     /// ones the user removed from the visible list. A version they still use
     /// must not be deleted just because the entry is hidden.
     fn instances_without_metadata(&self) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(self.instances_dir()) else {
-            return Vec::new();
-        };
-        let mut names = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if Instance::load(&path).is_err() {
-                names.push(entry.file_name().to_string_lossy().to_string());
-            }
-        }
-        names.sort();
-        names
+        self.instance_dirs_on_disk()
+            .into_iter()
+            .filter(|(_, dir)| Instance::load(dir).is_err())
+            .map(|(name, _)| name)
+            .collect()
     }
 
     /// Instance directories the user removed from the library. The files are
@@ -2775,23 +3088,40 @@ impl Launcher {
     /// imported game directory when there is one.
     pub fn removed_instances(&self) -> Vec<RemovedInstance> {
         let hidden = self.hidden();
-        let mut removed = Vec::new();
-        for name in hidden.instances {
-            let Ok(dir) = self.instance_dir(&name) else {
-                continue;
-            };
-            if !dir.is_dir() {
-                continue;
+        let mut dirs: Vec<PathBuf> = hidden
+            .paths
+            .iter()
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .collect();
+        // Names written by older builds have no folder, so they are resolved
+        // through the usual lookup.
+        for name in &hidden.instances {
+            if let Ok(dir) = self.instance_dir(name)
+                && dir.is_dir()
+            {
+                dirs.push(dir);
             }
-            // A broken `instance.json` cannot name a game directory; the
-            // library entry is the only thing known to exist.
-            let mut instance = Instance::load(&dir).ok();
-            if let Some(instance) = instance.as_mut() {
-                self.adopt_renamed_version(instance);
-                adopt_isolated_game_dir(instance, &dir);
-            }
-            removed.push(InstanceLocation::new(&name, &dir, instance.as_ref(), &self.root));
         }
+        dirs.sort();
+        dirs.dedup_by(|left, right| same_dir(left, right));
+        let mut removed: Vec<RemovedInstance> = dirs
+            .into_iter()
+            .map(|dir| {
+                let name = dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // A broken `instance.json` cannot name a game directory; the
+                // folder itself is the only thing known to exist.
+                let mut instance = Instance::load(&dir).ok();
+                if let Some(instance) = instance.as_mut() {
+                    self.adopt_renamed_version(instance);
+                    adopt_isolated_game_dir(instance, &dir);
+                }
+                InstanceLocation::new(&name, &dir, instance.as_ref(), &self.root)
+            })
+            .collect();
         removed.sort_by(|left, right| left.name.cmp(&right.name));
         removed
     }
@@ -2799,10 +3129,26 @@ impl Launcher {
     /// Drop an instance directory from the library even when its
     /// `instance.json` is missing or unreadable. Nothing on disk changes.
     pub fn forget_instance_dir(&self, name: &str) -> Result<PathBuf> {
+        self.forget_instance_dir_at(name, None)
+    }
+
+    pub fn forget_instance_dir_at(&self, name: &str, hint: Option<&Path>) -> Result<PathBuf> {
         valid_component(name)?;
         let dir = self.instances_dir().join(name);
         // A folder whose name is not valid UTF-8 is listed under its lossy
         // name; resolve it back so it can be dropped from the list too.
+        if let Some(hint) = hint.filter(|hint| hint.is_dir() && instance_config_present(hint)) {
+            let mut hidden = self.hidden();
+            hidden.instances.retain(|entry| entry != name);
+            let key = dir_key(hint);
+            hidden.paths.retain(|entry| entry != &key);
+            if !hidden.dismissed_paths.iter().any(|entry| entry == &key) {
+                hidden.dismissed_paths.push(key);
+                hidden.dismissed_paths.sort();
+            }
+            self.save_hidden(&hidden)?;
+            return Ok(hint.to_path_buf());
+        }
         let dir = if dir.is_dir() {
             dir
         } else {
@@ -2814,7 +3160,13 @@ impl Launcher {
                 .filter(|path| path.is_dir() && path.file_name().is_some_and(|file| file.to_string_lossy() == name));
             match (matches.next(), matches.next()) {
                 (Some(found), None) => found,
-                _ => bail!("{name} is not an instance directory"),
+                _ => match self.instance_dir(name) {
+                    // A portable instance lives outside the library; dropping it
+                    // from the list must work even when its configuration cannot
+                    // be read.
+                    Ok(found) if found.is_dir() => found,
+                    _ => bail!("{name} is not an instance directory"),
+                },
             }
         };
         let mut hidden = self.hidden();
@@ -2822,9 +3174,11 @@ impl Launcher {
         // would offer "restore" for something that cannot be loaded, and the
         // row would come straight back.
         hidden.instances.retain(|entry| entry != name);
-        if !hidden.dismissed.iter().any(|entry| entry == name) {
-            hidden.dismissed.push(name.to_string());
-            hidden.dismissed.sort();
+        let key = dir_key(&dir);
+        hidden.paths.retain(|entry| entry != &key);
+        if !hidden.dismissed_paths.iter().any(|entry| entry == &key) {
+            hidden.dismissed_paths.push(key);
+            hidden.dismissed_paths.sort();
         }
         self.save_hidden(&hidden)?;
         Ok(dir)
@@ -2843,19 +3197,9 @@ impl Launcher {
 
     /// `(name, version chain, root the chain resolves to)`.
     fn instance_chains(&self) -> Vec<(String, Vec<String>, PathBuf)> {
-        let Ok(entries) = fs::read_dir(self.instances_dir()) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect();
-        names.sort();
-        names
+        self.instance_dirs_on_disk()
             .into_iter()
-            .filter_map(|name| {
-                let dir = self.instance_dir(&name).ok()?;
+            .filter_map(|(name, dir)| {
                 let instance = Instance::load(&dir).ok()?;
                 let layout = instance.layout(&self.root);
                 let chain = self.chain_dirs(&layout, &instance.version_id);
@@ -3598,6 +3942,7 @@ impl Launcher {
                 imported: instance.root.is_some(),
                 dir: dir.clone(),
                 game_dir,
+                source: source_of(&dir),
                 modpack: modpack_name(&dir),
                 group: instance.group,
                 notes: instance.notes,
@@ -3709,6 +4054,22 @@ impl Launcher {
         self.ensure_owned_root()?;
         if !self.version_installed(id) {
             bail!("version {id} is not installed");
+        }
+        // A registered game directory that is not reachable may hold the
+        // instance that launches this version. Deleting the files now would
+        // break that instance the moment the disk is plugged back in.
+        let offline: Vec<String> = self
+            .sources()
+            .paths
+            .into_iter()
+            .filter(|path| !path.is_dir())
+            .map(|path| path.display().to_string())
+            .collect();
+        if !offline.is_empty() {
+            bail!(
+                "{} is not available, so it is not known whether version {id} is in use",
+                offline.join(", ")
+            );
         }
         let users = self.version_users(id);
         if !users.is_empty() {
@@ -3862,6 +4223,7 @@ impl Launcher {
                     loader_version: version.map(str::to_string),
                     assets: true,
                     instance: None,
+                    game_dir: None,
                 };
                 let id = self.install_forge(&layout, &http, &request, kind, progress)?;
                 // Legacy installers keep their libraries in the version JSON,
@@ -3964,12 +4326,32 @@ impl Launcher {
         }
 
         let http = Http::new()?;
+        // Everything an install produces (the version chain, libraries, assets)
+        // belongs to a game directory, not to the launcher's settings folder.
+        // `game_dir` therefore names the game directory to install into; it is
+        // registered on the way so the instances inside it show up in the
+        // library.
+        let source = match request.game_dir.as_deref() {
+            Some(dir) => {
+                let dir = tntl_store::simplify_path(dir);
+                if !dir.is_absolute() {
+                    bail!("{} is not an absolute path", dir.display());
+                }
+                if !dir.is_dir() {
+                    fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+                }
+                self.add_source(&dir)?;
+                dir
+            }
+            None => self.default_source()?,
+        };
+        let layout = RootLayout::new(source.clone());
         let target = match request.loader {
-            Some(kind) if kind.is_installer() => self.install_forge(&self.layout(), &http, request, kind, progress)?,
+            Some(kind) if kind.is_installer() => self.install_forge(&layout, &http, request, kind, progress)?,
             Some(kind) => {
                 let (id, profile) =
                     self.loader_profile(&http, &request.version, kind, request.loader_version.as_deref())?;
-                tntl_store::atomic_write(&self.layout().version_json(&id), &profile)?;
+                tntl_store::atomic_write(&layout.version_json(&id), &profile)?;
                 id
             }
             None => request.version.clone(),
@@ -3980,7 +4362,7 @@ impl Launcher {
             concurrency: self.settings().concurrency,
             verify_assets: false,
         };
-        let installer = Installer::new(&http, self.layout(), Environment::current());
+        let installer = Installer::new(&http, layout, Environment::current());
         let mut report = installer.install(&target, &options, progress)?;
         // A version the user hid ("unregistered") but installed again must
         // show up in the local list; otherwise the install looks like it
@@ -3989,8 +4371,7 @@ impl Launcher {
             let _ = self.restore_version(&target);
         }
         if let Some(name) = request.instance.as_deref() {
-            let instance = Instance::new(name, &target);
-            self.create_instance(&instance)?;
+            self.create_portable_instance(&source, Instance::new(name, &target))?;
             report.instance = Some(name.to_string());
         }
         Ok(report)
@@ -4025,6 +4406,10 @@ impl Launcher {
         let instance_dir = self.instance_dir(&name)?;
         let existed_before = instance_dir.exists();
         let report = self.install(&request, version_progress)?;
+        // The install may have created the instance inside a registered game
+        // directory; the library path resolved before it never exists then, and
+        // rolling that path back would leave the half-installed folder behind.
+        let instance_dir = self.instance_dir(&name)?;
         // A failure after the instance was registered would leave a half
         // installed, unrepairable instance that cannot be retried under the
         // same name. Drop it instead (only when this call created it).
@@ -6657,11 +7042,24 @@ impl Launcher {
         self.ensure_owned_root()?;
         self.ensure_not_running(name)?;
         let source = self.instance_dir(name)?;
-        if !source.join(tntl_instance::INSTANCE_FILE).exists() {
+        if !instance_config_present(&source) {
             bail!("instance {name} does not exist");
         }
-        let target = self.instance_dir(new_name)?;
-        if target.exists() {
+        let library = self.instances_dir();
+        // A portable instance resolves its version chain from where it sits
+        // (`<source>/versions/<id>` uses that installation's libraries), so the
+        // copy goes beside it. Moving it into the library would change which
+        // `versions/` the chain is looked up in.
+        let target = if source.starts_with(&library) || self.sources().paths.iter().any(|path| same_dir(path, &source))
+        {
+            self.instance_dir(new_name)?
+        } else {
+            source
+                .parent()
+                .map(|parent| parent.join(new_name))
+                .unwrap_or_else(|| library.join(new_name))
+        };
+        if target.exists() || instance_config_present(&self.instance_dir(new_name)?) {
             bail!("instance {new_name} already exists; pick another name");
         }
         let source_instance = self.load_instance(name)?;
@@ -6695,9 +7093,10 @@ impl Launcher {
             return Err(error);
         }
         let _ = self.restore_instance(new_name);
+        // The copy may have landed inside a registered game directory.
+        self.reload_instances();
         Ok(target)
     }
-
     /// Write the instance's game directory as a portable `.mrpack`.
     pub fn export_instance(
         &self,
@@ -8221,18 +8620,26 @@ pub fn sanitize_name(value: &str) -> String {
 
 pub fn list_instances(launcher: &Launcher) -> Result<Vec<Instance>> {
     let dir = launcher.instances_dir();
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        // A brand-new data directory has no `instances/` yet; that is "empty",
-        // not an error. Anything else (permissions, a dead network path) must
-        // reach the user instead of rendering as an empty library.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+    let entries: Vec<_> = match fs::read_dir(&dir) {
+        Ok(entries) => entries.flatten().collect(),
+        // No `instances/` folder at all is normal now: instances live in the
+        // game directories. Anything else (permissions, a dead network path)
+        // must reach the user instead of rendering as an empty library.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", dir.display())),
     };
     let hidden = launcher.hidden();
     let mut instances = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
         if !entry.path().is_dir() {
+            continue;
+        }
+        // A leftover folder without a configuration file is not an instance: it
+        // may be what a migration left behind, or a `natives` directory. Data
+        // with a configuration file is a different matter and stays in the
+        // "removed" list.
+        let path = entry.path();
+        if !path.join(tntl_instance::INSTANCE_FILE).is_file() && !path.join(tntl_instance::PORTABLE_FILE).is_file() {
             continue;
         }
         // Commands resolve an instance by a UTF-8 name; a non-UTF-8 folder
@@ -8242,7 +8649,7 @@ pub fn list_instances(launcher: &Launcher) -> Result<Vec<Instance>> {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if hidden.hides_instance(&name) {
+        if hidden.hides_instance(&name) || hidden.hides_dir(&path) {
             continue;
         }
         match Instance::load(&entry.path()) {
@@ -8260,7 +8667,39 @@ pub fn list_instances(launcher: &Launcher) -> Result<Vec<Instance>> {
             Err(error) => eprintln!("skipping instance {}: {error:#}", entry.path().display()),
         }
     }
-    instances.sort_by(|left, right| left.name.cmp(&right.name));
+    // Instances that live inside a game directory the user added. They carry no
+    // stored paths, so the directory name is the instance name. A name that is
+    // already taken is skipped rather than shadowing the first one: two
+    // instances under the same name cannot be told apart by any command.
+    for found in launcher.discovered() {
+        if found.dir.starts_with(&dir) {
+            continue;
+        }
+        let Some(name) = found
+            .dir
+            .file_name()
+            .and_then(|entry| entry.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if hidden.hides_dir(&found.dir) || instances.iter().any(|known| known.name == name) {
+            continue;
+        }
+        match Instance::load(&found.dir) {
+            Ok(mut instance) => {
+                instance.name = name;
+                instances.push(instance);
+            }
+            Err(error) => eprintln!("skipping instance {}: {error:#}", found.dir.display()),
+        }
+    }
+    instances.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
     Ok(instances)
 }
 
@@ -8315,11 +8754,28 @@ fn rebase_instance_paths(instance: &mut Instance, from: &Path, to: &Path) {
     }
 }
 
+/// Whether `dir` holds an instance configuration. Listing accepts both the
+/// legacy library file and the portable one written beside the game files, so
+/// every command that resolves an instance must accept both: checking only
+/// `instance.json` made every portable instance report "does not exist".
+fn instance_config_present(dir: &Path) -> bool {
+    dir.join(tntl_instance::INSTANCE_FILE).is_file() || dir.join(tntl_instance::PORTABLE_FILE).is_file()
+}
+
 /// Compare two directories by resolved path: on Windows the same directory can
 /// be spelled `C:\x`, `c:\x` or `\\?\C:\x`.
 fn same_dir(left: &Path, right: &Path) -> bool {
     let resolve = |path: &Path| tntl_store::simplify_path(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     resolve(left) == resolve(right)
+}
+
+/// Stable text key for a folder, used by the "removed" list in `hidden.json`.
+/// The folder may be gone by the time the key is compared, so resolving has a
+/// fallback instead of failing.
+fn dir_key(dir: &Path) -> String {
+    tntl_store::simplify_path(&dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()))
+        .display()
+        .to_string()
 }
 
 /// Whether an instance points at a game directory outside our data directory,
@@ -8364,6 +8820,18 @@ fn adopt_in_place(instance: &mut Instance, launcher_root: &Path) -> bool {
         return true;
     }
     false
+}
+
+/// Game directory an instance folder belongs to: `<source>/instances/<name>`
+/// and `<source>/versions/<id>` are both that shape.
+fn source_of(dir: &Path) -> Option<PathBuf> {
+    let parent = dir.parent()?;
+    let name = parent.file_name()?.to_str()?;
+    if matches!(name, "instances" | "versions") {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
 }
 
 /// Every `versions/<dir>/<dir>.json` that parses, with its directory name.
@@ -9424,6 +9892,271 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// An instance inside a registered game directory carries its configuration
+    /// beside its own game files (`tntl-instance.json`), never `instance.json`.
+    /// Every command resolves it by the folder name, so removal, rename and
+    /// playtime must accept the portable file: checking only `instance.json`
+    /// made removal answer "does not exist" for every instance the library
+    /// itself listed.
+    fn portable_instance(launcher: &Launcher, root: &Path) -> (PathBuf, PathBuf) {
+        let game = root.join("game");
+        fs::create_dir_all(&game).unwrap();
+        launcher.add_source(&game).unwrap();
+        let dir = game.join("versions/pack");
+        fs::create_dir_all(dir.join("mods")).unwrap();
+        fs::write(dir.join("mods/a.jar"), b"jar").unwrap();
+        Instance::new("pack", "1.20.1").save_portable(&dir).unwrap();
+        (game, dir)
+    }
+
+    #[test]
+    fn a_portable_instance_can_be_removed_from_the_library() {
+        let root = std::env::temp_dir().join(format!("tntl-portable-remove-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let (_, dir) = portable_instance(&launcher, &root);
+        assert_eq!(list_instances(&launcher).unwrap().len(), 1);
+
+        launcher.record_playtime("pack", 4_000).unwrap();
+        assert!(dir.join(tntl_instance::playtime::PLAY_FILE).is_file());
+
+        let removed = launcher.unregister("pack").unwrap();
+        assert_eq!(removed.dir, dir);
+        assert!(launcher.instance_views().unwrap().is_empty());
+        // Removal only drops the library entry; the game files stay.
+        assert!(dir.join(tntl_instance::PORTABLE_FILE).is_file());
+        assert!(dir.join("mods/a.jar").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_portable_instance_is_renamed_inside_its_game_directory() {
+        let root = std::env::temp_dir().join(format!("tntl-portable-rename-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let (game, dir) = portable_instance(&launcher, &root);
+
+        let renamed = launcher.rename_instance("pack", "pack2").unwrap();
+        // Renaming must not drag a game folder off the disk the user put it on.
+        assert_eq!(renamed, game.join("versions/pack2"));
+        assert!(!dir.exists());
+        assert!(renamed.join(tntl_instance::PORTABLE_FILE).is_file());
+        assert_eq!(launcher.instance_dir("pack2").unwrap(), renamed);
+        assert_eq!(launcher.load_instance("pack2").unwrap().name, "pack2");
+
+        let copy = launcher.duplicate_instance("pack2", "packcopy").unwrap();
+        // Beside the original: its version chain is resolved from that game
+        // directory, not from the launcher's shared store.
+        assert_eq!(copy, game.join("versions/packcopy"));
+        assert!(copy.join(tntl_instance::PORTABLE_FILE).is_file());
+        assert_eq!(list_instances(&launcher).unwrap().len(), 2);
+        // A name another instance already answers to stays refused.
+        assert!(launcher.rename_instance("pack2", "packcopy").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_removed_portable_instance_stays_removed() {
+        let root = std::env::temp_dir().join(format!("tntl-portable-hidden-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let (_, dir) = portable_instance(&launcher, &root);
+        // The library folder existing is what made the hide list drop a portable
+        // name: pruning only looked for `<library>/<name>`.
+        fs::create_dir_all(launcher.instances_dir()).unwrap();
+        launcher.unregister("pack").unwrap();
+
+        assert!(launcher.instance_views().unwrap().is_empty());
+        assert!(launcher.instance_views().unwrap().is_empty());
+        assert!(dir.join(tntl_instance::PORTABLE_FILE).is_file());
+        assert_eq!(launcher.removed_instances().len(), 1);
+        launcher.restore_instance("pack").unwrap();
+        assert_eq!(launcher.instance_views().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_portable_instance_on_the_shared_root_keeps_its_version() {
+        let root = std::env::temp_dir().join(format!("tntl-portable-version-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        // The game directory has no `libraries/` or `assets/`, so this instance
+        // launches through the launcher's shared store.
+        let (_, _) = portable_instance(&launcher, &root);
+        let json = launcher.layout().version_json("1.20.1");
+        fs::create_dir_all(json.parent().unwrap()).unwrap();
+        fs::write(&json, r#"{"id":"1.20.1"}"#).unwrap();
+
+        assert_eq!(launcher.version_users("1.20.1"), vec!["pack".to_string()]);
+        assert_eq!(
+            launcher.installed_version_details()[0].instances,
+            vec!["pack".to_string()]
+        );
+        assert!(launcher.delete_version("1.20.1").is_err());
+        assert!(json.is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_portable_instance_shows_up_while_it_runs() {
+        let root = std::env::temp_dir().join(format!("tntl-portable-running-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let (_, dir) = portable_instance(&launcher, &root);
+        let pid = std::process::id();
+        fs::write(dir.join(RUNNING_FILE), format!(r#"{{"pid":{pid}}}"#)).unwrap();
+
+        assert_eq!(launcher.running_instances(), vec![("pack".to_string(), pid)]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_broken_portable_instance_can_be_removed_and_dropped() {
+        let root = std::env::temp_dir().join(format!("tntl-portable-broken-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let (game, dir) = portable_instance(&launcher, &root);
+        fs::write(dir.join(tntl_instance::PORTABLE_FILE), b"{not json").unwrap();
+
+        let broken = launcher.broken_instances();
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].name, "pack");
+
+        // Dropping the entry must not depend on reading its configuration.
+        let removed = launcher.unregister("pack").unwrap();
+        assert_eq!(removed.dir, dir);
+        assert!(launcher.instance_views().unwrap().is_empty());
+        assert!(dir.join(tntl_instance::PORTABLE_FILE).is_file());
+        assert_eq!(launcher.removed_instances().len(), 1);
+
+        // "Remove from the list" works for a portable folder too.
+        launcher.restore_instance("pack").unwrap();
+        assert_eq!(
+            launcher.forget_instance_dir("pack").unwrap(),
+            game.join("versions/pack")
+        );
+        assert!(launcher.broken_instances().is_empty());
+        assert!(dir.join(tntl_instance::PORTABLE_FILE).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_instances_with_the_same_name_can_be_told_apart() {
+        let root = std::env::temp_dir().join(format!("tntl-same-name-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        // The same folder name under two registered game directories.
+        let first = root.join("game-a/versions/pack");
+        let second = root.join("game-b/versions/pack");
+        for game in [root.join("game-a"), root.join("game-b")] {
+            fs::create_dir_all(game.join("versions/pack/mods")).unwrap();
+            Instance::new("pack", "1.20.1")
+                .save_portable(&game.join("versions/pack"))
+                .unwrap();
+            launcher.add_source(&game).unwrap();
+        }
+        // One keeps the name; the other is reported instead of swallowed.
+        assert_eq!(list_instances(&launcher).unwrap().len(), 1);
+        let broken = launcher.broken_instances();
+        assert_eq!(broken.len(), 1);
+        assert!(broken[0].error.contains("already called pack"));
+        assert_eq!(broken[0].dir, second);
+        assert!(!launcher.hidden().hides_dir(&first));
+
+        // Removing the visible one hides that folder only, so the second becomes
+        // the instance called `pack` instead of disappearing with it.
+        launcher.unregister("pack").unwrap();
+        assert!(launcher.hidden().hides_dir(&first));
+        assert!(!launcher.hidden().hides_dir(&second));
+        assert!(first.join(tntl_instance::PORTABLE_FILE).is_file());
+        let visible = list_instances(&launcher).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "pack");
+        assert!(launcher.broken_instances().is_empty());
+
+        // Restoring by folder brings the removed one back.
+        launcher.restore_instance_at("pack", Some(&first)).unwrap();
+        assert!(!launcher.hidden().hides_dir(&first));
+        assert_eq!(launcher.removed_instances().len(), 0);
+        assert_eq!(list_instances(&launcher).unwrap().len(), 1);
+        assert_eq!(launcher.broken_instances().len(), 1);
+
+        // Dismissing the shadowed folder by path leaves the other one visible.
+        launcher.dismiss_instance_at("pack", Some(&second)).unwrap();
+        assert!(launcher.hidden().hides_dir(&second));
+        assert!(!launcher.hidden().hides_dir(&first));
+        assert_eq!(list_instances(&launcher).unwrap().len(), 1);
+        assert!(launcher.broken_instances().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saving_a_portable_instance_keeps_its_portable_file() {
+        let root = std::env::temp_dir().join(format!("tntl-portable-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let (_, dir) = portable_instance(&launcher, &root);
+        // What the UI sends back: `portable` and `dir` are not serialised.
+        let mut payload = launcher.load_instance("pack").unwrap();
+        payload.portable = false;
+        payload.dir = None;
+        payload.notes = "edited".to_string();
+        launcher.save_instance(&payload).unwrap();
+
+        assert!(!dir.join(tntl_instance::INSTANCE_FILE).exists());
+        assert_eq!(launcher.load_instance("pack").unwrap().notes, "edited");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_without_configuration_can_be_forgotten() {
+        let root = std::env::temp_dir().join(format!("tntl-forget-orphan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        let orphan = launcher.instance_dir("orphan").unwrap();
+        fs::create_dir_all(&orphan).unwrap();
+        assert_eq!(launcher.broken_instances().len(), 1);
+
+        launcher.forget_instance_dir("orphan").unwrap();
+        // The row stays gone even though the folder has no configuration: the
+        // hide list keeps folder entries while the folder still exists.
+        assert!(launcher.broken_instances().is_empty());
+        assert!(launcher.broken_instances().is_empty());
+        assert!(orphan.is_dir());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_game_directory_source_still_yields_instances_created_inside_it() {
+        let root = std::env::temp_dir().join(format!("tntl-source-instances-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+        // The source is a game directory itself and has no `versions/`.
+        let game = root.join("prism");
+        fs::create_dir_all(game.join("saves")).unwrap();
+        launcher.add_source(&game).unwrap();
+        let dir = game.join("instances/pack");
+        fs::create_dir_all(dir.join("mods")).unwrap();
+        fs::write(dir.join("mods/a.jar"), b"jar").unwrap();
+        Instance::new("pack", "1.20.1").save_portable(&dir).unwrap();
+        launcher.reload_instances();
+
+        assert_eq!(launcher.instance_dir("pack").unwrap(), dir);
+        assert_eq!(list_instances(&launcher).unwrap().len(), 1);
+        assert_eq!(launcher.version_users("1.20.1"), vec!["pack".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn removed_imported_instance_points_at_the_game_directory() {
         let root = std::env::temp_dir().join(format!("tntl-removed-location-{}", std::process::id()));
@@ -9665,6 +10398,95 @@ mod tests {
             .unwrap();
         assert_eq!(view.game_dir, isolated);
         assert_eq!(launcher.mods("old").unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn creating_an_instance_materializes_its_game_directory() {
+        let root = std::env::temp_dir().join(format!("tntl-create-gamedir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+
+        let dir = launcher.create_instance(&Instance::new("fresh", "1.20.1")).unwrap();
+        // The default game directory has to exist right away: opening the
+        // instance folder, the screenshots shortcut and the file browser all
+        // fail on a missing directory.
+        assert!(dir.join("minecraft").is_dir(), "{}", dir.join("minecraft").display());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn creating_an_instance_at_a_chosen_directory_uses_and_creates_it() {
+        let root = std::env::temp_dir().join(format!("tntl-create-at-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+
+        let target = root.join("elsewhere/game");
+        let dir = launcher.create_instance_at("picked", "1.20.1", Some(&target)).unwrap();
+        // Chosen by the user, so it is created even though the parent chain did
+        // not exist, and the instance lands inside it instead of in the
+        // launcher's own folder.
+        assert!(target.is_dir());
+        assert_eq!(dir, target.join("instances/picked"));
+        let saved = Instance::load(&dir).unwrap();
+        assert!(saved.portable);
+        // The instance *is* its game directory: no stored path can point it at
+        // another disk.
+        assert_eq!(saved.game_dir(&dir), dir);
+        assert_eq!(saved.root, None);
+
+        // The chosen folder is registered, so its instances show up later.
+        assert_eq!(launcher.sources().paths, vec![fs::canonicalize(&target).unwrap()]);
+
+        // A second instance may share the game directory: each one gets its own
+        // folder, so their mods and saves cannot collide.
+        let other = launcher.create_instance_at("second", "1.20.1", Some(&target)).unwrap();
+        assert_eq!(other, target.join("instances/second"));
+
+        // Reusing one name is refused; nothing is touched.
+        let error = launcher
+            .create_instance_at("picked", "1.20.1", Some(&target))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+
+        // The same instance saving again is not a conflict with itself.
+        let instance = Instance::load(&dir).unwrap();
+        launcher.save_instance(&instance).unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_game_directory_alone_fills_the_library() {
+        let root = std::env::temp_dir().join(format!("tntl-sources-only-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let launcher = Launcher::from_root(Some(root.clone()));
+        launcher.mark_root().unwrap();
+
+        // No `instances/` folder at all. The old code returned an empty library
+        // as soon as that folder was missing, hiding every instance in the game
+        // directories the user had added.
+        let game = root.join("games/.minecraft");
+        fs::create_dir_all(game.join("versions/pack")).unwrap();
+        fs::write(game.join("versions/pack/options.txt"), b"x").unwrap();
+        fs::write(
+            game.join("versions/pack/tntl-instance.json"),
+            br#"{"name":"pack","version_id":"1.21.1"}"#,
+        )
+        .unwrap();
+        launcher.add_source(&game).unwrap();
+
+        let names: Vec<String> = list_instances(&launcher)
+            .unwrap()
+            .into_iter()
+            .map(|instance| instance.name)
+            .collect();
+        assert_eq!(names, vec!["pack"]);
+
         let _ = fs::remove_dir_all(&root);
     }
 

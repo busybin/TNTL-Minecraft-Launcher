@@ -12,6 +12,8 @@ export interface InstanceView {
   account_name: string | null;
   dir: string;
   game_dir: string;
+  /** Game directory this instance belongs to, when it lives inside one. */
+  source?: string | null;
   installed: boolean;
   last_log: string | null;
   modpack: string | null;
@@ -156,6 +158,8 @@ export interface DiagnosticReport {
 
 export interface Bootstrap {
   root: string;
+  /** `std::env::consts::OS`: `linux`, `windows` or `macos`. */
+  os: string;
   instances: InstanceView[];
   installed_versions: string[];
   java: JavaView[];
@@ -547,6 +551,7 @@ export interface InstanceConfig {
   jvm_args: string[];
   game_args: string[];
   env: Record<string, string>;
+  gpu: "auto" | "screen" | "discrete";
   server: { host: string; port: number } | null;
   username: string;
   demo: boolean;
@@ -792,8 +797,15 @@ export interface CrashInfo {
   hints: string[];
 }
 
-export interface GameExit {
-  instance: string;
+/** A game directory the user added. */
+export interface SourceView {
+  path: string;
+  /** False when the disk or folder is not there right now. */
+  available: boolean;
+  instances: number;
+}
+
+export interface GameExit {  instance: string;
   exit_code: number | null;
   duration_ms: number;
   crash: CrashInfo | null;
@@ -805,6 +817,9 @@ export const api = {
   setRoot: (path: string) => invoke<RootsState>("set_root", { path }),
   forgetRoot: (path: string) => invoke<RootsState>("forget_root", { path }),
   listInstances: () => invoke<InstanceView[]>("list_instances"),
+  listSources: () => invoke<SourceView[]>("list_sources"),
+  addSource: (path: string) => invoke<SourceView[]>("add_source", { path }),
+  removeSource: (path: string) => invoke<SourceView[]>("remove_source", { path }),
   listVersions: (channel: "release" | "snapshot" | "all") =>
     invoke<VersionView[]>("list_versions", { channel }),
   listLoaders: (game: string, loader: LoaderKind) =>
@@ -821,9 +836,23 @@ export const api = {
     instanceName: string | null,
     loader: LoaderKind | null,
     loaderVersion: string | null,
-  ) => invoke<void>("install_version", { version, assets, instanceName, loader, loaderVersion }),
-  createInstance: (name: string, versionId: string, username: string | null, maxMemoryMb: number | null) =>
-    invoke<void>("create_instance", { name, versionId, username, maxMemoryMb }),
+    gameDir: string | null,
+  ) =>
+    invoke<void>("install_version", {
+      version,
+      assets,
+      instanceName,
+      loader,
+      loaderVersion,
+      gameDir,
+    }),
+  createInstance: (
+    name: string,
+    versionId: string,
+    username: string | null,
+    maxMemoryMb: number | null,
+    gameDir: string | null,
+  ) => invoke<void>("create_instance", { name, versionId, username, maxMemoryMb, gameDir }),
   loadInstance: (name: string) => invoke<InstanceConfig>("load_instance", { name }),
   saveInstance: (instance: InstanceConfig) => invoke<void>("save_instance", { instance }),
   // The memory slider saves on its own so the value is there before Play.
@@ -832,12 +861,15 @@ export const api = {
   clearInstanceJava: (name: string) => invoke<void>("clear_instance_java", { name }),
   // Removal only hides the entry; the files stay where they are.
   deleteInstance: (name: string) => invoke<InstanceLocation>("delete_instance", { name }),
-  restoreInstance: (name: string) => invoke<void>("restore_instance", { name }),
+  restoreInstance: (name: string, dir?: string | null) =>
+    invoke<void>("restore_instance", { name, dir: dir ?? null }),
   // Drops a removed entry for good; its files are still left alone.
-  dismissInstance: (name: string) => invoke<void>("dismiss_instance", { name }),
+  dismissInstance: (name: string, dir?: string | null) =>
+    invoke<void>("dismiss_instance", { name, dir: dir ?? null }),
   brokenInstances: () => invoke<BrokenInstance[]>("broken_instances"),
   removedInstances: () => invoke<RemovedInstance[]>("removed_instances"),
-  forgetInstanceDir: (name: string) => invoke<string>("forget_instance_dir", { name }),
+  forgetInstanceDir: (name: string, dir?: string | null) =>
+    invoke<string>("forget_instance_dir", { name, dir: dir ?? null }),
   hiddenVersions: () => invoke<InstalledVersion[]>("hidden_versions"),
   unregisterVersion: (id: string) => invoke<void>("unregister_version", { id }),
   restoreVersion: (id: string) => invoke<void>("restore_version", { id }),
@@ -852,13 +884,14 @@ export const api = {
   updateApply: (path: string) => invoke<string>("update_apply", { path }),
   installedVersions: () => invoke<InstalledVersion[]>("installed_versions"),
   deleteVersion: (id: string) => invoke<void>("delete_version", { id }),
-  createInstanceFromVersion: (versionId: string, name: string) =>
-    invoke<string>("create_instance_from_version", { versionId, name }),
+  createInstanceFromVersion: (versionId: string, name: string, gameDir: string | null) =>
+    invoke<string>("create_instance_from_version", { versionId, name, gameDir }),
   renameInstance: (name: string, newName: string) => invoke<string>("rename_instance", { name, newName }),
   duplicateInstance: (name: string, newName: string) =>
     invoke<string>("duplicate_instance", { name, newName }),
   pickFile: (title: string, extensions: string[]) => invoke<string | null>("pick_file", { title, extensions }),
-  pickFolder: (title: string) => invoke<string | null>("pick_folder", { title }),
+  pickFolder: (title: string, start?: string | null) =>
+    invoke<string | null>("pick_folder", { title, start: start ?? null }),
   isDirectory: (path: string) => invoke<boolean>("is_directory", { path }),
   pickSaveFile: (title: string, fileName: string, extensions: string[]) =>
     invoke<string | null>("pick_save_file", { title, fileName, extensions }),

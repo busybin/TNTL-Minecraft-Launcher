@@ -223,7 +223,10 @@ fn count_instances(root: &Path) -> usize {
     };
     entries
         .flatten()
-        .filter(|entry| entry.path().join(tntl_instance::INSTANCE_FILE).is_file())
+        .filter(|entry| {
+            entry.path().join(tntl_instance::INSTANCE_FILE).is_file()
+                || entry.path().join(tntl_instance::PORTABLE_FILE).is_file()
+        })
         .count()
 }
 

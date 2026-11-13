@@ -56,6 +56,8 @@ import { useTransfer } from "../progress";
 const props = defineProps<{
   name: string;
   modpack?: string | null;
+  /** `std::env::consts::OS` from the launcher. */
+  os?: string;
   running?: boolean;
   busy?: boolean;
   reload?: number;
@@ -131,6 +133,8 @@ const config = ref<InstanceConfig | null>(null);
 /** Slider needs plain numbers even before the instance json lands. */
 const memoryMin = computed(() => config.value?.min_memory_mb ?? null);
 const memoryMax = computed(() => config.value?.max_memory_mb ?? null);
+/** Only Linux splits the screen and the renderer across two GPUs. */
+const isLinux = computed(() => props.os === "linux");
 let memoryTimer: number | null = null;
 
 /** The slider saves on its own: the value must be stored before the next Play. */
@@ -2541,6 +2545,14 @@ async function openPath(path: string) {
                 </select>
                 <button class="ghost small" type="button" @click="pickJava">{{ t("editor.browse") }}</button>
               </div>
+            </label>
+            <label v-if="isLinux">
+              <span>{{ t("editor.gpu") }} <small>{{ t("editor.gpuHint") }}</small></span>
+              <select v-model="config.gpu">
+                <option value="auto">{{ t("editor.gpuAuto") }}</option>
+                <option value="screen">{{ t("editor.gpuScreen") }}</option>
+                <option value="discrete">{{ t("editor.gpuDiscrete") }}</option>
+              </select>
             </label>
             <label>
               <span>{{ t("editor.resolution") }}</span>

@@ -12,6 +12,8 @@ use std::time::Instant;
 
 use tntl_resolve::LaunchPlan;
 
+pub mod gpu;
+
 /// Receives one line of game output as it is produced.
 pub type LineSink = Arc<dyn Fn(&str) + Send + Sync>;
 use thiserror::Error;
@@ -48,6 +50,8 @@ pub struct LaunchOptions {
     /// Give the game its own handles to the log file instead of pumping the
     /// pipes here. Needed when the caller exits while the game keeps running.
     pub detach_output: bool,
+    /// Which GPU the game should render on.
+    pub gpu: gpu::GpuPreference,
 }
 
 impl std::fmt::Debug for LaunchOptions {
@@ -59,6 +63,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("clean_natives", &self.clean_natives)
             .field("line_sink", &self.line_sink.is_some())
             .field("detach_output", &self.detach_output)
+            .field("gpu", &self.gpu)
             .finish()
     }
 }
@@ -71,6 +76,7 @@ impl LaunchOptions {
             clean_natives: true,
             line_sink: None,
             detach_output: false,
+            gpu: gpu::GpuPreference::default(),
         }
     }
 }
@@ -223,6 +229,9 @@ pub fn launch(plan: &LaunchPlan, options: &LaunchOptions) -> Result<GameProcess,
         .current_dir(&plan.working_dir)
         .envs(&plan.env)
         .stdin(Stdio::null());
+    // Only Linux splits a screen and its renderer across two GPUs.
+    #[cfg(target_os = "linux")]
+    command.envs(gpu::offload_env(options.gpu, &gpu::detect(), &plan.env));
     // `java.exe` is a console program; spawned from the GUI shell it would open
     // a window that stays for the whole session (and closing it kills the game).
     // `javaw.exe` is the window-less twin, and the flag covers a custom runtime

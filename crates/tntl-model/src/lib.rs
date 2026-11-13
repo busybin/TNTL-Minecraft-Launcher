@@ -7,6 +7,7 @@
 
 mod asset;
 mod env;
+mod gpu;
 mod library;
 mod maven;
 mod rules;
@@ -14,6 +15,7 @@ mod version;
 
 pub use asset::{AssetIndex, AssetObject, AssetRef};
 pub use env::{Arch, Environment, OsName};
+pub use gpu::GpuPreference;
 pub use library::{Artifact, Extract, Library, LibraryDownloads, MavenName, NATIVE_ARCH_MARKER, classifier_for};
 pub use maven::maven_path;
 pub use rules::{Rule, RuleAction, allowed};

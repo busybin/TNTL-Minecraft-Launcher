@@ -6,6 +6,7 @@ publish = false
 license.workspace = true
 
 [dependencies]
+tntl-model = { path = "../tntl-model" }
 tntl-store = { path = "../tntl-store" }
 flate2 = "1"
 png.workspace = true

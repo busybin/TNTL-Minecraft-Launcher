@@ -156,6 +156,10 @@ enum Command {
         /// Instance name (defaults to the version id, or `<version>-<loader>`).
         #[arg(long)]
         name: Option<String>,
+        /// Game directory for the new instance (defaults to inside the
+        /// instance folder). Pick a drive with room for a modpack.
+        #[arg(long, value_name = "DIR")]
+        game_dir: Option<PathBuf>,
     },
     /// List loader builds published for a game version.
     Loaders {
@@ -239,6 +243,18 @@ enum Command {
     },
     /// List instances.
     List,
+    /// List the game directories the library is built from.
+    Sources,
+    /// Add a game directory: every instance inside it joins the library, and
+    /// keeps its settings beside its own game files.
+    AddSource {
+        path: PathBuf,
+        /// Only report what would be added.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a game directory from the library; the files stay on disk.
+    RemoveSource { path: PathBuf },
     /// List versions installed on this machine, or delete them.
     Installed {
         /// Delete one version that no instance uses.
@@ -690,6 +706,7 @@ fn run(cli: Cli) -> Result<i32> {
             no_assets,
             no_instance,
             name,
+            game_dir,
         } => cmd_install(
             &launcher,
             &version,
@@ -698,6 +715,7 @@ fn run(cli: Cli) -> Result<i32> {
             no_assets,
             no_instance,
             name,
+            game_dir,
         ),
         Command::Loaders { version, loader, limit } => cmd_loaders(&launcher, &version, &loader, limit),
         Command::Loader { instance, action } => cmd_loader(&launcher, &instance, action),
@@ -712,6 +730,9 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Installed { delete, cleanup, json } => cmd_installed(&launcher, delete.as_deref(), cleanup, json),
         Command::BisectPlan { instance } => cmd_bisect_plan(&launcher, &instance),
         Command::List => cmd_list(&launcher),
+        Command::Sources => cmd_sources(&launcher),
+        Command::AddSource { path, json } => cmd_add_source(&launcher, &path, json),
+        Command::RemoveSource { path } => cmd_remove_source(&launcher, &path),
         Command::Plan { instance, json } => cmd_plan(&launcher, &instance, json),
         Command::Launch {
             instance,
@@ -1439,6 +1460,7 @@ fn cmd_versions(channel: &str, limit: usize) -> Result<i32> {
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_install(
     launcher: &Launcher,
     version: &str,
@@ -1447,6 +1469,7 @@ fn cmd_install(
     no_assets: bool,
     no_instance: bool,
     name: Option<String>,
+    game_dir: Option<PathBuf>,
 ) -> Result<i32> {
     let mut request = InstallRequest::new(version);
     request.assets = !no_assets;
@@ -1465,6 +1488,7 @@ fn cmd_install(
         Some(name.unwrap_or_else(|| request.instance_name()))
     };
     request.instance = instance_name.clone();
+    request.game_dir = game_dir;
 
     let last_stage = std::sync::Mutex::new(String::new());
     let report = launcher.install(&request, &|event: InstallEvent| {
@@ -1709,16 +1733,67 @@ fn cmd_bisect_plan(launcher: &Launcher, instance: &str) -> Result<i32> {
 fn cmd_list(launcher: &Launcher) -> Result<i32> {
     let instances = list_instances(launcher)?;
     if instances.is_empty() {
-        println!("no instances in {}", launcher.instances_dir().display());
+        println!("no instances; add a game directory with `tntl add-source <DIR>`");
         return Ok(0);
     }
     for instance in instances {
-        let root = instance
-            .root
-            .as_ref()
-            .map(|root| root.display().to_string())
-            .unwrap_or_else(|| "launcher root".to_string());
-        println!("{:<24} {:<20} {}", instance.name, instance.version_id, root);
+        // Where the game data actually is. A portable instance derives it from
+        // its folder, so this is the only honest answer.
+        let game = launcher
+            .game_dir(&instance.name)
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|_| "-".to_string());
+        println!("{:<24} {:<20} {}", instance.name, instance.version_id, game);
+    }
+    Ok(0)
+}
+
+fn cmd_sources(launcher: &Launcher) -> Result<i32> {
+    let sources = launcher.sources();
+    println!("{:<40} {}", "LAUNCHER ROOT", launcher.root.display());
+    if sources.paths.is_empty() {
+        println!("no game directories; add one with `tntl add-source <DIR>`");
+        return Ok(0);
+    }
+    for path in sources.paths {
+        let found = tntl_app::sources::scan_source(&path).len();
+        let state = if path.is_dir() { "ok" } else { "not mounted" };
+        println!("{:<40} {:<12} {} instance(s)", path.display(), state, found);
+    }
+    Ok(0)
+}
+
+fn cmd_add_source(launcher: &Launcher, path: &Path, json: bool) -> Result<i32> {
+    let added = launcher.add_source(path)?;
+    let found = tntl_app::sources::scan_source(path);
+    if json {
+        let report = serde_json::json!({
+            "added": added,
+            "path": path.display().to_string(),
+            "instances": found.iter().map(|entry| entry.dir.display().to_string()).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(0);
+    }
+    if added {
+        println!("added {}", path.display());
+    } else {
+        println!("{} was already a game directory", path.display());
+    }
+    if found.is_empty() {
+        println!("no instances found there yet");
+    }
+    for entry in found {
+        println!("  {}", entry.dir.display());
+    }
+    Ok(0)
+}
+
+fn cmd_remove_source(launcher: &Launcher, path: &Path) -> Result<i32> {
+    if launcher.remove_source(path)? {
+        println!("removed {}; the files stay on disk", path.display());
+    } else {
+        println!("{} was not a game directory", path.display());
     }
     Ok(0)
 }
@@ -1868,6 +1943,9 @@ fn cmd_launch(
     let log_path = instance_dir.join("logs").join(format!("{}.log", timestamp()));
     let mut options = LaunchOptions::new(&log_path);
     options.echo = echo;
+    if let Ok(instance) = launcher.load_instance(name) {
+        options.gpu = instance.gpu;
+    }
     let mod_snapshot = launcher.mods(name).ok();
     launcher.claim_running(name, std::process::id())?;
     let process = match tntl_launch::launch(&plan, &options) {

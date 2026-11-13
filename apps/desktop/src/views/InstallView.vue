@@ -115,6 +115,8 @@ async function removeUnused() {
 
 const selected = ref<string | null>(null);
 const instanceName = ref("");
+/** Game directory for the new instance; empty keeps `<instance>/minecraft`. */
+const instanceDir = ref("");
 const withAssets = ref(true);
 const { installing, stage, progress, result, installError } = installState;
 
@@ -124,6 +126,23 @@ const createName = ref("");
 const createError = ref<string | null>(null);
 const createBusy = ref(false);
 const createInput = ref<HTMLInputElement | null>(null);
+/** Where the game data goes; empty means `<instance>/minecraft`. */
+const createDir = ref("");
+/**
+ * Game directory the new instance lands in. Defaults to the game folder the
+ * user added; the launcher's own data directory only holds settings now.
+ */
+const gameDirDefault = ref("");
+
+async function loadGameDirDefault() {
+  try {
+    const sources = await api.listSources();
+    const usable = sources.find((entry) => entry.available) ?? sources[0];
+    gameDirDefault.value = usable?.path ?? "";
+  } catch {
+    gameDirDefault.value = "";
+  }
+}
 
 function beginCreate(versionId: string) {
   const used = new Set(local.value.flatMap((entry) => entry.instances));
@@ -132,8 +151,29 @@ function beginCreate(versionId: string) {
   while (used.has(name)) name = `${versionId}-${index++}`;
   createFrom.value = versionId;
   createName.value = name;
+  createDir.value = gameDirDefault.value;
   createError.value = null;
   void nextTick(() => createInput.value?.select());
+}
+
+async function pickCreateDir() {
+  try {
+    // Start at the folder the user already picked, so re-opening the dialog
+    // does not walk back down from `$HOME`.
+    const picked = await api.pickFolder(t("install.local.pickDirTitle"), createDir.value || null);
+    if (picked) createDir.value = picked;
+  } catch (cause) {
+    createError.value = String(cause);
+  }
+}
+
+async function pickInstallDir() {
+  try {
+    const picked = await api.pickFolder(t("install.local.pickDirTitle"), instanceDir.value || null);
+    if (picked) instanceDir.value = picked;
+  } catch (cause) {
+    installError.value = String(cause);
+  }
 }
 
 async function confirmCreate() {
@@ -143,7 +183,7 @@ async function confirmCreate() {
   createBusy.value = true;
   createError.value = null;
   try {
-    await api.createInstanceFromVersion(versionId, name);
+    await api.createInstanceFromVersion(versionId, name, createDir.value.trim() || null);
     createFrom.value = null;
     await loadLocal();
     emit("installed");
@@ -311,6 +351,7 @@ async function start() {
       instanceName.value.trim() || null,
       loaderKind.value === "vanilla" ? null : loaderKind.value,
       loaderKind.value === "vanilla" ? null : loaderVersion.value,
+      instanceDir.value.trim() || null,
     );
   } catch (cause) {
     const message = String(cause);
@@ -323,6 +364,8 @@ async function start() {
 onMounted(async () => {
   await load();
   void loadLocal();
+  await loadGameDirDefault();
+  if (!instanceDir.value) instanceDir.value = gameDirDefault.value;
   try {
     unlisteners.push(
       await events.onInstallStart((payload) => {
@@ -565,6 +608,22 @@ watch(installing, (now, before) => {
           <input v-model="instanceName" spellcheck="false" :disabled="installing" />
         </label>
 
+        <div class="field">
+          <span>{{ t("install.local.createDir") }}</span>
+          <div class="dir-row">
+            <input
+              v-model="instanceDir"
+              spellcheck="false"
+              :disabled="installing"
+              :placeholder="gameDirDefault || t('install.local.createDirDefault')"
+            />
+            <button class="ghost small" type="button" :disabled="installing" @click="pickInstallDir">
+              {{ t("install.local.browse") }}
+            </button>
+          </div>
+          <small class="hint">{{ t("install.local.createDirHint") }}</small>
+        </div>
+
         <label class="switch">
           <input v-model="withAssets" type="checkbox" :disabled="installing" />
           <span class="track"><span class="knob" /></span>
@@ -637,6 +696,20 @@ watch(installing, (now, before) => {
             <span>{{ t("install.local.createName") }}</span>
             <input ref="createInput" v-model="createName" spellcheck="false" @keyup.enter="confirmCreate" />
           </label>
+          <div class="field">
+            <span>{{ t("install.local.createDir") }}</span>
+            <div class="dir-row">
+              <input
+                v-model="createDir"
+                spellcheck="false"
+                :placeholder="gameDirDefault || t('install.local.createDirDefault')"
+              />
+              <button class="ghost small" type="button" :disabled="createBusy" @click="pickCreateDir">
+                {{ t("install.local.browse") }}
+              </button>
+            </div>
+            <small class="hint">{{ t("install.local.createDirHint") }}</small>
+          </div>
           <p v-if="createError" class="error">{{ createError }}</p>
           <div class="create-actions">
             <button class="ghost" :disabled="createBusy" @click="createFrom = null">
@@ -1057,6 +1130,24 @@ watch(installing, (now, before) => {
 .field > input {
   width: 100%;
   min-width: 0;
+}
+
+.dir-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.dir-row > input {
+  flex: 1;
+  min-width: 0;
+}
+
+.field .hint {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .switch {

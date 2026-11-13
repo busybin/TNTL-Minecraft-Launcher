@@ -14,6 +14,7 @@ import {
   type RemovedInstance,
   type RootsState,
   type SessionState,
+  type SourceView,
   type UnlistenFn,
 } from "./api";
 import Icon from "./components/Icon.vue";
@@ -146,11 +147,51 @@ const heading = computed<{ title: string; subtitle: string }>(() => {
 });
 const root = computed(() => bootstrap.value?.root ?? "…");
 const rootMenuOpen = ref(false);
+// Game directories the user added. The top-right control is about these, not
+// about the launcher's own data directory: that one only holds settings.
+const sourceMenuOpen = ref(false);
+const sources = ref<SourceView[]>([]);
+const activeSource = ref<string>("");
+
+async function loadSources() {
+  try {
+    sources.value = await api.listSources();
+  } catch {
+    sources.value = [];
+  }
+  if (activeSource.value && !sources.value.some((entry) => entry.path === activeSource.value)) {
+    activeSource.value = "";
+  }
+}
+
+/** Prefer the game folder a path sits in, so the button stays short. */
+function sourceLabel(path: string): string {
+  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts.slice(-2).join("/") || path;
+}
+
+async function addSourceFolder() {
+  try {
+    const picked = await api.pickFolder(t("app.addSourceTitle"));
+    if (!picked) return;
+    sources.value = await api.addSource(picked);
+    await refresh();
+  } catch (cause) {
+    notify(String(cause));
+  }
+}
+
+async function removeSourceFolder(path: string) {
+  try {
+    sources.value = await api.removeSource(path);
+    if (activeSource.value === path) activeSource.value = "";
+    await refresh();
+  } catch (cause) {
+    notify(String(cause));
+  }
+}
+
 const rootsState = ref<RootsState | null>(null);
-const shortRoot = computed(() => {
-  const value = root.value;
-  return value.length > 34 ? `…${value.slice(-33)}` : value;
-});
 
 let refreshToken = 0;
 
@@ -170,6 +211,7 @@ async function refresh() {
     const current = await api.runningInstance();
     if (token !== refreshToken) return;
     running.value = current;
+    await loadSources();
     error.value = null;
   } catch (cause) {
     if (token === refreshToken) error.value = String(cause);
@@ -380,17 +422,17 @@ function closeRemovedFolder() {
 }
 
 /** Drop a folder whose `instance.json` is broken; nothing on disk changes. */
-async function forgetDir(name: string) {
+async function forgetDir(name: string, dir: string) {
   if (!window.confirm(t("instances.forgetBrokenConfirm", { name }))) return;
   try {
-    const dir = await api.forgetInstanceDir(name);
+    const removed = await api.forgetInstanceDir(name, dir);
     removedFolder.value = {
       name,
-      dir,
-      game_dir: dir,
+      dir: removed,
+      game_dir: removed,
       shared_root: root.value,
       external_game_dir: false,
-      files_dir: dir,
+      files_dir: removed,
     };
     await refresh();
   } catch (cause) {
@@ -399,9 +441,9 @@ async function forgetDir(name: string) {
 }
 
 /** Put a removed entry back; its files were never touched. */
-async function restoreRemoved(name: string) {
+async function restoreRemoved(name: string, dir: string) {
   try {
-    await api.restoreInstance(name);
+    await api.restoreInstance(name, dir);
     notify(t("instances.restored", { name }));
     await refresh();
   } catch (cause) {
@@ -410,10 +452,10 @@ async function restoreRemoved(name: string) {
 }
 
 /** Drop a removed entry for good; its folder and files are kept. */
-async function dismissRemoved(name: string) {
+async function dismissRemoved(name: string, dir: string) {
   if (!window.confirm(t("instances.dismissConfirm", { name }))) return;
   try {
-    await api.dismissInstance(name);
+    await api.dismissInstance(name, dir);
     notify(t("instances.dismissed", { name }));
     await refresh();
   } catch (cause) {
@@ -434,7 +476,7 @@ async function undoRemove() {
   const target = removedFolder.value;
   if (!target) return;
   try {
-    await api.restoreInstance(target.name);
+    await api.restoreInstance(target.name, target.dir);
     removedFolder.value = null;
     await refresh();
   } catch (cause) {
@@ -874,6 +916,7 @@ onUnmounted(() => {
         :key="`${detailInstance}-${detailKey}`"
         :name="detailInstance"
         :modpack="detailModpack"
+        :os="bootstrap?.os ?? ''"
         :running="running === detailInstance"
         :busy="busy === detailInstance"
         :reload="reloadTick"
@@ -898,13 +941,51 @@ onUnmounted(() => {
               <button
                 class="root mono"
                 type="button"
-                :title="t('app.rootHint')"
-                :disabled="!!running"
-                @click="openRootMenu"
+                :title="t('app.sourceHint')"
+                @click="sourceMenuOpen = !sourceMenuOpen"
               >
-                <Icon name="folder" :size="13" />{{ shortRoot }}
+                <Icon name="folder" :size="13" />{{
+                  activeSource ? sourceLabel(activeSource) : t("app.allSources")
+                }}
                 <Icon name="chevron" :size="11" />
               </button>
+              <div v-if="sourceMenuOpen" class="menu-scrim" @click="sourceMenuOpen = false" />
+              <div v-if="sourceMenuOpen" class="root-menu">
+                <button
+                  type="button"
+                  class="add-root"
+                  :class="{ active: !activeSource }"
+                  @click="activeSource = ''; sourceMenuOpen = false"
+                >
+                  {{ t("app.allSources") }}
+                </button>
+                <div v-for="entry in sources" :key="entry.path" class="root-row">
+                  <button
+                    type="button"
+                    :class="{ active: entry.path === activeSource }"
+                    :title="entry.path"
+                    @click="activeSource = entry.path; sourceMenuOpen = false"
+                  >
+                    {{ sourceLabel(entry.path) }}
+                    <span v-if="!entry.available" class="root-missing">{{ t("instances.sourceMissing") }}</span>
+                  </button>
+                  <button
+                    class="forget-root"
+                    type="button"
+                    :title="t('instances.removeSource')"
+                    @click.stop="removeSourceFolder(entry.path)"
+                  >
+                    <Icon name="close" :size="11" />
+                  </button>
+                </div>
+                <button class="add-root" type="button" @click="sourceMenuOpen = false; addSourceFolder()">
+                  <Icon name="folder" :size="13" />{{ t("app.addSource") }}
+                </button>
+                <button class="add-root" type="button" @click="sourceMenuOpen = false; openRootMenu()">
+                  <Icon name="settings" :size="13" />{{ t("app.switchRoot") }}
+                </button>
+              </div>
+
               <div v-if="rootMenuOpen" class="menu-scrim" @click="rootMenuOpen = false" />
               <div v-if="rootMenuOpen" class="root-menu">
                 <div
@@ -950,6 +1031,11 @@ onUnmounted(() => {
             :removed-entries="removedInstances"
             :running="running"
             :busy="busy"
+            :sources="sources"
+            :active-source="activeSource"
+            @select-source="(path: string) => (activeSource = path)"
+            @add-source="addSourceFolder"
+            @remove-source="removeSourceFolder"
             @launch="launch"
             @stop="stop"
             @log="showLog"
